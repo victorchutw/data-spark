@@ -80,6 +80,14 @@ _Avoid_: Fixed schema, locked schema
 A difference between the source's observed record shape and the destination dataset's expected shape.
 _Avoid_: Schema change, mismatch
 
+**Drift Policy**:
+The rule that decides whether a load may continue when schema drift is detected.
+_Avoid_: Drift handling, schema behavior
+
+**Additive Schema Drift**:
+Schema drift where the source has additional fields that can be added without changing existing fields.
+_Avoid_: Safe drift, new columns
+
 **BI-Ready Dataset**:
 A dataset that is typed, queryable, and stable enough for business intelligence tools.
 _Avoid_: Report-ready data, analytics output
