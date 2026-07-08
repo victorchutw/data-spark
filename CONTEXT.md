@@ -112,6 +112,18 @@ _Avoid_: Atomic write, transaction
 A destination write where partial destination changes can occur if the load fails.
 _Avoid_: Partial write, non-atomic write
 
+**Transient Failure**:
+A failure that is expected to be temporary and safe to retry without changing load semantics.
+_Avoid_: Temporary error, retryable error
+
+**Commit Boundary**:
+The point after which a destination write may have become visible.
+_Avoid_: Commit phase, point of no return
+
+**Retry Attempt**:
+A repeated attempt of a failed operation within the same load.
+_Avoid_: Retry, rerun
+
 **Full Refresh**:
 A load mode that replaces the destination dataset with the source's current records.
 _Avoid_: Rebuild, overwrite
