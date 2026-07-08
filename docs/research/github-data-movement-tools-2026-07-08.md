@@ -63,8 +63,9 @@ The target product is a single-binary tool that moves data from sources to BI-re
 
 The pragmatic first product is a batch ELT CLI:
 
-- Sources: local files, HTTP/S3-compatible objects, PostgreSQL, MySQL, SQLite, DuckDB.
+- Sources: local files, HTTP/S3-compatible objects, PostgreSQL, MySQL, SQL Server, SQLite, DuckDB.
 - Destinations: DuckDB, Parquet directory, PostgreSQL, SQLite, BigQuery.
+- SQL Server scope: source connector in v1; destination support is deferred until the first relational destination write paths are proven.
 - BigQuery write path: stage Parquet or newline-delimited JSON, then run a BigQuery batch load job; defer the Storage Write API until near-real-time or high-frequency small-batch loading is needed.
 - Formats: CSV, JSONL, Parquet; add Excel later if needed.
 - Execution model: streaming `RecordBatch` pipeline with bounded memory.
@@ -73,9 +74,9 @@ The pragmatic first product is a batch ELT CLI:
 - Schema: infer, preview, override, and write rejected rows.
 - Reporting: JSON run report plus human progress output.
 
-## Decisions To Grill Next
+## Current Design Boundary
 
-The first design boundary is whether the tool is primarily a batch movement tool or whether CDC/near-real-time sync is in the first product. Batch-first keeps the single-binary Rust goal realistic. CDC-first changes connector design, state durability, delivery guarantees, and test burden.
+The product is batch-first for v1. The next design boundary is how much schema control users must provide up front versus how much the tool infers and repairs automatically.
 
 ## Sources
 
