@@ -56,6 +56,10 @@ _Avoid_: Upsert, incremental merge
 A source record that cannot be written to the destination dataset without violating the chosen schema or load rules.
 _Avoid_: Bad row, error row, dead letter
 
+**Staging Object**:
+A temporary data object prepared so a destination can load records through its native batch loading path.
+_Avoid_: Temp file, intermediate file, upload
+
 **Schema Drift**:
 A difference between the source's observed record shape and the destination dataset's expected shape.
 _Avoid_: Schema change, mismatch

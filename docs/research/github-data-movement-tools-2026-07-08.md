@@ -65,6 +65,7 @@ The pragmatic first product is a batch ELT CLI:
 
 - Sources: local files, HTTP/S3-compatible objects, PostgreSQL, MySQL, SQLite, DuckDB.
 - Destinations: DuckDB, Parquet directory, PostgreSQL, SQLite, BigQuery.
+- BigQuery write path: stage Parquet or newline-delimited JSON, then run a BigQuery batch load job; defer the Storage Write API until near-real-time or high-frequency small-batch loading is needed.
 - Formats: CSV, JSONL, Parquet; add Excel later if needed.
 - Execution model: streaming `RecordBatch` pipeline with bounded memory.
 - Job interface: command flags for one-shot use, YAML for repeatable jobs.
