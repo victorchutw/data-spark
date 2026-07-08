@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 ---
 
 # Start With Batch Data Movement Before CDC
