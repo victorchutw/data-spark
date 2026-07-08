@@ -48,6 +48,14 @@ _Avoid_: Table, file, stream
 The expected fields and types for records in a dataset.
 _Avoid_: Schema, table definition
 
+**Structural Transform**:
+A transformation that changes record shape or representation so a load can produce a BI-ready dataset.
+_Avoid_: Data cleaning, mapping, light transform
+
+**Analytical Transform**:
+A transformation that derives analytical meaning through joins, aggregations, calculations, or business logic.
+_Avoid_: SQL transform, modeling, enrichment
+
 **Record**:
 One logical item inside a dataset.
 _Avoid_: Row, event, object
