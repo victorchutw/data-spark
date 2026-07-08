@@ -64,6 +64,33 @@ gh issue edit 4 \
 9. Merge only after CI passes.
 10. Let GitHub close the issue through the `Closes #<issue-number>` reference.
 
+## AI agent development loop
+
+Agents should treat implementation as a bounded loop: understand the issue,
+explore the relevant code, plan the smallest vertical slice, edit, verify,
+review, and stop when the work is either proven or blocked. The research-backed
+workflow is documented in
+`docs/research/ai-agent-loop-engineering-2026-07-08.md`.
+
+For agent-executable work, prefer this path:
+
+1. Confirm the issue has a clear problem statement, acceptance criteria, test
+   expectation, ADR/domain impact, out-of-scope notes, and release impact.
+2. If that information is missing, move the issue to `needs-info` instead of
+   guessing.
+3. Use one short-lived branch or worktree per issue.
+4. Add or update focused tests before relying on manual inspection.
+5. Run the local checks before opening or updating a PR.
+6. Keep the PR draft while behavior is still changing.
+7. Run a separate review pass focused on bugs, contract regressions, ADR
+   conflicts, credentials, and missing tests.
+8. Stop for human judgment if the work conflicts with an ADR, needs a new domain
+   concept, requires credentials or production data, changes release automation,
+   or repeats the same failing check three times.
+
+Agents may open draft PRs and respond to review comments, but must not merge PRs
+or cut releases.
+
 ## Local checks
 
 Run these before opening or updating a PR:
