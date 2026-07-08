@@ -93,14 +93,23 @@ git tag -a v0.1.0 -m "Release v0.1.0"
 git push origin v0.1.0
 ```
 
-The release workflow validates that the tag version matches `Cargo.toml`, runs the Rust checks, builds one Linux x86_64 release binary, smoke-tests `--help`, and publishes a GitHub Release with a single binary asset named `data-spark-linux-x86_64`.
+For prerelease pipeline validation, use a SemVer prerelease version in both `Cargo.toml` and the tag:
+
+```bash
+git checkout main
+git pull --ff-only
+git tag -a v0.1.0-alpha.1 -m "Release v0.1.0-alpha.1"
+git push origin v0.1.0-alpha.1
+```
+
+The release workflow validates that the tag version matches `Cargo.toml`, runs the Rust checks, builds one Linux x86_64 release binary, smoke-tests `--help`, and publishes a GitHub Release with a single binary asset named `data-spark-linux-x86_64`. Stable tags such as `v0.1.0` are marked latest; prerelease tags such as `v0.1.0-alpha.1` are marked prerelease and are not latest.
 
 ## GitHub automation
 
 - `.github/workflows/issue-default-label.yml` adds `needs-triage` to new issues when no state label is present.
 - `.github/workflows/issue-status-sync.yml` moves referenced issues to `in-progress` for draft PRs and `in-review` for ready PRs.
 - `.github/workflows/ci.yml` gates pushes and PRs with Rust formatting, linting, tests, and release build checks.
-- `.github/workflows/release.yml` creates the single-binary GitHub Release from `v*.*.*` tags.
+- `.github/workflows/release.yml` creates the single-binary GitHub Release from `v`-prefixed SemVer tags.
 
 ## Repository settings
 
