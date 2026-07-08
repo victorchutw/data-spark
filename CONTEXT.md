@@ -124,6 +124,14 @@ _Avoid_: Commit phase, point of no return
 A repeated attempt of a failed operation within the same load.
 _Avoid_: Retry, rerun
 
+**Load Parallelism**:
+The amount of concurrent work allowed within a load.
+_Avoid_: Concurrency, workers
+
+**Connector Parallelism Limit**:
+The maximum load parallelism a connector allows by default for safe operation.
+_Avoid_: Worker limit, concurrency cap
+
 **Full Refresh**:
 A load mode that replaces the destination dataset with the source's current records.
 _Avoid_: Rebuild, overwrite
