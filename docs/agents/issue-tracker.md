@@ -29,15 +29,16 @@ Use the label strings from `docs/agents/triage-labels.md`.
 External PRs are part of the triage queue and should run through the same labels
 and states as issues. Ignore collaborators' in-flight PRs.
 
-Treat a PR as external only when `authorAssociation` is `CONTRIBUTOR`,
-`FIRST_TIME_CONTRIBUTOR`, or `NONE`. Drop `OWNER`, `MEMBER`, and
-`COLLABORATOR`.
+Treat a PR as external unless `authorAssociation` is `OWNER`, `MEMBER`, or
+`COLLABORATOR`. External values include `CONTRIBUTOR`, `FIRST_TIMER`,
+`FIRST_TIME_CONTRIBUTOR`, `MANNEQUIN`, `NONE`, and any unknown value that is not
+an explicit maintainer or collaborator association.
 
 Use the `gh pr` equivalents when processing PRs:
 
 - **Read a PR**: `gh pr view <number> --comments` and `gh pr diff <number>`
   for the diff.
-- **List external PRs for triage**: `gh pr list --state open --json number,title,body,labels,author,authorAssociation,comments`, then filter by `authorAssociation`.
+- **List external PRs for triage**: `gh pr list --state open --json number,title,body,labels,author,authorAssociation,comments`, then drop only `OWNER`, `MEMBER`, and `COLLABORATOR`.
 - **Comment / label / close**: `gh pr comment`, `gh pr edit --add-label` /
   `--remove-label`, and `gh pr close`.
 

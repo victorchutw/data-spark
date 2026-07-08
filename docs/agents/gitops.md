@@ -1,9 +1,9 @@
 # GitOps Workflow
 
-Data Spark work is tracked in GitHub Issues and external pull requests,
-implemented through pull requests, and released from signed-off git tags. The
-repository should have one source of truth for work state: labels and PR state
-in GitHub.
+Data Spark work requests are tracked in GitHub Issues and external pull
+requests. Changes ship through pull requests, and releases are cut from
+signed-off git tags. The repository should have one source of truth for work
+state: labels and PR state in GitHub.
 
 ## State labels
 
