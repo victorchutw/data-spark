@@ -28,8 +28,8 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           version="${tag#v}"
 
-          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "Release tag must be vMAJOR.MINOR.PATCH; got $tag" >&2
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'; then
+            echo "Release tag must be vMAJOR.MINOR.PATCH or vMAJOR.MINOR.PATCH-prerelease; got $tag" >&2
             exit 1
           fi
 
@@ -71,6 +71,13 @@ jobs:
           tag="${GITHUB_REF_NAME}"
           checksum=$(cut -d' ' -f1 dist/SHA256SUMS)
           notes_file=$(mktemp)
+          release_flags=(--title "$tag" --notes-file "$notes_file")
+
+          if printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-'; then
+            release_flags+=(--prerelease)
+          else
+            release_flags+=(--latest)
+          fi
 
           {
             printf 'Data Spark %s\n\n' "$tag"
@@ -82,6 +89,4 @@ jobs:
 
           gh release create "$tag" \
             dist/data-spark-linux-x86_64 \
-            --title "$tag" \
-            --notes-file "$notes_file" \
-            --latest
+            "${release_flags[@]}"

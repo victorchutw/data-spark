@@ -7,8 +7,8 @@ body:
     id: version
     attributes:
       label: Version
-      description: Semver version to release, without the leading v.
-      placeholder: "0.1.0"
+      description: SemVer version to release, without the leading v. Prerelease versions are allowed for pipeline validation.
+      placeholder: "0.1.0-alpha.1"
     validations:
       required: true
   - type: textarea
@@ -33,6 +33,8 @@ body:
         - label: CI is green on main.
           required: true
         - label: The release tag will be annotated and pushed from main.
+          required: true
+        - label: Stable releases should be latest; prereleases should be marked prerelease.
           required: true
         - label: The GitHub Release should contain exactly one binary asset.
           required: true

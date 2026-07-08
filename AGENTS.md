@@ -10,7 +10,7 @@ This repo uses the default triage label vocabulary: `needs-triage`, `needs-info`
 
 ### GitOps workflow
 
-Work starts from GitHub Issues, moves through issue state labels and PRs, and releases from `v*.*.*` tags to a single Linux x86_64 binary asset. See `docs/agents/gitops.md`.
+Work starts from GitHub Issues, moves through issue state labels and PRs, and releases from `v`-prefixed SemVer tags to a single Linux x86_64 binary asset. See `docs/agents/gitops.md`.
 
 ### Domain docs
 
