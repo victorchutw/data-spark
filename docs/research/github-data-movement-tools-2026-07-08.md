@@ -42,7 +42,7 @@ The target product is a single-binary tool that moves data from sources to BI-re
    Sling and Redpanda Connect show the useful split: quick CLI flags for one-off jobs, YAML/JSON for jobs that belong in git. The MVP should support both, but avoid building a UI first.
 
 3. BI readiness means typed, queryable outputs.
-   The strongest local-first targets are DuckDB and Parquet. Warehouse/database targets matter too, but a portable tool should make `source -> DuckDB` and `source -> Parquet` excellent before chasing every SaaS API.
+   The strongest local-first targets are DuckDB and Parquet. BigQuery is the first cloud warehouse destination because it gives the tool a BI-native hosted path without turning the product into a connector marketplace.
 
 4. Incremental loading is a first-class line, not a later option.
    dlt, ingestr, Airbyte, Debezium, and Redpanda Connect all treat incremental state as core. The design should model load modes explicitly: `full_refresh`, `append`, `merge/upsert`, and later CDC.
@@ -64,7 +64,7 @@ The target product is a single-binary tool that moves data from sources to BI-re
 The pragmatic first product is a batch ELT CLI:
 
 - Sources: local files, HTTP/S3-compatible objects, PostgreSQL, MySQL, SQLite, DuckDB.
-- Destinations: DuckDB, Parquet directory, PostgreSQL, SQLite.
+- Destinations: DuckDB, Parquet directory, PostgreSQL, SQLite, BigQuery.
 - Formats: CSV, JSONL, Parquet; add Excel later if needed.
 - Execution model: streaming `RecordBatch` pipeline with bounded memory.
 - Job interface: command flags for one-shot use, YAML for repeatable jobs.
@@ -99,3 +99,6 @@ The first design boundary is whether the tool is primarily a batch movement tool
 - https://github.com/dathere/qsv
 - https://github.com/meltano/meltano
 - https://github.com/slingdata-io/sling-cli
+- https://docs.cloud.google.com/bigquery/docs/loading-data
+- https://docs.cloud.google.com/bigquery/docs/batch-loading-data
+- https://docs.cloud.google.com/bigquery/docs/write-api-streaming

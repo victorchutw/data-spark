@@ -16,6 +16,10 @@ _Avoid_: Input, upstream
 A system, file, object store, or analytical store that data is written to.
 _Avoid_: Output, target, downstream
 
+**Cloud Warehouse Destination**:
+A managed analytical destination that stores BI-ready datasets outside the local machine.
+_Avoid_: Cloud service, warehouse, hosted target
+
 **Connector**:
 A named capability for reading from a source or writing to a destination.
 _Avoid_: Adapter, integration, driver
