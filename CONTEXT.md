@@ -40,6 +40,14 @@ _Avoid_: Row, event, object
 One attempt to move records from a source into a destination.
 _Avoid_: Job, run, sync
 
+**Load Definition**:
+A saved description of a repeatable load, including its source, destination, load mode, schema choices, and related rules.
+_Avoid_: Job config, pipeline, workflow
+
+**One-Off Load**:
+A load started directly from command-line options without first saving a load definition.
+_Avoid_: Ad hoc job, quick run
+
 **Load Mode**:
 The rule that determines how a load changes the destination dataset.
 _Avoid_: Strategy, write mode
