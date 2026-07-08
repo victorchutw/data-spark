@@ -36,6 +36,10 @@ _Avoid_: Config file, credential file
 Sensitive proof that allows a connector to access a source or destination.
 _Avoid_: Password, token, secret
 
+**Credential Reference**:
+A non-sensitive pointer used to resolve a credential at load time.
+_Avoid_: Secret value, embedded credential
+
 **Dataset**:
 A named collection of records that is meaningful to a BI user.
 _Avoid_: Table, file, stream

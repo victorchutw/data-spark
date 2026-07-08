@@ -70,14 +70,14 @@ The pragmatic first product is a batch ELT CLI:
 - Formats: CSV, JSONL, Parquet; add Excel later if needed.
 - Execution model: streaming `RecordBatch` pipeline with bounded memory.
 - Job interface: YAML load definitions are the canonical form for repeatable loads; command flags support one-off loads as an on-ramp and can emit a YAML skeleton, but complex behavior and credentials stay out of flags.
-- Connections: load definitions use connection references only; credentials resolve from environment variables, local connection profiles, or secure prompts.
+- Connections: load definitions use connection references only; credentials resolve from environment variables, local connection profiles, or secure prompts. Local profiles store non-sensitive settings and credential references, not secret values; encrypted secret storage is deferred beyond v1.
 - Load modes: full refresh and append first, then merge load within v1. Merge loads require a resolved merge key: users either provide one or explicitly request strict DB metadata key discovery.
 - Schema: infer by default, preview before load, allow overrides, allow pinning for repeatable BI-ready datasets, fail fast on drift by default, allow explicit additive nullable drift, and write rejected rows.
 - Reporting: JSON run report plus human progress output.
 
 ## Current Design Boundary
 
-The product is batch-first for v1. Schemas are inferred by default, but users can override and pin them for repeatable BI-ready loads. Schema drift fails fast by default, with an explicit opt-in path for additive nullable fields. Merge load belongs in v1, after full refresh and append are implemented, and merge loads require a resolved merge key. YAML load definitions are canonical for repeatable loads, while command flags support one-off loads and YAML skeleton generation without becoming a second full configuration language. Load definitions contain connection references, not credentials. The next design boundary is where local connection profiles live and whether they should support encrypted storage in v1.
+The product is batch-first for v1. Schemas are inferred by default, but users can override and pin them for repeatable BI-ready loads. Schema drift fails fast by default, with an explicit opt-in path for additive nullable fields. Merge load belongs in v1, after full refresh and append are implemented, and merge loads require a resolved merge key. YAML load definitions are canonical for repeatable loads, while command flags support one-off loads and YAML skeleton generation without becoming a second full configuration language. Load definitions contain connection references, not credentials, and v1 local profiles avoid storing secret values. The next design boundary is where local connection profiles live.
 
 ## Sources
 
