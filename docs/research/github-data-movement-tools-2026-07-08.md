@@ -71,12 +71,12 @@ The pragmatic first product is a batch ELT CLI:
 - Execution model: streaming `RecordBatch` pipeline with bounded memory.
 - Job interface: command flags for one-shot use, YAML for repeatable jobs.
 - Load modes: full refresh and append first; merge/upsert immediately after if one destination supports it cleanly.
-- Schema: infer, preview, override, and write rejected rows.
+- Schema: infer by default, preview before load, allow overrides, allow pinning for repeatable BI-ready datasets, and write rejected rows.
 - Reporting: JSON run report plus human progress output.
 
 ## Current Design Boundary
 
-The product is batch-first for v1. The next design boundary is how much schema control users must provide up front versus how much the tool infers and repairs automatically.
+The product is batch-first for v1. Schemas are inferred by default, but users can override and pin them for repeatable BI-ready loads. The next design boundary is how schema drift should behave when a later load no longer matches the pinned schema.
 
 ## Sources
 

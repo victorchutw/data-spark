@@ -28,6 +28,10 @@ _Avoid_: Adapter, integration, driver
 A named collection of records that is meaningful to a BI user.
 _Avoid_: Table, file, stream
 
+**Dataset Schema**:
+The expected fields and types for records in a dataset.
+_Avoid_: Schema, table definition
+
 **Record**:
 One logical item inside a dataset.
 _Avoid_: Row, event, object
@@ -59,6 +63,18 @@ _Avoid_: Bad row, error row, dead letter
 **Staging Object**:
 A temporary data object prepared so a destination can load records through its native batch loading path.
 _Avoid_: Temp file, intermediate file, upload
+
+**Inferred Schema**:
+A dataset schema produced from observed source records.
+_Avoid_: Auto schema, detected schema
+
+**Schema Override**:
+User-provided changes to an inferred schema before records are loaded.
+_Avoid_: Manual schema, schema mapping
+
+**Pinned Schema**:
+A dataset schema that is reused across loads to keep a BI-ready dataset stable.
+_Avoid_: Fixed schema, locked schema
 
 **Schema Drift**:
 A difference between the source's observed record shape and the destination dataset's expected shape.
