@@ -14,16 +14,16 @@ This slice establishes the product boundary that later source and destination sl
 
 ## Acceptance criteria
 
-- [ ] A CLI command accepts a path to a YAML load definition and runs through a load lifecycle.
-- [ ] A load definition with `version: 1` is accepted as the v1 contract.
-- [ ] A load definition with a missing version fails before source or destination work starts.
-- [ ] A load definition with an unsupported version fails before source or destination work starts.
-- [ ] Every CLI invocation creates or attempts to create a load id and artifact directory for that load.
-- [ ] Every completed or failed load writes a JSON load report with `report_version: 1`.
-- [ ] The load report includes load id, source summary, destination summary, load mode, timings, exit status, and error summary where applicable.
-- [ ] Stdout contains a human-readable load summary and is not required for machine-readable automation.
-- [ ] Process exit status distinguishes success from failure.
-- [ ] Contract-level tests cover successful v1 parsing, missing version failure, unsupported version failure, report writing, summary output, and exit status.
+- [x] A CLI command accepts a path to a YAML load definition and runs through a load lifecycle.
+- [x] A load definition with `version: 1` is accepted as the v1 contract.
+- [x] A load definition with a missing version fails before source or destination work starts.
+- [x] A load definition with an unsupported version fails before source or destination work starts.
+- [x] Every CLI invocation creates or attempts to create a load id and artifact directory for that load.
+- [x] Every completed or failed load writes a JSON load report with `report_version: 1`.
+- [x] The load report includes load id, source summary, destination summary, load mode, timings, exit status, and error summary where applicable.
+- [x] Stdout contains a human-readable load summary and is not required for machine-readable automation.
+- [x] Process exit status distinguishes success from failure.
+- [x] Contract-level tests cover successful v1 parsing, missing version failure, unsupported version failure, report writing, summary output, and exit status.
 
 ## Blocked by
 
