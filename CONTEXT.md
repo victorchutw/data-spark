@@ -64,6 +64,14 @@ _Avoid_: Job config, pipeline, workflow
 A load started directly from command-line options without first saving a load definition.
 _Avoid_: Ad hoc job, quick run
 
+**Load Report**:
+A machine-readable record of a load's outcome, diagnostics, and measurements.
+_Avoid_: Run report, log, audit file
+
+**Load Summary**:
+A human-readable description of a load's outcome.
+_Avoid_: Console report, status output
+
 **Load Mode**:
 The rule that determines how a load changes the destination dataset.
 _Avoid_: Strategy, write mode

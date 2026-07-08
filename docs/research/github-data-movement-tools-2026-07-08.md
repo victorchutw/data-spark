@@ -54,10 +54,10 @@ The target product is a single-binary tool that moves data from sources to BI-re
    Miller, qsv, Redpanda Connect, Vector, and DataFusion all point toward chunked/streaming execution. A Rust version should use Arrow `RecordBatch` or a similar batch abstraction internally rather than row-by-row dynamic maps as the main path.
 
 7. Observability should exist without a server.
-   Logs, progress counters, row counts, byte counts, error counts, schema drift warnings, retry summaries, and machine-readable run reports are enough for a single binary MVP. Metrics endpoints and tracing can come later.
+   Logs, progress counters, row counts, byte counts, error counts, schema drift warnings, retry summaries, and machine-readable load reports are enough for a single binary MVP. Metrics endpoints and tracing can come later.
 
 8. Do not start with orchestration.
-   Airflow, Dagster, and Prefect are important downstream integrations, but embedding a scheduler or workflow server into the first version would blur the tool. The first integration point should be "this CLI exits with a useful status and writes a run report."
+   Airflow, Dagster, and Prefect are important downstream integrations, but embedding a scheduler or workflow server into the first version would blur the tool. The first integration point should be "this CLI exits with a useful status and writes a load report."
 
 ## Recommended MVP Cut
 
@@ -73,11 +73,11 @@ The pragmatic first product is a batch ELT CLI:
 - Connections: load definitions use connection references only; credentials resolve from environment variables, local connection profiles, or secure prompts. Local profiles store non-sensitive settings and credential references, not secret values; encrypted secret storage is deferred beyond v1. Profiles live in the platform config directory, with `DATA_SPARK_CONFIG_DIR` for overrides.
 - Load modes: full refresh and append first, then merge load within v1. Merge loads require a resolved merge key: users either provide one or explicitly request strict DB metadata key discovery.
 - Schema: infer by default, preview before load, allow overrides, allow pinning for repeatable BI-ready datasets, fail fast on drift by default, allow explicit additive nullable drift, and write rejected rows.
-- Reporting: JSON run report plus human progress output.
+- Reporting: JSON load report for every load, plus a human-readable load summary on stdout. The report includes load id, source, destination, load mode, schema decision, row counts, byte counts, rejected record counts, drift status, timings, exit status, and error summary.
 
 ## Current Design Boundary
 
-The product is batch-first for v1. Schemas are inferred by default, but users can override and pin them for repeatable BI-ready loads. Schema drift fails fast by default, with an explicit opt-in path for additive nullable fields. Merge load belongs in v1, after full refresh and append are implemented, and merge loads require a resolved merge key. YAML load definitions are canonical for repeatable loads, while command flags support one-off loads and YAML skeleton generation without becoming a second full configuration language. Load definitions contain connection references, not credentials, and v1 local profiles avoid storing secret values. Connection profiles live in the platform config directory and can be relocated with `DATA_SPARK_CONFIG_DIR`. The next design boundary is the run report format.
+The product is batch-first for v1. Schemas are inferred by default, but users can override and pin them for repeatable BI-ready loads. Schema drift fails fast by default, with an explicit opt-in path for additive nullable fields. Merge load belongs in v1, after full refresh and append are implemented, and merge loads require a resolved merge key. YAML load definitions are canonical for repeatable loads, while command flags support one-off loads and YAML skeleton generation without becoming a second full configuration language. Load definitions contain connection references, not credentials, and v1 local profiles avoid storing secret values. Connection profiles live in the platform config directory and can be relocated with `DATA_SPARK_CONFIG_DIR`. Every load writes a JSON load report and stdout shows a human-readable load summary. The next design boundary is where load reports and rejected records are written.
 
 ## Sources
 
