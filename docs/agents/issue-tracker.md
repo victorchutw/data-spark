@@ -1,6 +1,14 @@
 # Issue tracker: GitHub
 
-Issues and PRDs for this repo live as GitHub Issues in `victorchutw/data-spark`. Use the `gh` CLI for all operations.
+Issues and PRDs for this repo live as GitHub Issues in
+`victorchutw/data-spark`. Use the `gh` CLI for all issue and pull request
+operations.
+
+## Request surfaces
+
+- GitHub Issues are always a triage surface.
+- External GitHub PRs are also a triage surface.
+- Collaborator PRs are implementation work in progress, not incoming requests.
 
 ## Conventions
 
@@ -12,14 +20,30 @@ Issues and PRDs for this repo live as GitHub Issues in `victorchutw/data-spark`.
 - **Close**: `gh issue close <number> --comment "..."`
 
 Infer the repo from `git remote -v`; `gh` does this automatically when run inside this clone.
+Use the label strings from `docs/agents/triage-labels.md`.
 
 ## Pull requests as a triage surface
 
-**PRs as a request surface: no.**
+**PRs as a request surface: yes.**
 
-Do not pull external PRs into the triage queue unless this file is explicitly changed to say so.
+External PRs are part of the triage queue and should run through the same labels
+and states as issues. Ignore collaborators' in-flight PRs.
 
-GitHub shares one number space across issues and PRs, so a bare `#42` may be either. Resolve with `gh pr view 42` and fall back to `gh issue view 42` when needed.
+Treat a PR as external only when `authorAssociation` is `CONTRIBUTOR`,
+`FIRST_TIME_CONTRIBUTOR`, or `NONE`. Drop `OWNER`, `MEMBER`, and
+`COLLABORATOR`.
+
+Use the `gh pr` equivalents when processing PRs:
+
+- **Read a PR**: `gh pr view <number> --comments` and `gh pr diff <number>`
+  for the diff.
+- **List external PRs for triage**: `gh pr list --state open --json number,title,body,labels,author,authorAssociation,comments`, then filter by `authorAssociation`.
+- **Comment / label / close**: `gh pr comment`, `gh pr edit --add-label` /
+  `--remove-label`, and `gh pr close`.
+
+GitHub shares one number space across issues and PRs, so a bare `#42` may be
+either. Resolve with `gh pr view 42` and fall back to `gh issue view 42` when
+needed.
 
 ## When a skill says "publish to the issue tracker"
 
@@ -27,4 +51,6 @@ Create a GitHub issue with `gh issue create`.
 
 ## When a skill says "fetch the relevant ticket"
 
-Run `gh issue view <number> --comments`.
+Resolve whether the number is a PR or issue first. Try
+`gh pr view <number> --comments`, then fall back to
+`gh issue view <number> --comments`.

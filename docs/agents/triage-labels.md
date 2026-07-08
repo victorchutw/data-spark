@@ -10,11 +10,18 @@ The skills speak in terms of five canonical triage roles. This file maps those r
 | `ready-for-human`          | `ready-for-human`    | Requires human implementation            |
 | `wontfix`                  | `wontfix`            | Will not be actioned                     |
 
-When a skill mentions a role, use the corresponding label string from this table.
+When a skill mentions a role, use the corresponding label string from this
+table. Do not create alternate labels with similar meanings.
+
+For each open issue or external PR in the triage queue, keep exactly one
+canonical triage label unless the item has moved into one of the execution
+states below.
 
 ## Execution Labels
 
-GitOps work also uses these additional state labels. Each open issue should have only one state label from this table or the canonical triage table above.
+GitOps work also uses these additional state labels. Each open issue or external
+PR should have only one state label from this table or the canonical triage
+table above.
 
 | Label | Meaning |
 | ----- | ------- |
