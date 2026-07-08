@@ -1,6 +1,6 @@
 # Issue 02: Load local CSV to Parquet full refresh
 
-Status: ready-for-agent
+Status: ready-for-human
 
 ## Parent
 
@@ -14,16 +14,16 @@ This is the first real tracer bullet through source reading, schema inference, e
 
 ## Acceptance criteria
 
-- [ ] A `version: 1` load definition can name a local CSV source and Parquet directory destination.
-- [ ] The CSV source reads records from a local file path and reports a clear failure for malformed CSV syntax.
-- [ ] The load infers a dataset schema from the CSV source by default.
-- [ ] Records move through the internal execution path as Arrow `RecordBatch` batches.
-- [ ] A full refresh writes a readable Parquet directory for the destination dataset.
-- [ ] Existing destination data is replaced according to full refresh semantics.
-- [ ] The load report records source, destination, full refresh load mode, schema decision, row counts, byte counts where available, timings, exit status, and destination write atomicity.
-- [ ] The artifact directory includes `load-report.json`.
-- [ ] Stdout includes a human-readable load summary with the load outcome and core counts.
-- [ ] Integration tests invoke the CLI end to end and verify the Parquet destination with an external Parquet-capable reader.
+- [x] A `version: 1` load definition can name a local CSV source and Parquet directory destination.
+- [x] The CSV source reads records from a local file path and reports a clear failure for malformed CSV syntax.
+- [x] The load infers a dataset schema from the CSV source by default.
+- [x] Records move through the internal execution path as Arrow `RecordBatch` batches.
+- [x] A full refresh writes a readable Parquet directory for the destination dataset.
+- [x] Existing destination data is replaced according to full refresh semantics.
+- [x] The load report records source, destination, full refresh load mode, schema decision, row counts, byte counts where available, timings, exit status, and destination write atomicity.
+- [x] The artifact directory includes `load-report.json`.
+- [x] Stdout includes a human-readable load summary with the load outcome and core counts.
+- [x] Integration tests invoke the CLI end to end and verify the Parquet destination with an external Parquet-capable reader.
 
 ## Blocked by
 

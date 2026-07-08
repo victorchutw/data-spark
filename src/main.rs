@@ -1,9 +1,15 @@
+use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::{DataType, Field, Schema};
 use clap::{Args, Parser, Subcommand};
-use serde::Serialize;
+use parquet::arrow::ArrowWriter;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::fs;
+use std::fs::{self, File};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -38,10 +44,28 @@ struct LoadReport {
     source_summary: Value,
     destination_summary: Value,
     load_mode: String,
+    schema_decision: Value,
+    row_counts: RowCounts,
+    byte_counts: ByteCounts,
+    destination_write: Value,
+    execution: Value,
     timings: Timings,
     exit_status: &'static str,
     process_exit_code: u8,
     error_summary: Option<ErrorSummary>,
+}
+
+#[derive(Clone, Serialize)]
+struct RowCounts {
+    source: u64,
+    written: u64,
+    rejected: u64,
+}
+
+#[derive(Clone, Serialize)]
+struct ByteCounts {
+    source: Option<u64>,
+    destination: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -51,7 +75,7 @@ struct Timings {
     duration_ms: u128,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct ErrorSummary {
     code: &'static str,
     message: String,
@@ -64,9 +88,67 @@ struct LoadOutcome {
     source_summary: Value,
     destination_summary: Value,
     load_mode: String,
+    row_counts: RowCounts,
     exit_status: &'static str,
     process_exit_code: u8,
     error_summary: Option<ErrorSummary>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct LoadDefinition {
+    version: Option<u64>,
+    source: Option<SourceDefinition>,
+    destination: Option<DestinationDefinition>,
+    dataset: Option<String>,
+    load_mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct SourceDefinition {
+    connector: String,
+    path: PathBuf,
+    format: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DestinationDefinition {
+    connector: String,
+    path: PathBuf,
+}
+
+struct ExecutionDetails {
+    source_summary: Value,
+    destination_summary: Value,
+    load_mode: String,
+    schema_decision: Value,
+    row_counts: RowCounts,
+    byte_counts: ByteCounts,
+    destination_write: Value,
+    execution: Value,
+    error_summary: Option<ErrorSummary>,
+}
+
+struct CsvBatch {
+    batch: RecordBatch,
+    source_bytes: u64,
+}
+
+struct DestinationStats {
+    bytes_written: u64,
+}
+
+struct LoadFailure {
+    code: &'static str,
+    message: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InferredType {
+    Null,
+    Boolean,
+    Int64,
+    Float64,
+    Utf8,
 }
 
 fn main() -> ExitCode {
@@ -94,57 +176,9 @@ fn run_load(args: LoadArgs) -> Result<LoadOutcome, Box<dyn std::error::Error>> {
     let artifact_dir = artifact_root.join(&load_id);
     fs::create_dir_all(&artifact_dir)?;
 
-    let (source_summary, destination_summary, load_mode, error_summary) =
-        match fs::read_to_string(&args.definition) {
-            Ok(definition_text) => match serde_yaml::from_str::<Value>(&definition_text) {
-                Ok(definition) => {
-                    let source_summary = object_or_empty(definition.get("source"));
-                    let destination_summary = object_or_empty(definition.get("destination"));
-                    let load_mode = definition
-                        .get("load_mode")
-                        .and_then(Value::as_str)
-                        .unwrap_or("full_refresh")
-                        .to_string();
-                    let error_summary = match definition.get("version").and_then(Value::as_u64) {
-                        Some(SUPPORTED_LOAD_DEFINITION_VERSION) => None,
-                        Some(version) => Some(ErrorSummary {
-                            code: "unsupported_load_definition_version",
-                            message: format!("unsupported load definition version: {version}"),
-                        }),
-                        None => Some(ErrorSummary {
-                            code: "missing_load_definition_version",
-                            message: "load definition version is required".to_string(),
-                        }),
-                    };
-                    (
-                        source_summary,
-                        destination_summary,
-                        load_mode,
-                        error_summary,
-                    )
-                }
-                Err(error) => (
-                    json!({}),
-                    json!({}),
-                    "full_refresh".to_string(),
-                    Some(ErrorSummary {
-                        code: "invalid_load_definition_yaml",
-                        message: format!("failed to parse load definition: {error}"),
-                    }),
-                ),
-            },
-            Err(error) => (
-                json!({}),
-                json!({}),
-                "full_refresh".to_string(),
-                Some(ErrorSummary {
-                    code: "load_definition_read_failed",
-                    message: format!("failed to read load definition: {error}"),
-                }),
-            ),
-        };
+    let details = execute_load_definition(&args.definition, &load_id);
 
-    let (exit_status, process_exit_code) = if error_summary.is_some() {
+    let (exit_status, process_exit_code) = if details.error_summary.is_some() {
         ("failed", 1)
     } else {
         ("succeeded", 0)
@@ -160,13 +194,18 @@ fn run_load(args: LoadArgs) -> Result<LoadOutcome, Box<dyn std::error::Error>> {
         report_version: LOAD_REPORT_VERSION,
         load_id: load_id.clone(),
         artifact_dir: path_string(&artifact_dir),
-        source_summary: source_summary.clone(),
-        destination_summary: destination_summary.clone(),
-        load_mode: load_mode.clone(),
+        source_summary: details.source_summary.clone(),
+        destination_summary: details.destination_summary.clone(),
+        load_mode: details.load_mode.clone(),
+        schema_decision: details.schema_decision.clone(),
+        row_counts: details.row_counts.clone(),
+        byte_counts: details.byte_counts.clone(),
+        destination_write: details.destination_write.clone(),
+        execution: details.execution.clone(),
         timings,
         exit_status,
         process_exit_code,
-        error_summary,
+        error_summary: details.error_summary.clone(),
     };
 
     let report_path = artifact_dir.join("load-report.json");
@@ -176,17 +215,591 @@ fn run_load(args: LoadArgs) -> Result<LoadOutcome, Box<dyn std::error::Error>> {
         load_id,
         artifact_dir,
         report_path,
-        source_summary,
-        destination_summary,
-        load_mode,
+        source_summary: report.source_summary,
+        destination_summary: report.destination_summary,
+        load_mode: report.load_mode,
+        row_counts: report.row_counts,
         exit_status,
         process_exit_code,
         error_summary: report.error_summary,
     })
 }
 
-fn object_or_empty(value: Option<&Value>) -> Value {
-    value.cloned().unwrap_or_else(|| json!({}))
+fn execute_load_definition(definition_path: &Path, load_id: &str) -> ExecutionDetails {
+    let definition_text = match fs::read_to_string(definition_path) {
+        Ok(definition_text) => definition_text,
+        Err(error) => {
+            return failed_details(
+                json!({}),
+                json!({}),
+                "full_refresh".to_string(),
+                "load_definition_read_failed",
+                format!("failed to read load definition: {error}"),
+            )
+        }
+    };
+
+    let definition = match serde_yaml::from_str::<LoadDefinition>(&definition_text) {
+        Ok(definition) => definition,
+        Err(error) => {
+            return failed_details(
+                json!({}),
+                json!({}),
+                "full_refresh".to_string(),
+                "invalid_load_definition_yaml",
+                format!("failed to parse load definition: {error}"),
+            )
+        }
+    };
+
+    let source_summary = definition
+        .source
+        .as_ref()
+        .map(to_json)
+        .unwrap_or_else(|| json!({}));
+    let destination_summary = definition
+        .destination
+        .as_ref()
+        .map(to_json)
+        .unwrap_or_else(|| json!({}));
+    let load_mode = definition
+        .load_mode
+        .clone()
+        .unwrap_or_else(|| "full_refresh".to_string());
+
+    match definition.version {
+        Some(SUPPORTED_LOAD_DEFINITION_VERSION) => {}
+        Some(version) => {
+            return failed_details(
+                source_summary,
+                destination_summary,
+                load_mode,
+                "unsupported_load_definition_version",
+                format!("unsupported load definition version: {version}"),
+            )
+        }
+        None => {
+            return failed_details(
+                source_summary,
+                destination_summary,
+                load_mode,
+                "missing_load_definition_version",
+                "load definition version is required".to_string(),
+            )
+        }
+    }
+
+    match execute_supported_load(&definition, load_id) {
+        Ok(details) => details,
+        Err(failure) => failed_details(
+            source_summary,
+            destination_summary,
+            load_mode,
+            failure.code,
+            failure.message,
+        ),
+    }
+}
+
+fn execute_supported_load(
+    definition: &LoadDefinition,
+    load_id: &str,
+) -> Result<ExecutionDetails, LoadFailure> {
+    let source = definition.source.as_ref().ok_or_else(|| LoadFailure {
+        code: "missing_source",
+        message: "load definition source is required".to_string(),
+    })?;
+    let destination = definition.destination.as_ref().ok_or_else(|| LoadFailure {
+        code: "missing_destination",
+        message: "load definition destination is required".to_string(),
+    })?;
+    let load_mode = definition
+        .load_mode
+        .clone()
+        .unwrap_or_else(|| "full_refresh".to_string());
+
+    if load_mode != "full_refresh" {
+        return Err(LoadFailure {
+            code: "unsupported_load_mode",
+            message: format!("unsupported load mode: {load_mode}"),
+        });
+    }
+
+    if source.connector != "local_file" {
+        return Err(LoadFailure {
+            code: "unsupported_source_connector",
+            message: format!("unsupported source connector: {}", source.connector),
+        });
+    }
+
+    if source_format(source) != "csv" {
+        return Err(LoadFailure {
+            code: "unsupported_source_format",
+            message: "only local CSV sources are supported by this load path".to_string(),
+        });
+    }
+
+    if destination.connector != "parquet" {
+        return Err(LoadFailure {
+            code: "unsupported_destination_connector",
+            message: format!(
+                "unsupported destination connector: {}",
+                destination.connector
+            ),
+        });
+    }
+
+    let csv = read_local_csv_as_record_batch(&source.path)?;
+    let destination_stats = write_parquet_full_refresh(&destination.path, &csv.batch, load_id)?;
+    let row_count = csv.batch.num_rows() as u64;
+
+    Ok(ExecutionDetails {
+        source_summary: to_json(source),
+        destination_summary: to_json(destination),
+        load_mode,
+        schema_decision: inferred_schema_decision(csv.batch.schema().as_ref()),
+        row_counts: RowCounts {
+            source: row_count,
+            written: row_count,
+            rejected: 0,
+        },
+        byte_counts: ByteCounts {
+            source: Some(csv.source_bytes),
+            destination: Some(destination_stats.bytes_written),
+        },
+        destination_write: json!({
+            "atomicity": "best_effort",
+            "strategy": "staging_then_replace"
+        }),
+        execution: json!({
+            "record_format": "arrow_record_batch",
+            "batch_count": 1
+        }),
+        error_summary: None,
+    })
+}
+
+fn failed_details(
+    source_summary: Value,
+    destination_summary: Value,
+    load_mode: String,
+    code: &'static str,
+    message: String,
+) -> ExecutionDetails {
+    ExecutionDetails {
+        source_summary,
+        destination_summary,
+        load_mode,
+        schema_decision: json!({ "mode": "not_evaluated" }),
+        row_counts: RowCounts {
+            source: 0,
+            written: 0,
+            rejected: 0,
+        },
+        byte_counts: ByteCounts {
+            source: None,
+            destination: None,
+        },
+        destination_write: json!({
+            "atomicity": "not_applicable"
+        }),
+        execution: json!({
+            "record_format": "not_started",
+            "batch_count": 0
+        }),
+        error_summary: Some(ErrorSummary { code, message }),
+    }
+}
+
+fn read_local_csv_as_record_batch(source_path: &Path) -> Result<CsvBatch, LoadFailure> {
+    let file = File::open(source_path).map_err(|error| LoadFailure {
+        code: "source_read_failed",
+        message: format!(
+            "failed to read CSV source {}: {error}",
+            source_path.display()
+        ),
+    })?;
+    let source_bytes = file
+        .metadata()
+        .map_err(|error| LoadFailure {
+            code: "source_read_failed",
+            message: format!(
+                "failed to inspect CSV source {}: {error}",
+                source_path.display()
+            ),
+        })?
+        .len();
+
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(false)
+        .from_reader(file);
+    let headers = reader
+        .headers()
+        .map_err(|error| malformed_csv(source_path, error))?
+        .iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    if headers.is_empty() {
+        return Err(LoadFailure {
+            code: "malformed_csv",
+            message: format!(
+                "CSV source {} must include at least one header field",
+                source_path.display()
+            ),
+        });
+    }
+
+    let mut rows = Vec::new();
+    for record in reader.records() {
+        let record = record.map_err(|error| malformed_csv(source_path, error))?;
+        rows.push(
+            record
+                .iter()
+                .map(|value| {
+                    if value.is_empty() {
+                        None
+                    } else {
+                        Some(value.to_string())
+                    }
+                })
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    let inferred_types = infer_column_types(headers.len(), &rows);
+    let schema = Arc::new(Schema::new(
+        headers
+            .iter()
+            .zip(inferred_types.iter())
+            .map(|(name, inferred_type)| Field::new(name, inferred_type.data_type(), true))
+            .collect::<Vec<_>>(),
+    ));
+    let columns = inferred_types
+        .iter()
+        .enumerate()
+        .map(|(column_index, inferred_type)| build_array(*inferred_type, &rows, column_index))
+        .collect::<Result<Vec<_>, _>>()?;
+    let batch = RecordBatch::try_new(schema, columns).map_err(|error| LoadFailure {
+        code: "record_batch_creation_failed",
+        message: format!("failed to create Arrow record batch: {error}"),
+    })?;
+
+    Ok(CsvBatch {
+        batch,
+        source_bytes,
+    })
+}
+
+fn infer_column_types(column_count: usize, rows: &[Vec<Option<String>>]) -> Vec<InferredType> {
+    let mut inferred_types = vec![InferredType::Null; column_count];
+    for row in rows {
+        for (column_index, value) in row.iter().enumerate() {
+            if let Some(value) = value {
+                inferred_types[column_index] = inferred_types[column_index].include(value);
+            }
+        }
+    }
+
+    inferred_types
+        .into_iter()
+        .map(|inferred_type| {
+            if inferred_type == InferredType::Null {
+                InferredType::Utf8
+            } else {
+                inferred_type
+            }
+        })
+        .collect()
+}
+
+fn build_array(
+    inferred_type: InferredType,
+    rows: &[Vec<Option<String>>],
+    column_index: usize,
+) -> Result<ArrayRef, LoadFailure> {
+    match inferred_type {
+        InferredType::Null | InferredType::Utf8 => {
+            let mut builder = StringBuilder::new();
+            for row in rows {
+                match &row[column_index] {
+                    Some(value) => builder.append_value(value),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        InferredType::Boolean => {
+            let mut builder = BooleanBuilder::new();
+            for row in rows {
+                match &row[column_index] {
+                    Some(value) => builder.append_value(
+                        parse_bool(value)
+                            .ok_or_else(|| coercion_failure(column_index, value, "boolean"))?,
+                    ),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        InferredType::Int64 => {
+            let mut builder = Int64Builder::new();
+            for row in rows {
+                match &row[column_index] {
+                    Some(value) => builder.append_value(
+                        value
+                            .parse::<i64>()
+                            .map_err(|_| coercion_failure(column_index, value, "int64"))?,
+                    ),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+        InferredType::Float64 => {
+            let mut builder = Float64Builder::new();
+            for row in rows {
+                match &row[column_index] {
+                    Some(value) => builder.append_value(
+                        value
+                            .parse::<f64>()
+                            .map_err(|_| coercion_failure(column_index, value, "float64"))?,
+                    ),
+                    None => builder.append_null(),
+                }
+            }
+            Ok(Arc::new(builder.finish()))
+        }
+    }
+}
+
+fn write_parquet_full_refresh(
+    destination_path: &Path,
+    batch: &RecordBatch,
+    load_id: &str,
+) -> Result<DestinationStats, LoadFailure> {
+    let parent = destination_path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| LoadFailure {
+        code: "destination_write_failed",
+        message: format!(
+            "failed to prepare destination parent {}: {error}",
+            parent.display()
+        ),
+    })?;
+
+    let destination_name = destination_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("dataset");
+    let staging_path = parent.join(format!(".{destination_name}.data-spark-staging-{load_id}"));
+    remove_path_if_exists(&staging_path).map_err(|error| LoadFailure {
+        code: "destination_write_failed",
+        message: format!(
+            "failed to clear staging destination {}: {error}",
+            staging_path.display()
+        ),
+    })?;
+    fs::create_dir_all(&staging_path).map_err(|error| LoadFailure {
+        code: "destination_write_failed",
+        message: format!(
+            "failed to create staging destination {}: {error}",
+            staging_path.display()
+        ),
+    })?;
+
+    let parquet_file_path = staging_path.join("part-00000.parquet");
+    let file = File::create(&parquet_file_path).map_err(|error| LoadFailure {
+        code: "destination_write_failed",
+        message: format!(
+            "failed to create Parquet file {}: {error}",
+            parquet_file_path.display()
+        ),
+    })?;
+    let mut writer =
+        ArrowWriter::try_new(file, batch.schema(), None).map_err(|error| LoadFailure {
+            code: "destination_write_failed",
+            message: format!("failed to initialize Parquet writer: {error}"),
+        })?;
+    writer.write(batch).map_err(|error| LoadFailure {
+        code: "destination_write_failed",
+        message: format!("failed to write Parquet records: {error}"),
+    })?;
+    writer.close().map_err(|error| LoadFailure {
+        code: "destination_write_failed",
+        message: format!("failed to close Parquet writer: {error}"),
+    })?;
+
+    remove_path_if_exists(destination_path).map_err(|error| LoadFailure {
+        code: "destination_write_failed",
+        message: format!(
+            "failed to replace existing destination {}: {error}",
+            destination_path.display()
+        ),
+    })?;
+    fs::rename(&staging_path, destination_path).map_err(|error| LoadFailure {
+        code: "destination_write_failed",
+        message: format!(
+            "failed to commit Parquet destination {}: {error}",
+            destination_path.display()
+        ),
+    })?;
+
+    let bytes_written = directory_bytes(destination_path).map_err(|error| LoadFailure {
+        code: "destination_write_failed",
+        message: format!(
+            "failed to inspect Parquet destination {}: {error}",
+            destination_path.display()
+        ),
+    })?;
+    Ok(DestinationStats { bytes_written })
+}
+
+fn malformed_csv(source_path: &Path, error: csv::Error) -> LoadFailure {
+    LoadFailure {
+        code: "malformed_csv",
+        message: format!("malformed CSV syntax in {}: {error}", source_path.display()),
+    }
+}
+
+fn coercion_failure(column_index: usize, value: &str, data_type: &str) -> LoadFailure {
+    LoadFailure {
+        code: "schema_coercion_failed",
+        message: format!(
+            "failed to coerce CSV column {} value {:?} to {data_type}",
+            column_index + 1,
+            value
+        ),
+    }
+}
+
+fn source_format(source: &SourceDefinition) -> String {
+    source.format.clone().unwrap_or_else(|| {
+        source
+            .path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_string()
+    })
+}
+
+fn inferred_schema_decision(schema: &Schema) -> Value {
+    json!({
+        "mode": "inferred",
+        "fields": schema
+            .fields()
+            .iter()
+            .map(|field| {
+                json!({
+                    "name": field.name(),
+                    "type": data_type_name(field.data_type()),
+                    "nullable": field.is_nullable()
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+}
+
+fn data_type_name(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Boolean => "boolean",
+        DataType::Int64 => "int64",
+        DataType::Float64 => "float64",
+        DataType::Utf8 => "utf8",
+        _ => "unsupported",
+    }
+}
+
+fn to_json<T: Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).unwrap_or_else(|_| json!({}))
+}
+
+fn remove_path_if_exists(path: &Path) -> io::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
+fn directory_bytes(path: &Path) -> io::Result<u64> {
+    let mut total = 0;
+    for entry in fs::read_dir(path)? {
+        let path = entry?.path();
+        let metadata = fs::metadata(&path)?;
+        if metadata.is_dir() {
+            total += directory_bytes(&path)?;
+        } else {
+            total += metadata.len();
+        }
+    }
+    Ok(total)
+}
+
+impl InferredType {
+    fn include(self, value: &str) -> Self {
+        match self {
+            InferredType::Utf8 => InferredType::Utf8,
+            InferredType::Null => infer_value_type(value),
+            InferredType::Boolean => {
+                if parse_bool(value).is_some() {
+                    InferredType::Boolean
+                } else {
+                    InferredType::Utf8
+                }
+            }
+            InferredType::Int64 => {
+                if value.parse::<i64>().is_ok() {
+                    InferredType::Int64
+                } else if value.parse::<f64>().is_ok() {
+                    InferredType::Float64
+                } else {
+                    InferredType::Utf8
+                }
+            }
+            InferredType::Float64 => {
+                if value.parse::<f64>().is_ok() {
+                    InferredType::Float64
+                } else {
+                    InferredType::Utf8
+                }
+            }
+        }
+    }
+
+    fn data_type(self) -> DataType {
+        match self {
+            InferredType::Null | InferredType::Utf8 => DataType::Utf8,
+            InferredType::Boolean => DataType::Boolean,
+            InferredType::Int64 => DataType::Int64,
+            InferredType::Float64 => DataType::Float64,
+        }
+    }
+}
+
+fn infer_value_type(value: &str) -> InferredType {
+    if parse_bool(value).is_some() {
+        InferredType::Boolean
+    } else if value.parse::<i64>().is_ok() {
+        InferredType::Int64
+    } else if value.parse::<f64>().is_ok() {
+        InferredType::Float64
+    } else {
+        InferredType::Utf8
+    }
+}
+
+fn parse_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" | "TRUE" | "True" => Some(true),
+        "false" | "FALSE" | "False" => Some(false),
+        _ => None,
+    }
 }
 
 fn unix_ms() -> u128 {
@@ -205,6 +818,8 @@ fn print_summary(outcome: &LoadOutcome) {
         "Destination: {}",
         summary_text(&outcome.destination_summary)
     );
+    println!("Records read: {}", outcome.row_counts.source);
+    println!("Records written: {}", outcome.row_counts.written);
     println!("Artifact directory: {}", path_string(&outcome.artifact_dir));
     println!("Load report: {}", path_string(&outcome.report_path));
     if let Some(error) = &outcome.error_summary {
