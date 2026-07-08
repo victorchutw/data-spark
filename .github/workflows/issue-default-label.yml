@@ -1,0 +1,33 @@
+name: issue-default-label
+
+on:
+  issues:
+    types:
+      - opened
+      - reopened
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  needs-triage:
+    name: apply default state
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add needs-triage when no state label exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+
+          current_state_count=$(
+            gh issue view "$ISSUE_NUMBER" \
+              --json labels \
+              --jq '[.labels[].name] | map(select(. == "needs-triage" or . == "needs-info" or . == "ready-for-agent" or . == "ready-for-human" or . == "in-progress" or . == "in-review" or . == "blocked" or . == "wontfix")) | length'
+          )
+
+          if [ "$current_state_count" -eq 0 ]; then
+            gh issue edit "$ISSUE_NUMBER" --add-label "needs-triage"
+          fi

@@ -1,0 +1,87 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    name: linux x86_64 binary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust stable
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Validate tag and Cargo version
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Release tag must be vMAJOR.MINOR.PATCH; got $tag" >&2
+            exit 1
+          fi
+
+          cargo_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$cargo_version" != "$version" ]; then
+            echo "Cargo.toml version $cargo_version does not match tag $tag" >&2
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin data-spark
+
+      - name: Prepare binary asset
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+          cp target/release/data-spark dist/data-spark-linux-x86_64
+          strip dist/data-spark-linux-x86_64
+          chmod +x dist/data-spark-linux-x86_64
+          ./dist/data-spark-linux-x86_64 --help
+          sha256sum dist/data-spark-linux-x86_64 | tee dist/SHA256SUMS
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          checksum=$(cut -d' ' -f1 dist/SHA256SUMS)
+          notes_file=$(mktemp)
+
+          {
+            printf 'Data Spark %s\n\n' "$tag"
+            printf 'Binary asset:\n\n'
+            printf '- `data-spark-linux-x86_64`\n\n'
+            printf 'SHA256:\n\n'
+            printf '```text\n%s  data-spark-linux-x86_64\n```\n' "$checksum"
+          } > "$notes_file"
+
+          gh release create "$tag" \
+            dist/data-spark-linux-x86_64 \
+            --title "$tag" \
+            --notes-file "$notes_file" \
+            --latest

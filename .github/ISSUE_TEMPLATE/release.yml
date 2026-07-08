@@ -1,0 +1,38 @@
+name: Release
+description: Prepare and cut a Data Spark binary release.
+title: "Release vX.Y.Z"
+labels: ["ready-for-human"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Semver version to release, without the leading v.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: textarea
+    id: included_issues
+    attributes:
+      label: Included issues
+      description: List the issues included in this release.
+      placeholder: |
+        - #2
+        - #3
+    validations:
+      required: true
+  - type: checkboxes
+    id: readiness
+    attributes:
+      label: Release checklist
+      options:
+        - label: All included issues are closed or explicitly deferred.
+          required: true
+        - label: Cargo.toml version matches the planned release version.
+          required: true
+        - label: CI is green on main.
+          required: true
+        - label: The release tag will be annotated and pushed from main.
+          required: true
+        - label: The GitHub Release should contain exactly one binary asset.
+          required: true

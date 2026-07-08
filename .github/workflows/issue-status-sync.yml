@@ -1,0 +1,56 @@
+name: issue-status-sync
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - converted_to_draft
+      - ready_for_review
+
+permissions:
+  issues: write
+  pull-requests: read
+  contents: read
+
+jobs:
+  sync:
+    name: sync referenced issue state
+    runs-on: ubuntu-latest
+    steps:
+      - name: Move referenced issues
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
+        run: |
+          set -euo pipefail
+
+          if [ "$PR_DRAFT" = "true" ]; then
+            target_label="in-progress"
+          else
+            target_label="in-review"
+          fi
+
+          issue_numbers=$(
+            printf '%s\n%s\n' "$PR_TITLE" "$PR_BODY" \
+              | grep -Eio '(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' \
+              | grep -Eo '[0-9]+' \
+              | sort -u \
+              || true
+          )
+
+          if [ -z "$issue_numbers" ]; then
+            echo "No referenced issues found."
+            exit 0
+          fi
+
+          state_labels="needs-triage needs-info ready-for-agent ready-for-human in-progress in-review blocked wontfix"
+
+          for issue_number in $issue_numbers; do
+            for state_label in $state_labels; do
+              gh issue edit "$issue_number" --remove-label "$state_label" >/dev/null 2>&1 || true
+            done
+            gh issue edit "$issue_number" --add-label "$target_label"
+          done
