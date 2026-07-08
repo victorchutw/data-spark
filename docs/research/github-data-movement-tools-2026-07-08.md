@@ -70,13 +70,13 @@ The pragmatic first product is a batch ELT CLI:
 - Formats: CSV, JSONL, Parquet; add Excel later if needed.
 - Execution model: streaming `RecordBatch` pipeline with bounded memory.
 - Job interface: command flags for one-shot use, YAML for repeatable jobs.
-- Load modes: full refresh and append first, then merge load within v1.
+- Load modes: full refresh and append first, then merge load within v1. Merge loads require a resolved merge key: users either provide one or explicitly request strict DB metadata key discovery.
 - Schema: infer by default, preview before load, allow overrides, allow pinning for repeatable BI-ready datasets, fail fast on drift by default, allow explicit additive nullable drift, and write rejected rows.
 - Reporting: JSON run report plus human progress output.
 
 ## Current Design Boundary
 
-The product is batch-first for v1. Schemas are inferred by default, but users can override and pin them for repeatable BI-ready loads. Schema drift fails fast by default, with an explicit opt-in path for additive nullable fields. Merge load belongs in v1, after full refresh and append are implemented. The next design boundary is how records are matched for merge loads.
+The product is batch-first for v1. Schemas are inferred by default, but users can override and pin them for repeatable BI-ready loads. Schema drift fails fast by default, with an explicit opt-in path for additive nullable fields. Merge load belongs in v1, after full refresh and append are implemented, and merge loads require a resolved merge key. The next design boundary is how the CLI represents repeatable load definitions.
 
 ## Sources
 

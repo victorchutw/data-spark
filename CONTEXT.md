@@ -56,6 +56,18 @@ _Avoid_: Insert-only, incremental append
 A load mode that updates matching records and inserts records that do not already exist.
 _Avoid_: Upsert, incremental merge
 
+**Merge Key**:
+The field or fields used to decide whether a source record matches an existing destination record during a merge load.
+_Avoid_: Primary key, unique key, id
+
+**Resolved Merge Key**:
+A merge key that has been explicitly provided by the user or explicitly discovered from source metadata.
+_Avoid_: Detected key, guessed key
+
+**Key Discovery**:
+The act of deriving a merge key from source metadata after the user explicitly asks for it.
+_Avoid_: Key inference, automatic key selection
+
 **Rejected Record**:
 A source record that cannot be written to the destination dataset without violating the chosen schema or load rules.
 _Avoid_: Bad row, error row, dead letter
