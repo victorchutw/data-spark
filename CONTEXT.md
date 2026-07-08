@@ -68,6 +68,10 @@ _Avoid_: Job, run, sync
 A saved description of a repeatable load, including its source, destination, load mode, schema choices, and related rules.
 _Avoid_: Job config, pipeline, workflow
 
+**Load Definition Version**:
+The declared contract version that determines how a load definition is interpreted.
+_Avoid_: Config version, YAML version
+
 **One-Off Load**:
 A load started directly from command-line options without first saving a load definition.
 _Avoid_: Ad hoc job, quick run
@@ -75,6 +79,10 @@ _Avoid_: Ad hoc job, quick run
 **Load Report**:
 A machine-readable record of a load's outcome, diagnostics, and measurements.
 _Avoid_: Run report, log, audit file
+
+**Load Report Version**:
+The declared contract version that determines how a load report is interpreted by readers.
+_Avoid_: Report schema, output version
 
 **Load Summary**:
 A human-readable description of a load's outcome.
