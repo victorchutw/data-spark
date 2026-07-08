@@ -72,6 +72,14 @@ _Avoid_: Run report, log, audit file
 A human-readable description of a load's outcome.
 _Avoid_: Console report, status output
 
+**Load Artifact**:
+A file produced by a load for inspection, automation, or troubleshooting.
+_Avoid_: Output file, runtime file
+
+**Artifact Directory**:
+The directory where load artifacts are written for a specific load.
+_Avoid_: Output directory, run directory
+
 **Load Mode**:
 The rule that determines how a load changes the destination dataset.
 _Avoid_: Strategy, write mode
