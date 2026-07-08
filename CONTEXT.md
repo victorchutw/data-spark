@@ -132,6 +132,14 @@ _Avoid_: Concurrency, workers
 The maximum load parallelism a connector allows by default for safe operation.
 _Avoid_: Worker limit, concurrency cap
 
+**External Orchestrator**:
+A system outside Data Spark that decides when load definitions should run.
+_Avoid_: Scheduler, workflow engine
+
+**Built-in Scheduler**:
+A Data Spark component that would decide when load definitions should run.
+_Avoid_: Internal orchestrator, cron
+
 **Full Refresh**:
 A load mode that replaces the destination dataset with the source's current records.
 _Avoid_: Rebuild, overwrite
