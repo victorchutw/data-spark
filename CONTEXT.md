@@ -92,6 +92,14 @@ _Avoid_: Output directory, run directory
 The rule that determines how a load changes the destination dataset.
 _Avoid_: Strategy, write mode
 
+**Load Validation**:
+Checks that decide whether records can be written while honoring the dataset schema and load rules.
+_Avoid_: Data quality, validation framework
+
+**Reject Threshold**:
+The configured amount of rejected records after which a load fails.
+_Avoid_: Error limit, failure threshold
+
 **Full Refresh**:
 A load mode that replaces the destination dataset with the source's current records.
 _Avoid_: Rebuild, overwrite
