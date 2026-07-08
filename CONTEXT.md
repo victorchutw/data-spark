@@ -100,6 +100,18 @@ _Avoid_: Data quality, validation framework
 The configured amount of rejected records after which a load fails.
 _Avoid_: Error limit, failure threshold
 
+**Write Atomicity**:
+The degree to which a destination write is committed as a single visible change.
+_Avoid_: Transactionality, consistency guarantee
+
+**Atomic Commit**:
+A destination write that either becomes visible completely or does not change the destination dataset.
+_Avoid_: Atomic write, transaction
+
+**Best-Effort Write**:
+A destination write where partial destination changes can occur if the load fails.
+_Avoid_: Partial write, non-atomic write
+
 **Full Refresh**:
 A load mode that replaces the destination dataset with the source's current records.
 _Avoid_: Rebuild, overwrite
