@@ -24,6 +24,18 @@ _Avoid_: Cloud service, warehouse, hosted target
 A named capability for reading from a source or writing to a destination.
 _Avoid_: Adapter, integration, driver
 
+**Connection Reference**:
+A name in a load definition that identifies which connection should be used without exposing credential values.
+_Avoid_: Connection string, DSN, secret
+
+**Connection Profile**:
+A local saved connection configuration that a connection reference can resolve to.
+_Avoid_: Config file, credential file
+
+**Credential**:
+Sensitive proof that allows a connector to access a source or destination.
+_Avoid_: Password, token, secret
+
 **Dataset**:
 A named collection of records that is meaningful to a BI user.
 _Avoid_: Table, file, stream
