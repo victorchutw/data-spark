@@ -4,6 +4,9 @@
 # Data Spark local load artifacts
 /.data-spark/
 
+# Local scratch files; issues live in GitHub Issues.
+/.scratch/
+
 # Local environment files
 .env
 .env.*
