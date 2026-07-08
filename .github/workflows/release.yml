@@ -82,7 +82,7 @@ jobs:
           {
             printf 'Data Spark %s\n\n' "$tag"
             printf 'Binary asset:\n\n'
-            printf '- `data-spark-linux-x86_64`\n\n'
+            printf '%s\n\n' '- `data-spark-linux-x86_64`'
             printf 'SHA256:\n\n'
             printf '```text\n%s  data-spark-linux-x86_64\n```\n' "$checksum"
           } > "$notes_file"
