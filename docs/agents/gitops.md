@@ -1,10 +1,14 @@
 # GitOps Workflow
 
-Data Spark work is tracked in GitHub Issues, implemented through pull requests, and released from signed-off git tags. The repository should have one source of truth for work state: issue labels and PR state in GitHub.
+Data Spark work requests are tracked in GitHub Issues and external pull
+requests. Changes ship through pull requests, and releases are cut from
+signed-off git tags. The repository should have one source of truth for work
+state: labels and PR state in GitHub.
 
 ## State labels
 
-Each open issue should have exactly one primary state label:
+Each open issue or external PR in the triage queue should have exactly one
+primary state label:
 
 | State | Label | Meaning |
 | ----- | ----- | ------- |
@@ -17,7 +21,8 @@ Each open issue should have exactly one primary state label:
 | Blocked | `blocked` | Work cannot continue until a named blocker is resolved. |
 | Wontfix | `wontfix` | The issue will not be actioned. |
 
-Type labels such as `bug`, `documentation`, and `enhancement` may coexist with the state label.
+Type labels such as `bug`, `documentation`, and `enhancement` may coexist with
+the state label.
 
 ## State transitions
 
@@ -43,13 +48,17 @@ blocked
   -> wontfix if there is no viable path
 ```
 
-When moving an issue manually, remove the previous state label in the same command:
+When moving an issue manually, remove the previous state label in the same
+command:
 
 ```bash
 gh issue edit 4 \
   --remove-label "needs-triage,needs-info,ready-for-agent,ready-for-human,in-progress,in-review,blocked,wontfix" \
   --add-label "in-progress"
 ```
+
+When moving an external PR through triage, use the same labels with
+`gh pr edit`.
 
 ## Implementation flow
 
@@ -63,6 +72,23 @@ gh issue edit 4 \
 8. Mark the PR ready for review when it is ready to merge. The issue status sync workflow moves referenced issues to `in-review`.
 9. Merge only after CI passes.
 10. Let GitHub close the issue through the `Closes #<issue-number>` reference.
+
+## External PR triage
+
+External PRs are a request surface for this repo. Triage them with the same
+canonical labels as issues, but do not treat owner, member, or collaborator PRs
+as incoming requests.
+
+For an external PR:
+
+1. Read the PR body, comments, labels, and diff.
+2. Decide whether it is `needs-info`, `ready-for-agent`, `ready-for-human`, or
+   `wontfix`.
+3. Use `needs-info` when the PR cannot be evaluated without reporter input.
+4. Use `ready-for-agent` only when an AFK agent can finish or adapt it without
+   hidden context.
+5. Use `ready-for-human` when maintainer judgment is required.
+6. Keep implementation and review decisions in the PR thread.
 
 ## AI agent development loop
 
@@ -133,7 +159,7 @@ The release workflow validates that the tag version matches `Cargo.toml`, runs t
 
 ## GitHub automation
 
-- `.github/workflows/issue-default-label.yml` adds `needs-triage` to new issues when no state label is present.
+- `.github/workflows/issue-default-label.yml` adds `needs-triage` to new issues when no state label is present. External PR labels are applied by triage, not by this workflow.
 - `.github/workflows/issue-status-sync.yml` moves referenced issues to `in-progress` for draft PRs and `in-review` for ready PRs.
 - `.github/workflows/ci.yml` gates pushes and PRs with Rust formatting, linting, tests, and release build checks.
 - `.github/workflows/release.yml` creates the single-binary GitHub Release from `v`-prefixed SemVer tags.

@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues and PRDs are tracked in GitHub Issues for `victorchutw/data-spark`; external PRs are not a triage surface. See `docs/agents/issue-tracker.md`.
+Issues and PRDs are tracked in GitHub Issues for `victorchutw/data-spark`; external PRs are a triage surface. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 
@@ -14,4 +14,4 @@ Work starts from GitHub Issues, moves through issue state labels and PRs, and re
 
 ### Domain docs
 
-This is a single-context repo with one root `CONTEXT.md` and root `docs/adr/` directory. See `docs/agents/domain.md`.
+This is a multi-context repo. Start with root `CONTEXT-MAP.md`, then read the relevant context docs and ADRs. The current context is `CLI/core`. See `docs/agents/domain.md`.
