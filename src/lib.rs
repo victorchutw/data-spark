@@ -1,6 +1,4 @@
-use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::RecordBatch;
 use clap::{Args, Parser, Subcommand};
 use parquet::arrow::ArrowWriter;
 use serde::{Deserialize, Serialize};
@@ -10,9 +8,10 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+mod schema;
 
 const LOAD_REPORT_VERSION: u8 = 1;
 const SUPPORTED_LOAD_DEFINITION_VERSION: u64 = 1;
@@ -129,15 +128,15 @@ struct ExecutionDetails {
     error_summary: Option<ErrorSummary>,
 }
 
-struct SourceRecords {
+struct CsvRecords {
     field_names: Vec<String>,
     records: Vec<Vec<Option<String>>>,
-    inferred_types: Vec<InferredType>,
     source_bytes: u64,
 }
 
-struct SourceBatch {
-    batch: RecordBatch,
+struct JsonlRecords {
+    field_names: Vec<String>,
+    objects: Vec<serde_json::Map<String, Value>>,
     source_bytes: u64,
 }
 
@@ -145,18 +144,10 @@ struct DestinationStats {
     bytes_written: u64,
 }
 
+#[derive(Debug)]
 struct LoadFailure {
     code: &'static str,
     message: String,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum InferredType {
-    Null,
-    Boolean,
-    Int64,
-    Float64,
-    Utf8,
 }
 
 pub fn run() -> ExitCode {
@@ -352,9 +343,29 @@ fn execute_supported_load(
 
     // Validate connectors and load rules before reading the source so an
     // unsupported destination fails without doing source I/O (ADR 0019).
-    let records = match source_format(source).as_str() {
-        "csv" => read_local_csv(&source.path)?,
-        "jsonl" => read_local_jsonl(&source.path)?,
+    let (materialized, source_bytes) = match source_format(source).as_str() {
+        "csv" => {
+            let CsvRecords {
+                field_names,
+                records,
+                source_bytes,
+            } = read_local_csv(&source.path)?;
+            (
+                schema::from_text_columns(field_names, records)?,
+                source_bytes,
+            )
+        }
+        "jsonl" => {
+            let JsonlRecords {
+                field_names,
+                objects,
+                source_bytes,
+            } = read_local_jsonl(&source.path)?;
+            (
+                schema::from_json_columns(field_names, objects)?,
+                source_bytes,
+            )
+        }
         _ => {
             return Err(LoadFailure {
                 code: "unsupported_source_format",
@@ -364,23 +375,22 @@ fn execute_supported_load(
         }
     };
 
-    let source_batch = records_to_batch(records)?;
     let destination_stats =
-        write_parquet_full_refresh(&destination.path, &source_batch.batch, load_id)?;
-    let row_count = source_batch.batch.num_rows() as u64;
+        write_parquet_full_refresh(&destination.path, &materialized.batch, load_id)?;
+    let row_count = materialized.batch.num_rows() as u64;
 
     Ok(ExecutionDetails {
         source_summary: to_json(source),
         destination_summary: to_json(destination),
         load_mode,
-        schema_decision: inferred_schema_decision(source_batch.batch.schema().as_ref()),
+        schema_decision: materialized.schema_decision,
         row_counts: RowCounts {
             source: row_count,
             written: row_count,
             rejected: 0,
         },
         byte_counts: ByteCounts {
-            source: Some(source_batch.source_bytes),
+            source: Some(source_bytes),
             destination: Some(destination_stats.bytes_written),
         },
         destination_write: json!({
@@ -427,7 +437,7 @@ fn failed_details(
     }
 }
 
-fn read_local_csv(source_path: &Path) -> Result<SourceRecords, LoadFailure> {
+fn read_local_csv(source_path: &Path) -> Result<CsvRecords, LoadFailure> {
     let file = File::open(source_path).map_err(|error| LoadFailure {
         code: "source_read_failed",
         message: format!(
@@ -484,18 +494,14 @@ fn read_local_csv(source_path: &Path) -> Result<SourceRecords, LoadFailure> {
         );
     }
 
-    // CSV fields arrive untyped, so their types are inferred from the text values.
-    let inferred_types = infer_types(field_names.len(), &records, infer_text_type);
-
-    Ok(SourceRecords {
+    Ok(CsvRecords {
         field_names,
         records,
-        inferred_types,
         source_bytes,
     })
 }
 
-fn read_local_jsonl(source_path: &Path) -> Result<SourceRecords, LoadFailure> {
+fn read_local_jsonl(source_path: &Path) -> Result<JsonlRecords, LoadFailure> {
     let file = File::open(source_path).map_err(|error| LoadFailure {
         code: "source_read_failed",
         message: format!(
@@ -561,168 +567,11 @@ fn read_local_jsonl(source_path: &Path) -> Result<SourceRecords, LoadFailure> {
         });
     }
 
-    // JSON values carry their own type, so a field's type is inferred from the
-    // observed JSON kinds rather than by re-parsing stringified values. This keeps
-    // JSON strings like "01234" as text instead of retyping them as numbers.
-    let mut inferred_types = vec![InferredType::Null; field_names.len()];
-    for object in &objects {
-        for (column_index, field_name) in field_names.iter().enumerate() {
-            if let Some(value) = object.get(field_name) {
-                inferred_types[column_index] =
-                    inferred_types[column_index].merge(infer_json_type(value));
-            }
-        }
-    }
-    let inferred_types = inferred_types
-        .into_iter()
-        .map(default_null_to_text)
-        .collect::<Vec<_>>();
-
-    let records = objects
-        .iter()
-        .map(|object| {
-            field_names
-                .iter()
-                .map(|field_name| json_scalar_to_string(object.get(field_name)))
-                .collect::<Vec<_>>()
-        })
-        .collect::<Vec<_>>();
-
-    Ok(SourceRecords {
+    Ok(JsonlRecords {
         field_names,
-        records,
-        inferred_types,
+        objects,
         source_bytes,
     })
-}
-
-fn json_scalar_to_string(value: Option<&Value>) -> Option<String> {
-    match value {
-        None | Some(Value::Null) => None,
-        Some(Value::String(text)) => Some(text.clone()),
-        Some(Value::Bool(flag)) => Some(flag.to_string()),
-        Some(Value::Number(number)) => Some(number.to_string()),
-        Some(other) => Some(other.to_string()),
-    }
-}
-
-fn records_to_batch(source_records: SourceRecords) -> Result<SourceBatch, LoadFailure> {
-    let SourceRecords {
-        field_names,
-        records,
-        inferred_types,
-        source_bytes,
-    } = source_records;
-
-    let schema = Arc::new(Schema::new(
-        field_names
-            .iter()
-            .zip(inferred_types.iter())
-            .map(|(name, inferred_type)| Field::new(name, inferred_type.data_type(), true))
-            .collect::<Vec<_>>(),
-    ));
-    let columns = inferred_types
-        .iter()
-        .enumerate()
-        .map(|(column_index, inferred_type)| build_array(*inferred_type, &records, column_index))
-        .collect::<Result<Vec<_>, _>>()?;
-    let batch = RecordBatch::try_new(schema, columns).map_err(|error| LoadFailure {
-        code: "record_batch_creation_failed",
-        message: format!("failed to create Arrow record batch: {error}"),
-    })?;
-
-    Ok(SourceBatch {
-        batch,
-        source_bytes,
-    })
-}
-
-fn infer_types(
-    field_count: usize,
-    records: &[Vec<Option<String>>],
-    observe: fn(&str) -> InferredType,
-) -> Vec<InferredType> {
-    let mut inferred_types = vec![InferredType::Null; field_count];
-    for record in records {
-        for (column_index, value) in record.iter().enumerate() {
-            if let Some(value) = value {
-                inferred_types[column_index] = inferred_types[column_index].merge(observe(value));
-            }
-        }
-    }
-
-    inferred_types
-        .into_iter()
-        .map(default_null_to_text)
-        .collect()
-}
-
-fn default_null_to_text(inferred_type: InferredType) -> InferredType {
-    if inferred_type == InferredType::Null {
-        InferredType::Utf8
-    } else {
-        inferred_type
-    }
-}
-
-fn build_array(
-    inferred_type: InferredType,
-    records: &[Vec<Option<String>>],
-    column_index: usize,
-) -> Result<ArrayRef, LoadFailure> {
-    match inferred_type {
-        InferredType::Null | InferredType::Utf8 => {
-            let mut builder = StringBuilder::new();
-            for record in records {
-                match &record[column_index] {
-                    Some(value) => builder.append_value(value),
-                    None => builder.append_null(),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        InferredType::Boolean => {
-            let mut builder = BooleanBuilder::new();
-            for record in records {
-                match &record[column_index] {
-                    Some(value) => builder.append_value(
-                        parse_bool(value)
-                            .ok_or_else(|| coercion_failure(column_index, value, "boolean"))?,
-                    ),
-                    None => builder.append_null(),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        InferredType::Int64 => {
-            let mut builder = Int64Builder::new();
-            for record in records {
-                match &record[column_index] {
-                    Some(value) => builder.append_value(
-                        value
-                            .parse::<i64>()
-                            .map_err(|_| coercion_failure(column_index, value, "int64"))?,
-                    ),
-                    None => builder.append_null(),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-        InferredType::Float64 => {
-            let mut builder = Float64Builder::new();
-            for record in records {
-                match &record[column_index] {
-                    Some(value) => builder.append_value(
-                        value
-                            .parse::<f64>()
-                            .map_err(|_| coercion_failure(column_index, value, "float64"))?,
-                    ),
-                    None => builder.append_null(),
-                }
-            }
-            Ok(Arc::new(builder.finish()))
-        }
-    }
 }
 
 fn write_parquet_full_refresh(
@@ -823,17 +672,6 @@ fn malformed_jsonl(source_path: &Path, line_number: usize, detail: String) -> Lo
     }
 }
 
-fn coercion_failure(column_index: usize, value: &str, data_type: &str) -> LoadFailure {
-    LoadFailure {
-        code: "schema_coercion_failed",
-        message: format!(
-            "failed to coerce column {} value {:?} to {data_type}",
-            column_index + 1,
-            value
-        ),
-    }
-}
-
 fn source_format(source: &SourceDefinition) -> String {
     source.format.clone().unwrap_or_else(|| {
         source
@@ -843,33 +681,6 @@ fn source_format(source: &SourceDefinition) -> String {
             .unwrap_or("")
             .to_string()
     })
-}
-
-fn inferred_schema_decision(schema: &Schema) -> Value {
-    json!({
-        "mode": "inferred",
-        "fields": schema
-            .fields()
-            .iter()
-            .map(|field| {
-                json!({
-                    "name": field.name(),
-                    "type": data_type_name(field.data_type()),
-                    "nullable": field.is_nullable()
-                })
-            })
-            .collect::<Vec<_>>()
-    })
-}
-
-fn data_type_name(data_type: &DataType) -> &'static str {
-    match data_type {
-        DataType::Boolean => "boolean",
-        DataType::Int64 => "int64",
-        DataType::Float64 => "float64",
-        DataType::Utf8 => "utf8",
-        _ => "unsupported",
-    }
 }
 
 fn to_json<T: Serialize>(value: &T) -> Value {
@@ -900,73 +711,6 @@ fn directory_bytes(path: &Path) -> io::Result<u64> {
         }
     }
     Ok(total)
-}
-
-impl InferredType {
-    /// Widens two observed types to the narrowest type that can hold both.
-    ///
-    /// `Null` is the identity (an absent or null value constrains nothing),
-    /// integers widen to floats when mixed, and any other disagreement falls
-    /// back to text. Both source readers share this lattice so CSV and JSONL
-    /// produce schemas the same way.
-    fn merge(self, other: Self) -> Self {
-        match (self, other) {
-            (InferredType::Null, other) => other,
-            (current, InferredType::Null) => current,
-            (current, other) if current == other => current,
-            (InferredType::Int64, InferredType::Float64)
-            | (InferredType::Float64, InferredType::Int64) => InferredType::Float64,
-            _ => InferredType::Utf8,
-        }
-    }
-
-    fn data_type(self) -> DataType {
-        match self {
-            InferredType::Null | InferredType::Utf8 => DataType::Utf8,
-            InferredType::Boolean => DataType::Boolean,
-            InferredType::Int64 => DataType::Int64,
-            InferredType::Float64 => DataType::Float64,
-        }
-    }
-}
-
-/// Observes the type carried by a text value, as CSV fields have no other type
-/// information than how they parse.
-fn infer_text_type(value: &str) -> InferredType {
-    if parse_bool(value).is_some() {
-        InferredType::Boolean
-    } else if value.parse::<i64>().is_ok() {
-        InferredType::Int64
-    } else if value.parse::<f64>().is_ok() {
-        InferredType::Float64
-    } else {
-        InferredType::Utf8
-    }
-}
-
-/// Observes the type a JSON value already declares, so JSON strings stay text
-/// even when they look numeric and nested values degrade to text.
-fn infer_json_type(value: &Value) -> InferredType {
-    match value {
-        Value::Null => InferredType::Null,
-        Value::Bool(_) => InferredType::Boolean,
-        Value::Number(number) => {
-            if number.is_i64() {
-                InferredType::Int64
-            } else {
-                InferredType::Float64
-            }
-        }
-        Value::String(_) | Value::Array(_) | Value::Object(_) => InferredType::Utf8,
-    }
-}
-
-fn parse_bool(value: &str) -> Option<bool> {
-    match value {
-        "true" | "TRUE" | "True" => Some(true),
-        "false" | "FALSE" | "False" => Some(false),
-        _ => None,
-    }
 }
 
 fn unix_ms() -> u128 {
@@ -1011,21 +755,4 @@ fn summary_text(summary: &Value) -> String {
 
 fn path_string(path: &Path) -> String {
     path.display().to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // Smoke test confirming internal items are reachable from in-process unit
-    // tests now that the load logic lives in a library target (ADR-0028).
-    // Exhaustive inference coverage is deferred to the inferred-schema module
-    // (candidate B).
-    #[test]
-    fn infer_text_type_maps_text_to_its_narrowest_type() {
-        assert!(infer_text_type("true") == InferredType::Boolean);
-        assert!(infer_text_type("42") == InferredType::Int64);
-        assert!(infer_text_type("3.14") == InferredType::Float64);
-        assert!(infer_text_type("data-spark") == InferredType::Utf8);
-    }
 }
