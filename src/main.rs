@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -340,6 +340,18 @@ fn execute_supported_load(
         });
     }
 
+    if destination.connector != "parquet" {
+        return Err(LoadFailure {
+            code: "unsupported_destination_connector",
+            message: format!(
+                "unsupported destination connector: {}",
+                destination.connector
+            ),
+        });
+    }
+
+    // Validate connectors and load rules before reading the source so an
+    // unsupported destination fails without doing source I/O (ADR 0019).
     let records = match source_format(source).as_str() {
         "csv" => read_local_csv(&source.path)?,
         "jsonl" => read_local_jsonl(&source.path)?,
@@ -351,16 +363,6 @@ fn execute_supported_load(
             })
         }
     };
-
-    if destination.connector != "parquet" {
-        return Err(LoadFailure {
-            code: "unsupported_destination_connector",
-            message: format!(
-                "unsupported destination connector: {}",
-                destination.connector
-            ),
-        });
-    }
 
     let source_batch = records_to_batch(records)?;
     let destination_stats =
@@ -494,23 +496,42 @@ fn read_local_csv(source_path: &Path) -> Result<SourceRecords, LoadFailure> {
 }
 
 fn read_local_jsonl(source_path: &Path) -> Result<SourceRecords, LoadFailure> {
-    let source_text = fs::read_to_string(source_path).map_err(|error| LoadFailure {
+    let file = File::open(source_path).map_err(|error| LoadFailure {
         code: "source_read_failed",
         message: format!(
             "failed to read JSONL source {}: {error}",
             source_path.display()
         ),
     })?;
-    let source_bytes = source_text.len() as u64;
+    let source_bytes = file
+        .metadata()
+        .map_err(|error| LoadFailure {
+            code: "source_read_failed",
+            message: format!(
+                "failed to inspect JSONL source {}: {error}",
+                source_path.display()
+            ),
+        })?
+        .len();
 
+    // Read one record per line so peak memory tracks the parsed records rather
+    // than an extra whole-file string copy, matching the CSV reader.
     let mut field_names: Vec<String> = Vec::new();
     let mut seen_fields: HashSet<String> = HashSet::new();
     let mut objects: Vec<serde_json::Map<String, Value>> = Vec::new();
-    for (line_index, line) in source_text.lines().enumerate() {
+    for (line_index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|error| LoadFailure {
+            code: "source_read_failed",
+            message: format!(
+                "failed to read JSONL source {} line {}: {error}",
+                source_path.display(),
+                line_index + 1
+            ),
+        })?;
         if line.trim().is_empty() {
             continue;
         }
-        let value = serde_json::from_str::<Value>(line)
+        let value = serde_json::from_str::<Value>(&line)
             .map_err(|error| malformed_jsonl(source_path, line_index + 1, error.to_string()))?;
         let object = match value {
             Value::Object(object) => object,
