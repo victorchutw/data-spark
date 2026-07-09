@@ -1,3 +1,7 @@
+## Communication
+
+Discuss with the maintainer in Traditional Chinese (zh-TW). Repository artifacts — code, identifiers, comments, commit messages, PR descriptions, ADRs, and `docs/` — stay in English to match the existing convention, unless the maintainer asks otherwise.
+
 ## Agent skills
 
 ### Issue tracker
