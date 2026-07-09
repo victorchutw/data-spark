@@ -2,7 +2,7 @@
 
 ### Issue tracker
 
-Issues and PRDs are tracked in GitHub Issues for `victorchutw/data-spark`; external PRs are a triage surface. See `docs/agents/issue-tracker.md`.
+Issues, specs, and tickets are tracked in GitHub Issues for `victorchutw/data-spark`; external PRs are a triage surface. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

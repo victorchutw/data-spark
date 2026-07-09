@@ -1,6 +1,6 @@
 # Issue tracker: GitHub
 
-Issues and PRDs for this repo live as GitHub Issues in
+Issues, specs, and tickets for this repo live as GitHub Issues in
 `victorchutw/data-spark`. Use the `gh` CLI for all issue and pull request
 operations.
 
@@ -48,7 +48,16 @@ needed.
 
 ## When a skill says "publish to the issue tracker"
 
-Create a GitHub issue with `gh issue create`.
+Create a GitHub issue with `gh issue create`. This applies to a single spec
+(from `to-spec`) as well as to individual tickets.
+
+## When a skill says "publish the tickets" (blocking edges)
+
+This is a real issue tracker, so `to-tickets` publishes **one GitHub issue per
+ticket** rather than a local `tickets.md`. Create the issues in dependency
+order (blockers first) so each ticket's "Blocked by" can reference the real
+issue numbers of the tickets that gate it. Apply the `ready-for-agent` triage
+label unless instructed otherwise, and do not modify the parent spec issue.
 
 ## When a skill says "fetch the relevant ticket"
 
