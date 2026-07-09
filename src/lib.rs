@@ -1,17 +1,16 @@
-use arrow_array::RecordBatch;
 use clap::{Args, Parser, Subcommand};
-use parquet::arrow::ArrowWriter;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+mod connector;
 mod schema;
+
+use connector::{destination_connector, source_connector, DestinationWrite, LoadMode, SourceRead};
 
 const LOAD_REPORT_VERSION: u8 = 1;
 const SUPPORTED_LOAD_DEFINITION_VERSION: u64 = 1;
@@ -128,22 +127,6 @@ struct ExecutionDetails {
     error_summary: Option<ErrorSummary>,
 }
 
-struct CsvRecords {
-    field_names: Vec<String>,
-    records: Vec<Vec<Option<String>>>,
-    source_bytes: u64,
-}
-
-struct JsonlRecords {
-    field_names: Vec<String>,
-    objects: Vec<serde_json::Map<String, Value>>,
-    source_bytes: u64,
-}
-
-struct DestinationStats {
-    bytes_written: u64,
-}
-
 #[derive(Debug)]
 struct LoadFailure {
     code: &'static str,
@@ -175,7 +158,7 @@ fn run_load(args: LoadArgs) -> Result<LoadOutcome, Box<dyn std::error::Error>> {
     let artifact_dir = artifact_root.join(&load_id);
     fs::create_dir_all(&artifact_dir)?;
 
-    let details = execute_load_definition(&args.definition, &load_id);
+    let details = execute_load_definition(&args.definition);
 
     let (exit_status, process_exit_code) = if details.error_summary.is_some() {
         ("failed", 1)
@@ -224,7 +207,7 @@ fn run_load(args: LoadArgs) -> Result<LoadOutcome, Box<dyn std::error::Error>> {
     })
 }
 
-fn execute_load_definition(definition_path: &Path, load_id: &str) -> ExecutionDetails {
+fn execute_load_definition(definition_path: &Path) -> ExecutionDetails {
     let definition_text = match fs::read_to_string(definition_path) {
         Ok(definition_text) => definition_text,
         Err(error) => {
@@ -288,7 +271,7 @@ fn execute_load_definition(definition_path: &Path, load_id: &str) -> ExecutionDe
         }
     }
 
-    match execute_supported_load(&definition, load_id) {
+    match execute_supported_load(&definition) {
         Ok(details) => details,
         Err(failure) => failed_details(
             source_summary,
@@ -300,10 +283,7 @@ fn execute_load_definition(definition_path: &Path, load_id: &str) -> ExecutionDe
     }
 }
 
-fn execute_supported_load(
-    definition: &LoadDefinition,
-    load_id: &str,
-) -> Result<ExecutionDetails, LoadFailure> {
+fn execute_supported_load(definition: &LoadDefinition) -> Result<ExecutionDetails, LoadFailure> {
     let source = definition.source.as_ref().ok_or_else(|| LoadFailure {
         code: "missing_source",
         message: "load definition source is required".to_string(),
@@ -317,73 +297,33 @@ fn execute_supported_load(
         .clone()
         .unwrap_or_else(|| "full_refresh".to_string());
 
-    if load_mode != "full_refresh" {
-        return Err(LoadFailure {
-            code: "unsupported_load_mode",
-            message: format!("unsupported load mode: {load_mode}"),
-        });
-    }
+    // Validate the load mode and both connectors before any I/O so an
+    // unsupported definition fails without reading the source or touching the
+    // destination (ADR-0019), preserving the current error precedence: load
+    // mode -> source connector -> destination connector -> read -> write. The
+    // source format is validated inside read() so its precedence stays after the
+    // destination-connector check for a doubly-invalid definition.
+    let mode = LoadMode::parse(&load_mode)?;
+    let source_port = source_connector(source)?;
+    let destination_port = destination_connector(destination)?;
 
-    if source.connector != "local_file" {
-        return Err(LoadFailure {
-            code: "unsupported_source_connector",
-            message: format!("unsupported source connector: {}", source.connector),
-        });
-    }
-
-    if destination.connector != "parquet" {
-        return Err(LoadFailure {
-            code: "unsupported_destination_connector",
-            message: format!(
-                "unsupported destination connector: {}",
-                destination.connector
-            ),
-        });
-    }
-
-    // Validate connectors and load rules before reading the source so an
-    // unsupported destination fails without doing source I/O (ADR 0019).
-    let (materialized, source_bytes) = match source_format(source).as_str() {
-        "csv" => {
-            let CsvRecords {
-                field_names,
-                records,
-                source_bytes,
-            } = read_local_csv(&source.path)?;
-            (
-                schema::from_text_columns(field_names, records)?,
-                source_bytes,
-            )
-        }
-        "jsonl" => {
-            let JsonlRecords {
-                field_names,
-                objects,
-                source_bytes,
-            } = read_local_jsonl(&source.path)?;
-            (
-                schema::from_json_columns(field_names, objects)?,
-                source_bytes,
-            )
-        }
-        _ => {
-            return Err(LoadFailure {
-                code: "unsupported_source_format",
-                message: "only local CSV and JSONL sources are supported by this load path"
-                    .to_string(),
-            })
-        }
-    };
-
-    let destination_stats =
-        write_parquet_full_refresh(&destination.path, &materialized.batch, load_id)?;
-    let row_count = materialized.batch.num_rows() as u64;
+    let SourceRead {
+        batch,
+        schema_decision,
+        source_bytes,
+    } = source_port.read()?;
+    let DestinationWrite {
+        bytes_written,
+        atomicity,
+        strategy,
+    } = destination_port.write(&batch, mode)?;
+    let row_count = batch.num_rows() as u64;
 
     Ok(ExecutionDetails {
         source_summary: to_json(source),
         destination_summary: to_json(destination),
         load_mode,
-        schema_decision: materialized.schema_decision,
+        schema_decision,
         row_counts: RowCounts {
             source: row_count,
             written: row_count,
@@ -391,11 +331,11 @@ fn execute_supported_load(
         },
         byte_counts: ByteCounts {
             source: Some(source_bytes),
-            destination: Some(destination_stats.bytes_written),
+            destination: Some(bytes_written),
         },
         destination_write: json!({
-            "atomicity": "best_effort",
-            "strategy": "staging_then_replace"
+            "atomicity": atomicity,
+            "strategy": strategy
         }),
         execution: json!({
             "record_format": "arrow_record_batch",
@@ -437,280 +377,8 @@ fn failed_details(
     }
 }
 
-fn read_local_csv(source_path: &Path) -> Result<CsvRecords, LoadFailure> {
-    let file = File::open(source_path).map_err(|error| LoadFailure {
-        code: "source_read_failed",
-        message: format!(
-            "failed to read CSV source {}: {error}",
-            source_path.display()
-        ),
-    })?;
-    let source_bytes = file
-        .metadata()
-        .map_err(|error| LoadFailure {
-            code: "source_read_failed",
-            message: format!(
-                "failed to inspect CSV source {}: {error}",
-                source_path.display()
-            ),
-        })?
-        .len();
-
-    let mut reader = csv::ReaderBuilder::new()
-        .has_headers(true)
-        .flexible(false)
-        .from_reader(file);
-    let field_names = reader
-        .headers()
-        .map_err(|error| malformed_csv(source_path, error))?
-        .iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-
-    if field_names.is_empty() {
-        return Err(LoadFailure {
-            code: "malformed_csv",
-            message: format!(
-                "CSV source {} must include at least one header field",
-                source_path.display()
-            ),
-        });
-    }
-
-    let mut records = Vec::new();
-    for record in reader.records() {
-        let record = record.map_err(|error| malformed_csv(source_path, error))?;
-        records.push(
-            record
-                .iter()
-                .map(|value| {
-                    if value.is_empty() {
-                        None
-                    } else {
-                        Some(value.to_string())
-                    }
-                })
-                .collect::<Vec<_>>(),
-        );
-    }
-
-    Ok(CsvRecords {
-        field_names,
-        records,
-        source_bytes,
-    })
-}
-
-fn read_local_jsonl(source_path: &Path) -> Result<JsonlRecords, LoadFailure> {
-    let file = File::open(source_path).map_err(|error| LoadFailure {
-        code: "source_read_failed",
-        message: format!(
-            "failed to read JSONL source {}: {error}",
-            source_path.display()
-        ),
-    })?;
-    let source_bytes = file
-        .metadata()
-        .map_err(|error| LoadFailure {
-            code: "source_read_failed",
-            message: format!(
-                "failed to inspect JSONL source {}: {error}",
-                source_path.display()
-            ),
-        })?
-        .len();
-
-    // Read one record per line so peak memory tracks the parsed records rather
-    // than an extra whole-file string copy, matching the CSV reader.
-    let mut field_names: Vec<String> = Vec::new();
-    let mut seen_fields: HashSet<String> = HashSet::new();
-    let mut objects: Vec<serde_json::Map<String, Value>> = Vec::new();
-    for (line_index, line) in BufReader::new(file).lines().enumerate() {
-        let line = line.map_err(|error| LoadFailure {
-            code: "source_read_failed",
-            message: format!(
-                "failed to read JSONL source {} line {}: {error}",
-                source_path.display(),
-                line_index + 1
-            ),
-        })?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value = serde_json::from_str::<Value>(&line)
-            .map_err(|error| malformed_jsonl(source_path, line_index + 1, error.to_string()))?;
-        let object = match value {
-            Value::Object(object) => object,
-            _ => {
-                return Err(malformed_jsonl(
-                    source_path,
-                    line_index + 1,
-                    "each JSONL record must be a JSON object".to_string(),
-                ))
-            }
-        };
-        for key in object.keys() {
-            if seen_fields.insert(key.clone()) {
-                field_names.push(key.clone());
-            }
-        }
-        objects.push(object);
-    }
-
-    if field_names.is_empty() {
-        return Err(LoadFailure {
-            code: "malformed_jsonl",
-            message: format!(
-                "JSONL source {} must include at least one record with fields",
-                source_path.display()
-            ),
-        });
-    }
-
-    Ok(JsonlRecords {
-        field_names,
-        objects,
-        source_bytes,
-    })
-}
-
-fn write_parquet_full_refresh(
-    destination_path: &Path,
-    batch: &RecordBatch,
-    load_id: &str,
-) -> Result<DestinationStats, LoadFailure> {
-    let parent = destination_path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|error| LoadFailure {
-        code: "destination_write_failed",
-        message: format!(
-            "failed to prepare destination parent {}: {error}",
-            parent.display()
-        ),
-    })?;
-
-    let destination_name = destination_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("dataset");
-    let staging_path = parent.join(format!(".{destination_name}.data-spark-staging-{load_id}"));
-    remove_path_if_exists(&staging_path).map_err(|error| LoadFailure {
-        code: "destination_write_failed",
-        message: format!(
-            "failed to clear staging destination {}: {error}",
-            staging_path.display()
-        ),
-    })?;
-    fs::create_dir_all(&staging_path).map_err(|error| LoadFailure {
-        code: "destination_write_failed",
-        message: format!(
-            "failed to create staging destination {}: {error}",
-            staging_path.display()
-        ),
-    })?;
-
-    let parquet_file_path = staging_path.join("part-00000.parquet");
-    let file = File::create(&parquet_file_path).map_err(|error| LoadFailure {
-        code: "destination_write_failed",
-        message: format!(
-            "failed to create Parquet file {}: {error}",
-            parquet_file_path.display()
-        ),
-    })?;
-    let mut writer =
-        ArrowWriter::try_new(file, batch.schema(), None).map_err(|error| LoadFailure {
-            code: "destination_write_failed",
-            message: format!("failed to initialize Parquet writer: {error}"),
-        })?;
-    writer.write(batch).map_err(|error| LoadFailure {
-        code: "destination_write_failed",
-        message: format!("failed to write Parquet records: {error}"),
-    })?;
-    writer.close().map_err(|error| LoadFailure {
-        code: "destination_write_failed",
-        message: format!("failed to close Parquet writer: {error}"),
-    })?;
-
-    remove_path_if_exists(destination_path).map_err(|error| LoadFailure {
-        code: "destination_write_failed",
-        message: format!(
-            "failed to replace existing destination {}: {error}",
-            destination_path.display()
-        ),
-    })?;
-    fs::rename(&staging_path, destination_path).map_err(|error| LoadFailure {
-        code: "destination_write_failed",
-        message: format!(
-            "failed to commit Parquet destination {}: {error}",
-            destination_path.display()
-        ),
-    })?;
-
-    let bytes_written = directory_bytes(destination_path).map_err(|error| LoadFailure {
-        code: "destination_write_failed",
-        message: format!(
-            "failed to inspect Parquet destination {}: {error}",
-            destination_path.display()
-        ),
-    })?;
-    Ok(DestinationStats { bytes_written })
-}
-
-fn malformed_csv(source_path: &Path, error: csv::Error) -> LoadFailure {
-    LoadFailure {
-        code: "malformed_csv",
-        message: format!("malformed CSV syntax in {}: {error}", source_path.display()),
-    }
-}
-
-fn malformed_jsonl(source_path: &Path, line_number: usize, detail: String) -> LoadFailure {
-    LoadFailure {
-        code: "malformed_jsonl",
-        message: format!(
-            "malformed JSONL record in {} line {line_number}: {detail}",
-            source_path.display()
-        ),
-    }
-}
-
-fn source_format(source: &SourceDefinition) -> String {
-    source.format.clone().unwrap_or_else(|| {
-        source
-            .path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("")
-            .to_string()
-    })
-}
-
 fn to_json<T: Serialize>(value: &T) -> Value {
     serde_json::to_value(value).unwrap_or_else(|_| json!({}))
-}
-
-fn remove_path_if_exists(path: &Path) -> io::Result<()> {
-    if !path.exists() {
-        return Ok(());
-    }
-
-    if path.is_dir() {
-        fs::remove_dir_all(path)
-    } else {
-        fs::remove_file(path)
-    }
-}
-
-fn directory_bytes(path: &Path) -> io::Result<u64> {
-    let mut total = 0;
-    for entry in fs::read_dir(path)? {
-        let path = entry?.path();
-        let metadata = fs::metadata(&path)?;
-        if metadata.is_dir() {
-            total += directory_bytes(&path)?;
-        } else {
-            total += metadata.len();
-        }
-    }
-    Ok(total)
 }
 
 fn unix_ms() -> u128 {
