@@ -82,8 +82,10 @@ by a repository ruleset. Observed behavior on this repo:
 - A PR opened ready for review is reviewed immediately, in parallel with the
   first CI run. A PR opened as draft is reviewed only when it is marked ready
   for review.
-- A review takes about 2-3 minutes. The `rust` CI job takes about 4-5 minutes,
-  so review comments normally arrive before CI turns green.
+- A review takes about 2-3 minutes. The `rust` CI job takes single-digit
+  minutes with a warm dependency cache and over an hour on a cold cache
+  (toolchain bump, `duckdb` upgrade, or cache eviction), so review
+  comments normally arrive before CI turns green.
 - Copilot does not re-review later pushes. It reviews the snapshot that was
   current when the review was requested.
 
