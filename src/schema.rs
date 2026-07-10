@@ -8,15 +8,20 @@
 //! Everything type-related — the lattice, observation rules, materialization,
 //! and the `schema_decision` shape — is private behind these two entry points.
 
-use crate::LoadFailure;
+use crate::{ExecutionFailure, LoadFailure};
 use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-/// A materialized load: the typed Arrow batch plus the `schema_decision` shape
-/// that the load report echoes back to the caller.
+const PINNED_SCHEMA_VERSION: u64 = 1;
+
+/// A materialized load: the typed Arrow batch, the `schema_decision` shape
+/// that the load report echoes back to the caller, and the pinned schema YAML
+/// the caller persists when this load produces or extends a pin (ADR-0033).
 ///
 /// Rejected records (#8) will arrive here later as an **additive** `rejected`
 /// field, so callers pattern-match by name rather than positionally. That
@@ -25,6 +30,32 @@ use std::sync::Arc;
 pub(crate) struct Materialized {
     pub(crate) batch: RecordBatch,
     pub(crate) schema_decision: Value,
+    pub(crate) pinned_schema_yaml: Option<String>,
+}
+
+/// How a load decides its dataset schema: infer it from observed records,
+/// infer it and persist it as the new pinned schema (the first pin-requesting
+/// load, ADR-0033), or validate observed records against an existing pinned
+/// schema (ADR-0034). `pinned_path` is the display path the schema decision
+/// reports; file I/O stays with the caller.
+pub(crate) enum SchemaDirective {
+    Inferred,
+    PinInferred {
+        pinned_path: String,
+    },
+    Pinned {
+        pinned_path: String,
+        pin: PinnedSchema,
+        drift_policy: DriftPolicy,
+    },
+}
+
+/// The rule that decides whether a load may continue when schema drift is
+/// detected against a pinned schema: fail fast by default, or allow additive
+/// nullable drift when the load definition explicitly permits it (ADR-0007).
+pub(crate) enum DriftPolicy {
+    Fail,
+    AllowAdditiveNullable,
 }
 
 /// The narrowest type observed across a column's values, before it is widened
@@ -38,101 +69,525 @@ enum InferredType {
     Utf8,
 }
 
+/// A pinned schema: the dataset schema a load definition reuses across loads to
+/// keep a BI-ready dataset stable (ADR-0033). Parsed from and serialized to the
+/// versioned YAML pinned schema file named by `schema.pinned_path`.
+#[derive(Debug, PartialEq)]
+pub(crate) struct PinnedSchema {
+    fields: Vec<PinnedField>,
+}
+
+/// One field of a pinned schema. Only nullable fields are representable today;
+/// `nullable: false` is rejected at parse until rejected-record handling (#8)
+/// gives non-null contracts per-record semantics.
+#[derive(Debug, PartialEq)]
+struct PinnedField {
+    name: String,
+    field_type: InferredType,
+}
+
+/// The raw serde shape of a pinned schema file, kept separate from
+/// [`PinnedSchema`] so contract validation happens in one place after parsing.
+#[derive(Deserialize, Serialize)]
+struct PinnedSchemaFile {
+    version: Option<u64>,
+    fields: Option<Vec<PinnedFieldFile>>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct PinnedFieldFile {
+    name: String,
+    #[serde(rename = "type")]
+    field_type: String,
+    nullable: Option<bool>,
+}
+
+impl PinnedSchema {
+    /// Parses a pinned schema file's YAML text, validating the contract:
+    /// `version: 1`, at least one field, unique field names, known field types,
+    /// and nullable fields only.
+    pub(crate) fn from_yaml(text: &str) -> Result<Self, LoadFailure> {
+        let file = serde_yaml::from_str::<PinnedSchemaFile>(text).map_err(|error| {
+            invalid_pinned_schema(format!("failed to parse pinned schema: {error}"))
+        })?;
+        match file.version {
+            Some(PINNED_SCHEMA_VERSION) => {}
+            Some(version) => {
+                return Err(invalid_pinned_schema(format!(
+                    "unsupported pinned schema version: {version}"
+                )))
+            }
+            None => {
+                return Err(invalid_pinned_schema(
+                    "pinned schema version is required".to_string(),
+                ))
+            }
+        }
+
+        let raw_fields = file.fields.unwrap_or_default();
+        if raw_fields.is_empty() {
+            return Err(invalid_pinned_schema(
+                "pinned schema must declare at least one field".to_string(),
+            ));
+        }
+
+        let mut seen_names = HashSet::new();
+        let mut fields = Vec::with_capacity(raw_fields.len());
+        for raw_field in raw_fields {
+            if !seen_names.insert(raw_field.name.clone()) {
+                return Err(invalid_pinned_schema(format!(
+                    "pinned schema field {:?} is declared more than once",
+                    raw_field.name
+                )));
+            }
+            if raw_field.nullable == Some(false) {
+                return Err(invalid_pinned_schema(format!(
+                    "pinned schema field {:?} must be nullable until rejected records exist",
+                    raw_field.name
+                )));
+            }
+            let field_type = parse_type_name(&raw_field.field_type).ok_or_else(|| {
+                invalid_pinned_schema(format!(
+                    "unsupported pinned schema field type: {}",
+                    raw_field.field_type
+                ))
+            })?;
+            fields.push(PinnedField {
+                name: raw_field.name,
+                field_type,
+            });
+        }
+
+        Ok(PinnedSchema { fields })
+    }
+
+    /// Renders the pinned schema as the YAML text the pinned schema file
+    /// persists.
+    pub(crate) fn to_yaml(&self) -> String {
+        let file = PinnedSchemaFile {
+            version: Some(PINNED_SCHEMA_VERSION),
+            fields: Some(
+                self.fields
+                    .iter()
+                    .map(|field| PinnedFieldFile {
+                        name: field.name.clone(),
+                        field_type: data_type_name(&field.field_type.data_type()).to_string(),
+                        nullable: Some(true),
+                    })
+                    .collect(),
+            ),
+        };
+        serde_yaml::to_string(&file).expect("pinned schema serializes to yaml")
+    }
+}
+
+fn invalid_pinned_schema(message: String) -> LoadFailure {
+    LoadFailure {
+        code: "invalid_pinned_schema",
+        message,
+    }
+}
+
+fn parse_type_name(name: &str) -> Option<InferredType> {
+    match name {
+        "boolean" => Some(InferredType::Boolean),
+        "int64" => Some(InferredType::Int64),
+        "float64" => Some(InferredType::Float64),
+        "utf8" => Some(InferredType::Utf8),
+        _ => None,
+    }
+}
+
 /// Materializes CSV columns, whose cells arrive untyped as text and are typed
-/// by how they parse.
+/// by how they parse, under the load's schema directive.
 pub(crate) fn from_text_columns(
+    directive: &SchemaDirective,
     field_names: Vec<String>,
     records: Vec<Vec<Option<String>>>,
-) -> Result<Materialized, LoadFailure> {
-    // CSV fields arrive untyped, so their types are inferred from the text values.
-    let inferred_types = infer_text_types(field_names.len(), &records);
-    let columns = inferred_types
+) -> Result<Materialized, ExecutionFailure> {
+    // CSV fields arrive untyped, so their types are observed from the text values.
+    let observed_types = observe_text_types(field_names.len(), &records);
+    let plan = plan_fields(directive, &field_names, &observed_types)?;
+    let columns = plan
+        .fields
         .iter()
-        .enumerate()
-        .map(|(column_index, inferred_type)| {
-            build_text_array(*inferred_type, &records, column_index)
-        })
+        .map(|planned| build_text_array(planned.materialized_type, &records, planned.observed_index))
         .collect::<Result<Vec<_>, _>>()?;
-    materialize(field_names, inferred_types, columns)
+    materialize(plan, columns)
 }
 
 /// Materializes JSONL columns from their parsed [`Value`]s directly, owning the
 /// field projection (`None` / [`Value::Null`] → null) so a JSON string like
 /// `"01234"` stays text instead of being round-tripped through a re-parse.
 pub(crate) fn from_json_columns(
+    directive: &SchemaDirective,
     field_names: Vec<String>,
     objects: Vec<serde_json::Map<String, Value>>,
-) -> Result<Materialized, LoadFailure> {
-    // JSON values carry their own type, so a field's type is inferred from the
-    // observed JSON kinds rather than by re-parsing stringified values. This keeps
-    // JSON strings like "01234" as text instead of retyping them as numbers.
-    let mut inferred_types = vec![InferredType::Null; field_names.len()];
-    for object in &objects {
-        for (column_index, field_name) in field_names.iter().enumerate() {
-            if let Some(value) = object.get(field_name) {
-                inferred_types[column_index] =
-                    inferred_types[column_index].merge(infer_json_type(value));
+) -> Result<Materialized, ExecutionFailure> {
+    // JSON values carry their own type, so a field's type is observed from the
+    // JSON kinds rather than by re-parsing stringified values. This keeps JSON
+    // strings like "01234" as text instead of retyping them as numbers.
+    let observed_types = observe_json_types(&field_names, &objects);
+    let plan = plan_fields(directive, &field_names, &observed_types)?;
+    let columns = plan
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(column_index, planned)| {
+            build_json_array(planned.materialized_type, &objects, &planned.name, column_index)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    materialize(plan, columns)
+}
+
+/// One field the load will materialize: its output name, the type its column is
+/// built as (never `Null`), and the index of the observed source column it
+/// reads from.
+struct PlannedField {
+    name: String,
+    materialized_type: InferredType,
+    observed_index: usize,
+}
+
+/// The resolved field plan for a load: the fields to materialize in output
+/// order, the `schema_decision` the report echoes, and the pinned schema YAML
+/// to persist when this load produces or extends a pin.
+struct FieldPlan {
+    fields: Vec<PlannedField>,
+    decision: Value,
+    pinned_schema_yaml: Option<String>,
+}
+
+/// Resolves the observed columns against the schema directive into the field
+/// plan, failing with `schema_drift` before any column is built when observed
+/// records do not fit a pinned schema (ADR-0034).
+fn plan_fields(
+    directive: &SchemaDirective,
+    observed_names: &[String],
+    observed_types: &[InferredType],
+) -> Result<FieldPlan, ExecutionFailure> {
+    match directive {
+        SchemaDirective::Inferred => Ok(inferred_plan(observed_names, observed_types, None)),
+        SchemaDirective::PinInferred { pinned_path } => {
+            Ok(inferred_plan(observed_names, observed_types, Some(pinned_path)))
+        }
+        SchemaDirective::Pinned {
+            pinned_path,
+            pin,
+            drift_policy,
+        } => pinned_plan(pinned_path, pin, drift_policy, observed_names, observed_types),
+    }
+}
+
+/// Plans an inference-driven load: every observed column keeps its observed
+/// type (all-null columns default to text). With a `pinned_path`, the inferred
+/// schema is also rendered for persistence as the new pin (ADR-0033).
+fn inferred_plan(
+    observed_names: &[String],
+    observed_types: &[InferredType],
+    pinned_path: Option<&str>,
+) -> FieldPlan {
+    let fields = observed_names
+        .iter()
+        .zip(observed_types)
+        .enumerate()
+        .map(|(observed_index, (name, observed_type))| PlannedField {
+            name: name.clone(),
+            materialized_type: default_null_to_text(*observed_type),
+            observed_index,
+        })
+        .collect::<Vec<_>>();
+
+    let mut decision = json!({
+        "mode": "inferred",
+        "fields": fields_json(&fields),
+        "drift_status": "not_applicable",
+    });
+    let pinned_schema_yaml = pinned_path.map(|path| {
+        decision["pinned_schema_path"] = json!(path);
+        decision["pinned_schema_persisted"] = json!(true);
+        pin_yaml(&fields)
+    });
+
+    FieldPlan {
+        fields,
+        decision,
+        pinned_schema_yaml,
+    }
+}
+
+/// Validates the observed columns against a pinned schema and plans the load
+/// that keeps the destination stable: matching fields materialize in pin order
+/// with pinned types, and additive fields are appended only under the additive
+/// drift policy (ADR-0034).
+fn pinned_plan(
+    pinned_path: &str,
+    pin: &PinnedSchema,
+    drift_policy: &DriftPolicy,
+    observed_names: &[String],
+    observed_types: &[InferredType],
+) -> Result<FieldPlan, ExecutionFailure> {
+    // Observed columns match pin fields by name, so duplicate observed names
+    // are unmatchable shape drift.
+    let mut observed_indexes = HashMap::with_capacity(observed_names.len());
+    for (index, name) in observed_names.iter().enumerate() {
+        if observed_indexes.insert(name.as_str(), index).is_some() {
+            return Err(drift_failure(
+                pinned_path,
+                pin,
+                format!("source field {name:?} appears more than once, so records cannot be validated against the pinned schema"),
+                json!({ "duplicate_fields": [name] }),
+            ));
+        }
+    }
+
+    let mut missing_fields = Vec::new();
+    let mut type_changes = Vec::new();
+    let mut matched_fields = Vec::new();
+    for pin_field in &pin.fields {
+        match observed_indexes.get(pin_field.name.as_str()) {
+            None => missing_fields.push(pin_field.name.clone()),
+            Some(&observed_index) => {
+                let observed_type = observed_types[observed_index];
+                // Compatible iff the observed type widens to the pinned type
+                // under the inference lattice (ADR-0034): all-null columns
+                // match anything, integers widen to floats, anything widens to
+                // text. Building a column with a compatible pinned type can
+                // then never fail per value.
+                if observed_type.merge(pin_field.field_type) == pin_field.field_type {
+                    matched_fields.push(PlannedField {
+                        name: pin_field.name.clone(),
+                        materialized_type: pin_field.field_type,
+                        observed_index,
+                    });
+                } else {
+                    type_changes.push((pin_field.name.clone(), pin_field.field_type, observed_type));
+                }
             }
         }
     }
-    let inferred_types = inferred_types
-        .into_iter()
-        .map(default_null_to_text)
+    let pinned_names = pin
+        .fields
+        .iter()
+        .map(|field| field.name.as_str())
+        .collect::<HashSet<_>>();
+    let added_fields = observed_names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| !pinned_names.contains(name.as_str()))
+        .map(|(observed_index, name)| PlannedField {
+            name: name.clone(),
+            materialized_type: default_null_to_text(observed_types[observed_index]),
+            observed_index,
+        })
         .collect::<Vec<_>>();
 
-    let columns = field_names
-        .iter()
-        .zip(inferred_types.iter())
-        .enumerate()
-        .map(|(column_index, (field_name, inferred_type))| {
-            build_json_array(*inferred_type, &objects, field_name, column_index)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    materialize(field_names, inferred_types, columns)
+    let additive_allowed = matches!(drift_policy, DriftPolicy::AllowAdditiveNullable);
+    if !missing_fields.is_empty()
+        || !type_changes.is_empty()
+        || (!added_fields.is_empty() && !additive_allowed)
+    {
+        let added_names = added_fields
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>();
+        let mut segments = Vec::new();
+        if !missing_fields.is_empty() {
+            segments.push(format!("missing fields: {}", missing_fields.join(", ")));
+        }
+        if !added_names.is_empty() {
+            segments.push(format!("added fields: {}", added_names.join(", ")));
+        }
+        if !type_changes.is_empty() {
+            segments.push(format!(
+                "type changes: {}",
+                type_changes
+                    .iter()
+                    .map(|(name, pinned, observed)| format!(
+                        "{name} (pinned {}, observed {})",
+                        pinned.name(),
+                        observed.name()
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        return Err(drift_failure(
+            pinned_path,
+            pin,
+            segments.join("; "),
+            json!({
+                "missing_fields": missing_fields,
+                "added_fields": added_names,
+                "type_changes": type_changes
+                    .iter()
+                    .map(|(name, pinned, observed)| json!({
+                        "name": name,
+                        "pinned": pinned.name(),
+                        "observed": observed.name()
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        ));
+    }
+
+    if added_fields.is_empty() {
+        let decision = json!({
+            "mode": "pinned",
+            "fields": fields_json(&matched_fields),
+            "drift_status": "none",
+            "pinned_schema_path": pinned_path,
+        });
+        return Ok(FieldPlan {
+            fields: matched_fields,
+            decision,
+            pinned_schema_yaml: None,
+        });
+    }
+
+    // Additive nullable drift under the additive policy: append the added
+    // fields after the pinned ones and extend the persisted pin (ADR-0033) so a
+    // field that later disappears again is caught as drift.
+    let added_json = fields_json(&added_fields);
+    let mut fields = matched_fields;
+    fields.extend(added_fields);
+    let decision = json!({
+        "mode": "pinned",
+        "fields": fields_json(&fields),
+        "drift_status": "additive_fields_added",
+        "added_fields": added_json,
+        "pinned_schema_path": pinned_path,
+        "pinned_schema_persisted": true,
+    });
+    let pinned_schema_yaml = Some(pin_yaml(&fields));
+    Ok(FieldPlan {
+        fields,
+        decision,
+        pinned_schema_yaml,
+    })
 }
 
-/// Assembles a schema from the inferred types and the pre-built columns into a
-/// [`RecordBatch`], deriving the `schema_decision` from the same schema so the
-/// report can never disagree with the batch that was written.
-fn materialize(
-    field_names: Vec<String>,
-    inferred_types: Vec<InferredType>,
-    columns: Vec<ArrayRef>,
-) -> Result<Materialized, LoadFailure> {
-    let schema = Arc::new(Schema::new(
-        field_names
+/// Builds the `schema_drift` failure whose report echoes the pinned expectation
+/// and the observed drift, so a drift-failed load's report still records the
+/// schema decision.
+fn drift_failure(
+    pinned_path: &str,
+    pin: &PinnedSchema,
+    detail: String,
+    drift: Value,
+) -> ExecutionFailure {
+    let decision = json!({
+        "mode": "pinned",
+        "fields": pinned_fields_json(pin),
+        "drift_status": "failed_on_drift",
+        "drift": drift,
+        "pinned_schema_path": pinned_path,
+    });
+    ExecutionFailure {
+        failure: LoadFailure {
+            code: "schema_drift",
+            message: format!("schema drift against pinned schema {pinned_path}: {detail}"),
+        },
+        schema_decision: Some(decision),
+    }
+}
+
+/// Renders a pinned schema's fields as the `fields` array of a schema decision.
+fn pinned_fields_json(pin: &PinnedSchema) -> Value {
+    Value::Array(
+        pin.fields
             .iter()
-            .zip(inferred_types.iter())
-            .map(|(name, inferred_type)| Field::new(name, inferred_type.data_type(), true))
+            .map(|field| {
+                json!({
+                    "name": field.name,
+                    "type": field.field_type.name(),
+                    "nullable": true
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Renders planned fields as the `fields` array of a schema decision.
+fn fields_json(fields: &[PlannedField]) -> Value {
+    Value::Array(
+        fields
+            .iter()
+            .map(|planned| {
+                json!({
+                    "name": planned.name,
+                    "type": planned.materialized_type.name(),
+                    "nullable": true
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Renders planned fields as the pinned schema YAML to persist.
+fn pin_yaml(fields: &[PlannedField]) -> String {
+    PinnedSchema {
+        fields: fields
+            .iter()
+            .map(|planned| PinnedField {
+                name: planned.name.clone(),
+                field_type: planned.materialized_type,
+            })
+            .collect(),
+    }
+    .to_yaml()
+}
+
+/// Assembles the planned fields and their pre-built columns into a
+/// [`RecordBatch`]. The batch schema and the reported `schema_decision` derive
+/// from the same plan, so the report can never disagree with the batch that was
+/// written.
+fn materialize(plan: FieldPlan, columns: Vec<ArrayRef>) -> Result<Materialized, ExecutionFailure> {
+    let schema = Arc::new(Schema::new(
+        plan.fields
+            .iter()
+            .map(|planned| Field::new(&planned.name, planned.materialized_type.data_type(), true))
             .collect::<Vec<_>>(),
     ));
     let batch = RecordBatch::try_new(schema, columns).map_err(|error| LoadFailure {
         code: "record_batch_creation_failed",
         message: format!("failed to create Arrow record batch: {error}"),
     })?;
-    let schema_decision = inferred_schema_decision(batch.schema().as_ref());
 
     Ok(Materialized {
         batch,
-        schema_decision,
+        schema_decision: plan.decision,
+        pinned_schema_yaml: plan.pinned_schema_yaml,
     })
 }
 
-fn infer_text_types(field_count: usize, records: &[Vec<Option<String>>]) -> Vec<InferredType> {
-    let mut inferred_types = vec![InferredType::Null; field_count];
+fn observe_text_types(field_count: usize, records: &[Vec<Option<String>>]) -> Vec<InferredType> {
+    let mut observed_types = vec![InferredType::Null; field_count];
     for record in records {
         for (column_index, value) in record.iter().enumerate() {
             if let Some(value) = value {
-                inferred_types[column_index] =
-                    inferred_types[column_index].merge(infer_text_type(value));
+                observed_types[column_index] =
+                    observed_types[column_index].merge(infer_text_type(value));
             }
         }
     }
+    observed_types
+}
 
-    inferred_types
-        .into_iter()
-        .map(default_null_to_text)
-        .collect()
+fn observe_json_types(
+    field_names: &[String],
+    objects: &[serde_json::Map<String, Value>],
+) -> Vec<InferredType> {
+    let mut observed_types = vec![InferredType::Null; field_names.len()];
+    for object in objects {
+        for (column_index, field_name) in field_names.iter().enumerate() {
+            if let Some(value) = object.get(field_name) {
+                observed_types[column_index] =
+                    observed_types[column_index].merge(infer_json_type(value));
+            }
+        }
+    }
+    observed_types
 }
 
 fn default_null_to_text(inferred_type: InferredType) -> InferredType {
@@ -307,23 +762,6 @@ fn json_scalar_to_string(value: Option<&Value>) -> Option<String> {
     }
 }
 
-fn inferred_schema_decision(schema: &Schema) -> Value {
-    json!({
-        "mode": "inferred",
-        "fields": schema
-            .fields()
-            .iter()
-            .map(|field| {
-                json!({
-                    "name": field.name(),
-                    "type": data_type_name(field.data_type()),
-                    "nullable": field.is_nullable()
-                })
-            })
-            .collect::<Vec<_>>()
-    })
-}
-
 fn data_type_name(data_type: &DataType) -> &'static str {
     match data_type {
         DataType::Boolean => "boolean",
@@ -370,6 +808,12 @@ impl InferredType {
             InferredType::Int64 => DataType::Int64,
             InferredType::Float64 => DataType::Float64,
         }
+    }
+
+    /// The stable name this type carries in schema decisions and pinned schema
+    /// files.
+    fn name(self) -> &'static str {
+        data_type_name(&self.data_type())
     }
 }
 
@@ -584,6 +1028,7 @@ mod tests {
     #[test]
     fn from_text_columns_infers_types_values_and_schema_decision() {
         let materialized = from_text_columns(
+            &SchemaDirective::Inferred,
             names(&["id", "name", "total"]),
             vec![
                 row(&[Some("1"), Some("Ada"), Some("42.50")]),
@@ -612,7 +1057,8 @@ mod tests {
                     {"name": "id", "type": "int64", "nullable": true},
                     {"name": "name", "type": "utf8", "nullable": true},
                     {"name": "total", "type": "float64", "nullable": true}
-                ]
+                ],
+                "drift_status": "not_applicable"
             })
         );
     }
@@ -620,6 +1066,7 @@ mod tests {
     #[test]
     fn from_text_columns_widens_mixed_columns_and_defaults_empty_columns_to_text() {
         let materialized = from_text_columns(
+            &SchemaDirective::Inferred,
             names(&["mixed", "widened", "empty"]),
             vec![
                 row(&[Some("1"), Some("1"), None]),
@@ -652,6 +1099,7 @@ mod tests {
         // numbers falls to Utf8 under the disagreements-fall-to-text merge rule
         // and stores the original strings verbatim.
         let materialized = from_text_columns(
+            &SchemaDirective::Inferred,
             names(&["reading"]),
             vec![row(&[Some("1.5")]), row(&[Some("inf")])],
         )
@@ -669,6 +1117,7 @@ mod tests {
         // integers falls to Utf8 under the disagreements-fall-to-text merge rule
         // and stores the original strings verbatim.
         let materialized = from_text_columns(
+            &SchemaDirective::Inferred,
             names(&["account"]),
             vec![row(&[Some("007")]), row(&[Some("1234")])],
         )
@@ -689,7 +1138,7 @@ mod tests {
             json_object(r#"{"zip": "00987", "balance": 5}"#),
         ];
         let materialized =
-            from_json_columns(names(&["zip", "balance", "active"]), objects).expect("materialize");
+            from_json_columns(&SchemaDirective::Inferred, names(&["zip", "balance", "active"]), objects).expect("materialize");
         let batch = &materialized.batch;
 
         assert_eq!(
@@ -713,7 +1162,7 @@ mod tests {
             json_object(r#"{"amount": 10}"#),
             json_object(r#"{"amount": 42.5}"#),
         ];
-        let materialized = from_json_columns(names(&["amount"]), objects).expect("materialize");
+        let materialized = from_json_columns(&SchemaDirective::Inferred, names(&["amount"]), objects).expect("materialize");
         let batch = &materialized.batch;
 
         assert_eq!(schema_types(batch), vec![DataType::Float64]);
@@ -728,7 +1177,7 @@ mod tests {
     fn from_json_columns_stringifies_composites_and_reports_schema_decision() {
         let objects = vec![json_object(r#"{"tags": ["a", "b"], "meta": {"k": 1}}"#)];
         let materialized =
-            from_json_columns(names(&["tags", "meta"]), objects).expect("materialize");
+            from_json_columns(&SchemaDirective::Inferred, names(&["tags", "meta"]), objects).expect("materialize");
         let batch = &materialized.batch;
 
         assert_eq!(schema_types(batch), vec![DataType::Utf8, DataType::Utf8]);
@@ -743,7 +1192,8 @@ mod tests {
                 "fields": [
                     {"name": "tags", "type": "utf8", "nullable": true},
                     {"name": "meta", "type": "utf8", "nullable": true}
-                ]
+                ],
+                "drift_status": "not_applicable"
             })
         );
     }
@@ -751,12 +1201,487 @@ mod tests {
     #[test]
     fn from_json_columns_defaults_all_null_columns_to_text() {
         let objects = vec![json_object(r#"{"note": null}"#), json_object("{}")];
-        let materialized = from_json_columns(names(&["note"]), objects).expect("materialize");
+        let materialized = from_json_columns(&SchemaDirective::Inferred, names(&["note"]), objects).expect("materialize");
         let batch = &materialized.batch;
 
         assert_eq!(schema_types(batch), vec![DataType::Utf8]);
         assert!(strings(batch, 0).is_null(0));
         assert!(strings(batch, 0).is_null(1));
+    }
+
+    // ---- Pinned schema contract (ADR-0033) ----
+
+    const PIN_YAML: &str = "version: 1\n\
+                            fields:\n\
+                            - name: customer_id\n\
+                            \x20 type: int64\n\
+                            \x20 nullable: true\n\
+                            - name: name\n\
+                            \x20 type: utf8\n\
+                            \x20 nullable: true\n";
+
+    #[test]
+    fn pinned_schema_parses_versioned_yaml_fields() {
+        let pin = PinnedSchema::from_yaml(PIN_YAML).expect("parse pinned schema");
+
+        assert_eq!(
+            pin,
+            PinnedSchema {
+                fields: vec![
+                    PinnedField {
+                        name: "customer_id".to_string(),
+                        field_type: InferredType::Int64,
+                    },
+                    PinnedField {
+                        name: "name".to_string(),
+                        field_type: InferredType::Utf8,
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn pinned_schema_defaults_omitted_nullable_to_true() {
+        // A hand-written pin may omit `nullable`; all fields are nullable today.
+        let pin = PinnedSchema::from_yaml("version: 1\nfields:\n- name: id\n  type: int64\n")
+            .expect("parse pinned schema without nullable");
+        assert_eq!(pin.fields[0].name, "id");
+        assert_eq!(pin.fields[0].field_type, InferredType::Int64);
+    }
+
+    #[test]
+    fn pinned_schema_rejects_contract_violations() {
+        let violations = [
+            (
+                "fields:\n- name: id\n  type: int64\n",
+                "pinned schema version is required",
+            ),
+            (
+                "version: 2\nfields:\n- name: id\n  type: int64\n",
+                "unsupported pinned schema version: 2",
+            ),
+            (
+                "version: 1\nfields:\n- name: id\n  type: date\n",
+                "unsupported pinned schema field type: date",
+            ),
+            (
+                "version: 1\nfields:\n- name: id\n  type: int64\n  nullable: false\n",
+                "pinned schema field \"id\" must be nullable",
+            ),
+            ("version: 1\nfields: []\n", "at least one field"),
+            ("version: 1\n", "at least one field"),
+            (
+                "version: 1\nfields:\n- name: id\n  type: int64\n- name: id\n  type: utf8\n",
+                "pinned schema field \"id\" is declared more than once",
+            ),
+            ("version: [\n", "failed to parse pinned schema"),
+        ];
+
+        for (yaml, expected_message_part) in violations {
+            let error = PinnedSchema::from_yaml(yaml)
+                .err()
+                .unwrap_or_else(|| panic!("pinned schema {yaml:?} accepted"));
+            assert_eq!(error.code, "invalid_pinned_schema", "code for {yaml:?}");
+            assert!(
+                error.message.contains(expected_message_part),
+                "message {:?} misses {expected_message_part:?}",
+                error.message
+            );
+        }
+    }
+
+    // ---- Pinned materialization and drift (ADR-0034) ----
+
+    fn pinned_directive(pin_yaml: &str, drift_policy: DriftPolicy) -> SchemaDirective {
+        SchemaDirective::Pinned {
+            pinned_path: "customers.schema.yml".to_string(),
+            pin: PinnedSchema::from_yaml(pin_yaml).expect("test pin parses"),
+            drift_policy,
+        }
+    }
+
+    #[test]
+    fn from_text_columns_materializes_matching_records_in_pinned_order_and_types() {
+        // The source arrives with reordered columns and `total` observes as
+        // int64 this batch; the pin still materializes pin order and widens
+        // total to the pinned float64.
+        let directive = pinned_directive(
+            "version: 1\n\
+             fields:\n\
+             - name: id\n\
+             \x20 type: int64\n\
+             - name: total\n\
+             \x20 type: float64\n\
+             - name: name\n\
+             \x20 type: utf8\n",
+            DriftPolicy::Fail,
+        );
+        let materialized = from_text_columns(
+            &directive,
+            names(&["name", "id", "total"]),
+            vec![
+                row(&[Some("Ada"), Some("1"), Some("42")]),
+                row(&[Some("Grace"), Some("2"), Some("7")]),
+            ],
+        )
+        .expect("materialize");
+        let batch = &materialized.batch;
+
+        assert_eq!(
+            schema_types(batch),
+            vec![DataType::Int64, DataType::Float64, DataType::Utf8]
+        );
+        assert_eq!(
+            batch
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().to_string())
+                .collect::<Vec<_>>(),
+            vec!["id", "total", "name"]
+        );
+        assert_eq!(ints(batch, 0).value(0), 1);
+        assert_eq!(floats(batch, 1).value(0), 42.0);
+        assert_eq!(floats(batch, 1).value(1), 7.0);
+        assert_eq!(strings(batch, 2).value(1), "Grace");
+
+        // A matching load persists nothing and reports the pinned posture.
+        assert!(materialized.pinned_schema_yaml.is_none());
+        assert_eq!(
+            materialized.schema_decision,
+            json!({
+                "mode": "pinned",
+                "fields": [
+                    {"name": "id", "type": "int64", "nullable": true},
+                    {"name": "total", "type": "float64", "nullable": true},
+                    {"name": "name", "type": "utf8", "nullable": true}
+                ],
+                "drift_status": "none",
+                "pinned_schema_path": "customers.schema.yml"
+            })
+        );
+    }
+
+    #[test]
+    fn from_text_columns_fails_on_missing_fields_and_type_changes_before_building() {
+        // `name` is missing, `id` observes as text, and `nickname` is new; all
+        // three surface in one schema_drift failure that echoes the pinned
+        // expectation.
+        let directive = pinned_directive(
+            "version: 1\n\
+             fields:\n\
+             - name: id\n\
+             \x20 type: int64\n\
+             - name: name\n\
+             \x20 type: utf8\n\
+             - name: total\n\
+             \x20 type: float64\n",
+            DriftPolicy::Fail,
+        );
+        let error = from_text_columns(
+            &directive,
+            names(&["id", "total", "nickname"]),
+            vec![row(&[Some("abc"), Some("1.5"), Some("Ada")])],
+        )
+        .err()
+        .expect("drift rejected");
+
+        assert_eq!(error.failure.code, "schema_drift");
+        assert_eq!(
+            error.failure.message,
+            "schema drift against pinned schema customers.schema.yml: \
+             missing fields: name; added fields: nickname; \
+             type changes: id (pinned int64, observed utf8)"
+        );
+        assert_eq!(
+            error.schema_decision.expect("drift failure carries decision"),
+            json!({
+                "mode": "pinned",
+                "fields": [
+                    {"name": "id", "type": "int64", "nullable": true},
+                    {"name": "name", "type": "utf8", "nullable": true},
+                    {"name": "total", "type": "float64", "nullable": true}
+                ],
+                "drift_status": "failed_on_drift",
+                "drift": {
+                    "missing_fields": ["name"],
+                    "added_fields": ["nickname"],
+                    "type_changes": [
+                        {"name": "id", "pinned": "int64", "observed": "utf8"}
+                    ]
+                },
+                "pinned_schema_path": "customers.schema.yml"
+            })
+        );
+    }
+
+    #[test]
+    fn from_text_columns_fails_on_added_fields_under_the_default_drift_policy() {
+        let directive = pinned_directive(
+            "version: 1\nfields:\n- name: id\n  type: int64\n",
+            DriftPolicy::Fail,
+        );
+        let error = from_text_columns(
+            &directive,
+            names(&["id", "extra"]),
+            vec![row(&[Some("1"), Some("x")])],
+        )
+        .err()
+        .expect("added field rejected by default");
+
+        assert_eq!(error.failure.code, "schema_drift");
+        assert_eq!(
+            error.failure.message,
+            "schema drift against pinned schema customers.schema.yml: added fields: extra"
+        );
+    }
+
+    #[test]
+    fn from_text_columns_appends_added_nullable_fields_under_the_additive_policy() {
+        let directive = pinned_directive(
+            "version: 1\n\
+             fields:\n\
+             - name: id\n\
+             \x20 type: int64\n\
+             - name: name\n\
+             \x20 type: utf8\n",
+            DriftPolicy::AllowAdditiveNullable,
+        );
+        let materialized = from_text_columns(
+            &directive,
+            names(&["id", "name", "vip"]),
+            vec![
+                row(&[Some("1"), Some("Ada"), Some("true")]),
+                row(&[Some("2"), Some("Grace"), None]),
+            ],
+        )
+        .expect("additive drift allowed");
+        let batch = &materialized.batch;
+
+        assert_eq!(
+            schema_types(batch),
+            vec![DataType::Int64, DataType::Utf8, DataType::Boolean]
+        );
+        assert!(bools(batch, 2).value(0));
+        assert!(bools(batch, 2).is_null(1));
+
+        assert_eq!(
+            materialized.schema_decision,
+            json!({
+                "mode": "pinned",
+                "fields": [
+                    {"name": "id", "type": "int64", "nullable": true},
+                    {"name": "name", "type": "utf8", "nullable": true},
+                    {"name": "vip", "type": "boolean", "nullable": true}
+                ],
+                "drift_status": "additive_fields_added",
+                "added_fields": [
+                    {"name": "vip", "type": "boolean", "nullable": true}
+                ],
+                "pinned_schema_path": "customers.schema.yml",
+                "pinned_schema_persisted": true
+            })
+        );
+        // The persisted pin now carries the added field, so a later
+        // disappearance is caught as drift (ADR-0033).
+        assert_eq!(
+            materialized.pinned_schema_yaml.expect("extended pin"),
+            "version: 1\n\
+             fields:\n\
+             - name: id\n\
+             \x20 type: int64\n\
+             \x20 nullable: true\n\
+             - name: name\n\
+             \x20 type: utf8\n\
+             \x20 nullable: true\n\
+             - name: vip\n\
+             \x20 type: boolean\n\
+             \x20 nullable: true\n"
+        );
+    }
+
+    #[test]
+    fn from_text_columns_persists_the_inferred_schema_as_the_new_pin_on_first_load() {
+        let materialized = from_text_columns(
+            &SchemaDirective::PinInferred {
+                pinned_path: "customers.schema.yml".to_string(),
+            },
+            names(&["id", "total"]),
+            vec![row(&[Some("1"), Some("42.5")])],
+        )
+        .expect("materialize");
+
+        assert_eq!(
+            materialized.schema_decision,
+            json!({
+                "mode": "inferred",
+                "fields": [
+                    {"name": "id", "type": "int64", "nullable": true},
+                    {"name": "total", "type": "float64", "nullable": true}
+                ],
+                "drift_status": "not_applicable",
+                "pinned_schema_path": "customers.schema.yml",
+                "pinned_schema_persisted": true
+            })
+        );
+        assert_eq!(
+            materialized.pinned_schema_yaml.expect("bootstrap pin"),
+            "version: 1\n\
+             fields:\n\
+             - name: id\n\
+             \x20 type: int64\n\
+             \x20 nullable: true\n\
+             - name: total\n\
+             \x20 type: float64\n\
+             \x20 nullable: true\n"
+        );
+    }
+
+    #[test]
+    fn from_text_columns_matches_all_null_columns_against_any_pinned_type() {
+        // `score` never carries a value in this batch: the Null observation is
+        // the lattice identity, so it matches the pinned int64 and materializes
+        // as an all-null int64 column.
+        let directive = pinned_directive(
+            "version: 1\n\
+             fields:\n\
+             - name: id\n\
+             \x20 type: int64\n\
+             - name: score\n\
+             \x20 type: int64\n",
+            DriftPolicy::Fail,
+        );
+        let materialized = from_text_columns(
+            &directive,
+            names(&["id", "score"]),
+            vec![row(&[Some("1"), None]), row(&[Some("2"), None])],
+        )
+        .expect("all-null column matches");
+        let batch = &materialized.batch;
+
+        assert_eq!(schema_types(batch), vec![DataType::Int64, DataType::Int64]);
+        assert!(ints(batch, 1).is_null(0));
+        assert!(ints(batch, 1).is_null(1));
+        assert_eq!(materialized.schema_decision["drift_status"], "none");
+    }
+
+    #[test]
+    fn from_text_columns_fails_on_duplicate_source_field_names_under_a_pin() {
+        let directive = pinned_directive(
+            "version: 1\nfields:\n- name: id\n  type: int64\n",
+            DriftPolicy::Fail,
+        );
+        let error = from_text_columns(
+            &directive,
+            names(&["id", "id"]),
+            vec![row(&[Some("1"), Some("2")])],
+        )
+        .err()
+        .expect("duplicate names rejected");
+
+        assert_eq!(error.failure.code, "schema_drift");
+        assert!(error.failure.message.contains(
+            "source field \"id\" appears more than once, so records cannot be validated"
+        ));
+        assert_eq!(
+            error.schema_decision.expect("decision")["drift"],
+            json!({ "duplicate_fields": ["id"] })
+        );
+    }
+
+    #[test]
+    fn from_json_columns_validates_and_widens_against_a_pinned_schema() {
+        // `zip` is a JSON string that merely looks numeric: pinned utf8 keeps
+        // it text. `balance` observes as int64 and widens to the pinned float64.
+        let directive = pinned_directive(
+            "version: 1\n\
+             fields:\n\
+             - name: zip\n\
+             \x20 type: utf8\n\
+             - name: balance\n\
+             \x20 type: float64\n",
+            DriftPolicy::Fail,
+        );
+        let objects = vec![
+            json_object(r#"{"zip": "01234", "balance": 10}"#),
+            json_object(r#"{"zip": "00987", "balance": 5}"#),
+        ];
+        let materialized = from_json_columns(&directive, names(&["zip", "balance"]), objects)
+            .expect("materialize");
+        let batch = &materialized.batch;
+
+        assert_eq!(schema_types(batch), vec![DataType::Utf8, DataType::Float64]);
+        assert_eq!(strings(batch, 0).value(0), "01234");
+        assert_eq!(floats(batch, 1).value(0), 10.0);
+        assert_eq!(materialized.schema_decision["mode"], "pinned");
+        assert_eq!(materialized.schema_decision["drift_status"], "none");
+    }
+
+    #[test]
+    fn from_json_columns_fails_when_a_json_string_hits_a_pinned_numeric_field() {
+        let directive = pinned_directive(
+            "version: 1\nfields:\n- name: balance\n  type: int64\n",
+            DriftPolicy::Fail,
+        );
+        let objects = vec![json_object(r#"{"balance": "10"}"#)];
+        let error = from_json_columns(&directive, names(&["balance"]), objects)
+            .err()
+            .expect("string vs pinned int64 rejected");
+
+        assert_eq!(error.failure.code, "schema_drift");
+        assert_eq!(
+            error.failure.message,
+            "schema drift against pinned schema customers.schema.yml: \
+             type changes: balance (pinned int64, observed utf8)"
+        );
+    }
+
+    #[test]
+    fn from_json_columns_appends_an_all_null_added_field_as_text_under_the_additive_policy() {
+        let directive = pinned_directive(
+            "version: 1\nfields:\n- name: id\n  type: int64\n",
+            DriftPolicy::AllowAdditiveNullable,
+        );
+        let objects = vec![
+            json_object(r#"{"id": 1, "note": null}"#),
+            json_object(r#"{"id": 2}"#),
+        ];
+        let materialized =
+            from_json_columns(&directive, names(&["id", "note"]), objects).expect("materialize");
+        let batch = &materialized.batch;
+
+        assert_eq!(schema_types(batch), vec![DataType::Int64, DataType::Utf8]);
+        assert!(strings(batch, 1).is_null(0));
+        assert!(strings(batch, 1).is_null(1));
+        assert_eq!(
+            materialized.schema_decision["added_fields"],
+            json!([{"name": "note", "type": "utf8", "nullable": true}])
+        );
+        assert_eq!(
+            materialized.pinned_schema_yaml.expect("extended pin"),
+            "version: 1\n\
+             fields:\n\
+             - name: id\n\
+             \x20 type: int64\n\
+             \x20 nullable: true\n\
+             - name: note\n\
+             \x20 type: utf8\n\
+             \x20 nullable: true\n"
+        );
+    }
+
+    #[test]
+    fn pinned_schema_serializes_to_the_persisted_yaml_form() {
+        let pin = PinnedSchema::from_yaml(PIN_YAML).expect("parse pinned schema");
+
+        // The exact persisted form is part of the pinned schema file contract.
+        assert_eq!(pin.to_yaml(), PIN_YAML);
+        // And the round trip is lossless.
+        assert_eq!(
+            PinnedSchema::from_yaml(&pin.to_yaml()).expect("reparse"),
+            pin
+        );
     }
 
     // ---- Test helpers ----

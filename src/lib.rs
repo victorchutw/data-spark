@@ -223,6 +223,25 @@ struct LoadFailure {
     message: String,
 }
 
+/// A load failure joined with the schema decision that had already been made
+/// when the failure happened, so a schema drift failure's report can echo what
+/// was expected. Failures raised before or without a schema decision lift via
+/// `From` and report `not_evaluated`.
+#[derive(Debug)]
+struct ExecutionFailure {
+    failure: LoadFailure,
+    schema_decision: Option<Value>,
+}
+
+impl From<LoadFailure> for ExecutionFailure {
+    fn from(failure: LoadFailure) -> Self {
+        ExecutionFailure {
+            failure,
+            schema_decision: None,
+        }
+    }
+}
+
 pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
@@ -368,8 +387,11 @@ fn execute_supported_load(definition: &LoadDefinition) -> Result<ExecutionDetail
     let SourceRead {
         batch,
         schema_decision,
+        pinned_schema_yaml: _,
         source_bytes,
-    } = source_port.read()?;
+    } = source_port
+        .read(&schema::SchemaDirective::Inferred)
+        .map_err(|execution_failure| execution_failure.failure)?;
     let DestinationWrite {
         bytes_written,
         atomicity,
