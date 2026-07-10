@@ -374,13 +374,15 @@ impl InferredType {
 }
 
 /// Observes the type carried by a text value, as CSV fields have no other type
-/// information than how they parse.
+/// information than how they parse. Float64 requires a finite parse: text that
+/// parses non-finite (the `inf` / `infinity` / `nan` spellings and overflow
+/// that saturates to ±infinity) observes as text per ADR-0031.
 fn infer_text_type(value: &str) -> InferredType {
     if parse_bool(value).is_some() {
         InferredType::Boolean
     } else if value.parse::<i64>().is_ok() {
         InferredType::Int64
-    } else if value.parse::<f64>().is_ok() {
+    } else if value.parse::<f64>().is_ok_and(f64::is_finite) {
         InferredType::Float64
     } else {
         InferredType::Utf8
@@ -479,7 +481,7 @@ mod tests {
         assert_eq!(Float64.merge(Utf8), Utf8);
     }
 
-    // ---- Observation rules (pinned as-is; policy calls tracked in #22/#23) ----
+    // ---- Observation rules (pinned as-is; policy call tracked in #22) ----
 
     #[test]
     fn infer_text_type_reads_the_narrowest_type_the_text_parses_into() {
@@ -491,16 +493,23 @@ mod tests {
         assert_eq!(infer_text_type("data-spark"), Utf8);
 
         // Reverse-behaviour table: unintuitive but pinned to keep the refactor
-        // behaviour-preserving. #22 tracks leading zeros; #23 tracks inf/NaN.
+        // behaviour-preserving. #22 tracks leading zeros.
         assert_eq!(infer_text_type("007"), Int64); // leading zeros survive as Int64
         assert_eq!(infer_text_type("+42"), Int64); // leading sign parses as Int64
         assert_eq!(infer_text_type("1e10"), Float64); // scientific notation is float
-        assert_eq!(infer_text_type("inf"), Float64); // #23
-        assert_eq!(infer_text_type("infinity"), Float64); // #23
-        assert_eq!(infer_text_type("NaN"), Float64); // #23
         assert_eq!(infer_text_type("99999999999999999999999"), Float64); // i64 overflow -> float
         assert_eq!(infer_text_type(" 42"), Utf8); // whitespace padding is not trimmed
         assert_eq!(infer_text_type("42 "), Utf8);
+
+        // ADR-0031: only a finite parse observes Float64. Non-finite spellings
+        // (any casing, optional sign) and f64-saturating overflow observe as text.
+        assert_eq!(infer_text_type("inf"), Utf8);
+        assert_eq!(infer_text_type("-inf"), Utf8);
+        assert_eq!(infer_text_type("infinity"), Utf8);
+        assert_eq!(infer_text_type("NaN"), Utf8);
+        assert_eq!(infer_text_type("NAN"), Utf8);
+        assert_eq!(infer_text_type("1e400"), Utf8); // saturates to +infinity
+        assert_eq!(infer_text_type("1e-400"), Float64); // underflows to the finite 0.0
     }
 
     #[test]
@@ -609,6 +618,23 @@ mod tests {
         assert_eq!(strings(batch, 2).len(), 2);
         assert!(strings(batch, 2).is_null(0));
         assert!(strings(batch, 2).is_null(1));
+    }
+
+    #[test]
+    fn from_text_columns_keeps_a_column_with_non_finite_numeric_text_as_text() {
+        // ADR-0031: `inf` observes as text, so a column mixing it with finite
+        // numbers falls to Utf8 under the disagreements-fall-to-text merge rule
+        // and stores the original strings verbatim.
+        let materialized = from_text_columns(
+            names(&["reading"]),
+            vec![row(&[Some("1.5")]), row(&[Some("inf")])],
+        )
+        .expect("materialize");
+        let batch = &materialized.batch;
+
+        assert_eq!(schema_types(batch), vec![DataType::Utf8]);
+        assert_eq!(strings(batch, 0).value(0), "1.5");
+        assert_eq!(strings(batch, 0).value(1), "inf");
     }
 
     #[test]
