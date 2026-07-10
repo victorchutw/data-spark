@@ -25,8 +25,9 @@ use std::sync::Arc;
 const PINNED_SCHEMA_VERSION: u64 = 1;
 
 /// A materialized load: the typed Arrow batch, the `schema_decision` shape
-/// that the load report echoes back to the caller, and the pinned schema YAML
-/// the caller persists when this load produces or extends a pin (ADR-0033).
+/// that the load report echoes back to the caller, and the pinned schema file
+/// write the caller performs when this load produces or extends a pin
+/// (ADR-0033).
 ///
 /// Rejected records (#8) will arrive here later as an **additive** `rejected`
 /// field, so callers pattern-match by name rather than positionally. That
@@ -35,7 +36,16 @@ const PINNED_SCHEMA_VERSION: u64 = 1;
 pub(crate) struct Materialized {
     pub(crate) batch: RecordBatch,
     pub(crate) schema_decision: Value,
-    pub(crate) pinned_schema_yaml: Option<String>,
+    pub(crate) pinned_schema_write: Option<PinnedSchemaWrite>,
+}
+
+/// A pinned schema file write the load must perform: the path the load
+/// definition named and the YAML text to persist there. Produced only when a
+/// load creates the pin (first pin-requesting load) or extends it (additive
+/// drift), so the path always travels with the text it belongs to.
+pub(crate) struct PinnedSchemaWrite {
+    pub(crate) pinned_path: String,
+    pub(crate) yaml: String,
 }
 
 /// How a load decides its dataset schema: infer it from observed records,
@@ -262,12 +272,12 @@ struct PlannedField {
 }
 
 /// The resolved field plan for a load: the fields to materialize in output
-/// order, the `schema_decision` the report echoes, and the pinned schema YAML
-/// to persist when this load produces or extends a pin.
+/// order, the `schema_decision` the report echoes, and the pinned schema file
+/// write to perform when this load produces or extends a pin.
 struct FieldPlan {
     fields: Vec<PlannedField>,
     decision: Value,
-    pinned_schema_yaml: Option<String>,
+    pinned_schema_write: Option<PinnedSchemaWrite>,
 }
 
 /// Resolves the observed columns against the schema directive into the field
@@ -323,16 +333,19 @@ fn inferred_plan(
         "fields": fields_json(&fields),
         "drift_status": "not_applicable",
     });
-    let pinned_schema_yaml = pinned_path.map(|path| {
+    let pinned_schema_write = pinned_path.map(|path| {
         decision["pinned_schema_path"] = json!(path);
         decision["pinned_schema_persisted"] = json!(true);
-        pin_yaml(&fields)
+        PinnedSchemaWrite {
+            pinned_path: path.to_string(),
+            yaml: pin_yaml(&fields),
+        }
     });
 
     FieldPlan {
         fields,
         decision,
-        pinned_schema_yaml,
+        pinned_schema_write,
     }
 }
 
@@ -465,7 +478,7 @@ fn pinned_plan(
         return Ok(FieldPlan {
             fields: matched_fields,
             decision,
-            pinned_schema_yaml: None,
+            pinned_schema_write: None,
         });
     }
 
@@ -483,11 +496,14 @@ fn pinned_plan(
         "pinned_schema_path": pinned_path,
         "pinned_schema_persisted": true,
     });
-    let pinned_schema_yaml = Some(pin_yaml(&fields));
+    let pinned_schema_write = Some(PinnedSchemaWrite {
+        pinned_path: pinned_path.to_string(),
+        yaml: pin_yaml(&fields),
+    });
     Ok(FieldPlan {
         fields,
         decision,
-        pinned_schema_yaml,
+        pinned_schema_write,
     })
 }
 
@@ -581,7 +597,7 @@ fn materialize(plan: FieldPlan, columns: Vec<ArrayRef>) -> Result<Materialized, 
     Ok(Materialized {
         batch,
         schema_decision: plan.decision,
-        pinned_schema_yaml: plan.pinned_schema_yaml,
+        pinned_schema_write: plan.pinned_schema_write,
     })
 }
 
@@ -1384,7 +1400,7 @@ mod tests {
         assert_eq!(strings(batch, 2).value(1), "Grace");
 
         // A matching load persists nothing and reports the pinned posture.
-        assert!(materialized.pinned_schema_yaml.is_none());
+        assert!(materialized.pinned_schema_write.is_none());
         assert_eq!(
             materialized.schema_decision,
             json!({
@@ -1525,7 +1541,7 @@ mod tests {
         // The persisted pin now carries the added field, so a later
         // disappearance is caught as drift (ADR-0033).
         assert_eq!(
-            materialized.pinned_schema_yaml.expect("extended pin"),
+            materialized.pinned_schema_write.expect("extended pin").yaml,
             "version: 1\n\
              fields:\n\
              - name: id\n\
@@ -1564,8 +1580,10 @@ mod tests {
                 "pinned_schema_persisted": true
             })
         );
+        let pinned_schema_write = materialized.pinned_schema_write.expect("bootstrap pin");
+        assert_eq!(pinned_schema_write.pinned_path, "customers.schema.yml");
         assert_eq!(
-            materialized.pinned_schema_yaml.expect("bootstrap pin"),
+            pinned_schema_write.yaml,
             "version: 1\n\
              fields:\n\
              - name: id\n\
@@ -1677,6 +1695,30 @@ mod tests {
     }
 
     #[test]
+    fn from_json_columns_treats_a_batch_wide_absent_pinned_field_as_missing_field_drift() {
+        // A field absent from one record reads as null, but a pinned field
+        // absent from every record is missing-field drift under every policy
+        // (ADR-0034): a silently renamed source field must not quietly become
+        // an all-null column.
+        let directive = pinned_directive(
+            "version: 1\n\
+             fields:\n\
+             - name: id\n\
+             \x20 type: int64\n\
+             - name: note\n\
+             \x20 type: utf8\n",
+            DriftPolicy::AllowAdditiveNullable,
+        );
+        let objects = vec![json_object(r#"{"id": 1}"#), json_object(r#"{"id": 2}"#)];
+        let error = from_json_columns(&directive, names(&["id"]), objects)
+            .err()
+            .expect("batch-wide absence rejected");
+
+        assert_eq!(error.failure.code, "schema_drift");
+        assert!(error.failure.message.contains("missing fields: note"));
+    }
+
+    #[test]
     fn from_json_columns_appends_an_all_null_added_field_as_text_under_the_additive_policy() {
         let directive = pinned_directive(
             "version: 1\nfields:\n- name: id\n  type: int64\n",
@@ -1698,7 +1740,7 @@ mod tests {
             json!([{"name": "note", "type": "utf8", "nullable": true}])
         );
         assert_eq!(
-            materialized.pinned_schema_yaml.expect("extended pin"),
+            materialized.pinned_schema_write.expect("extended pin").yaml,
             "version: 1\n\
              fields:\n\
              - name: id\n\

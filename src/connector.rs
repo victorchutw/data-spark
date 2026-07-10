@@ -27,14 +27,14 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// What a [`Source`] hands back: the materialized Arrow batch, the
-/// `schema_decision` shape the report echoes, the pinned schema YAML the
-/// orchestrator persists when the load produces or extends a pin, and the
+/// `schema_decision` shape the report echoes, the pinned schema file write the
+/// orchestrator performs when the load produces or extends a pin, and the
 /// source bytes the source measured. Recombines [`schema::Materialized`] with
 /// the byte count so `schema.rs` stays types-only.
 pub(crate) struct SourceRead {
     pub(crate) batch: RecordBatch,
     pub(crate) schema_decision: Value,
-    pub(crate) pinned_schema_yaml: Option<String>,
+    pub(crate) pinned_schema_write: Option<schema::PinnedSchemaWrite>,
     pub(crate) source_bytes: u64,
 }
 
@@ -45,7 +45,7 @@ impl SourceRead {
         SourceRead {
             batch: materialized.batch,
             schema_decision: materialized.schema_decision,
-            pinned_schema_yaml: materialized.pinned_schema_yaml,
+            pinned_schema_write: materialized.pinned_schema_write,
             source_bytes,
         }
     }

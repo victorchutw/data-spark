@@ -418,20 +418,15 @@ fn execute_supported_load(
     let SourceRead {
         batch,
         schema_decision,
-        pinned_schema_yaml,
+        pinned_schema_write,
         source_bytes,
     } = source_port.read(&directive)?;
 
     // Persist the produced or extended pin before the destination write: the
     // pin records the schema decision of this load's source, which stays valid
     // even if the write then fails, and a retry converges on the same pin.
-    if let Some(pinned_schema_yaml) = &pinned_schema_yaml {
-        let pinned_path = definition
-            .schema
-            .as_ref()
-            .and_then(|schema_config| schema_config.pinned_path.as_ref())
-            .expect("a pin is only produced when the definition names a pinned_path");
-        persist_pinned_schema(pinned_path, pinned_schema_yaml)?;
+    if let Some(pinned_schema_write) = &pinned_schema_write {
+        persist_pinned_schema(pinned_schema_write)?;
     }
 
     let DestinationWrite {
@@ -520,8 +515,11 @@ fn resolve_schema_directive(
 }
 
 /// Writes the pinned schema file a load produced or extended, creating parent
-/// directories as needed.
-fn persist_pinned_schema(pinned_path: &Path, yaml: &str) -> Result<(), LoadFailure> {
+/// directories as needed. The write carries the path it belongs to, so no
+/// second lookup into the definition is needed.
+fn persist_pinned_schema(write: &schema::PinnedSchemaWrite) -> Result<(), LoadFailure> {
+    let pinned_path = Path::new(&write.pinned_path);
+    let yaml = &write.yaml;
     let write_failure = |error: io::Error| LoadFailure {
         code: "pinned_schema_write_failed",
         message: format!(
