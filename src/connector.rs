@@ -5,15 +5,16 @@
 //! sources; Parquet, DuckDB, BigQuery, ... as destinations) plugs in behind one
 //! of two trait-object ports — [`Source`] and [`Destination`] — reached only
 //! through the pure [`source_connector`] / [`destination_connector`] factories.
-//! A source owns reading and materialization ([`SourceRead`]); a destination
-//! owns writing and reports its own write facts ([`DestinationWrite`]) so the
-//! orchestrator never branches on connector identity. The load mode is parsed
+//! A source owns reading and materialization under the load's schema directive
+//! ([`SourceRead`]); a destination owns writing and reports its own write facts
+//! ([`DestinationWrite`]) so the orchestrator never branches on connector
+//! identity. The load mode is parsed
 //! once into [`LoadMode`] at the write-dispatch boundary. `local_file`,
 //! `parquet`, and `duckdb` are the first connectors; everything else here is
 //! private.
 
-use crate::schema;
-use crate::{DestinationDefinition, LoadFailure, SourceDefinition};
+use crate::schema::{self, SchemaDirective};
+use crate::{DestinationDefinition, ExecutionFailure, LoadFailure, SourceDefinition};
 use arrow_array::RecordBatch;
 use duckdb::vtab::arrow::{arrow_recordbatch_to_query_params, ArrowVTab};
 use duckdb::Connection;
@@ -26,12 +27,14 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// What a [`Source`] hands back: the materialized Arrow batch, the
-/// `schema_decision` shape the report echoes, and the source bytes the source
-/// measured. Recombines [`schema::Materialized`] with the byte count so
-/// `schema.rs` stays types-only.
+/// `schema_decision` shape the report echoes, the pinned schema file write the
+/// orchestrator performs when the load produces or extends a pin, and the
+/// source bytes the source measured. Recombines [`schema::Materialized`] with
+/// the byte count so `schema.rs` stays types-only.
 pub(crate) struct SourceRead {
     pub(crate) batch: RecordBatch,
     pub(crate) schema_decision: Value,
+    pub(crate) pinned_schema_write: Option<schema::PinnedSchemaWrite>,
     pub(crate) source_bytes: u64,
 }
 
@@ -42,6 +45,7 @@ impl SourceRead {
         SourceRead {
             batch: materialized.batch,
             schema_decision: materialized.schema_decision,
+            pinned_schema_write: materialized.pinned_schema_write,
             source_bytes,
         }
     }
@@ -82,9 +86,11 @@ impl LoadMode {
 }
 
 /// A named capability for reading records from a source. Reads and materializes
-/// behind one narrow call so the orchestrator never sees connector internals.
+/// under the load's schema directive behind one narrow call so the orchestrator
+/// never sees connector internals. Only reads make schema decisions, so only
+/// this port's failures can carry one ([`ExecutionFailure`]).
 pub(crate) trait Source {
-    fn read(&self) -> Result<SourceRead, LoadFailure>;
+    fn read(&self, directive: &SchemaDirective) -> Result<SourceRead, ExecutionFailure>;
 }
 
 /// A named capability for writing records to a destination. Owns how it commits
@@ -157,7 +163,7 @@ struct LocalFileSource {
 }
 
 impl Source for LocalFileSource {
-    fn read(&self) -> Result<SourceRead, LoadFailure> {
+    fn read(&self, directive: &SchemaDirective) -> Result<SourceRead, ExecutionFailure> {
         // Validate the resolved format before opening the file so an unsupported
         // format fails without source I/O (ADR-0019), and so its precedence
         // stays after the destination-connector check for a doubly-invalid
@@ -169,7 +175,7 @@ impl Source for LocalFileSource {
                     records,
                     source_bytes,
                 } = read_local_csv(&self.path)?;
-                let materialized = schema::from_text_columns(field_names, records)?;
+                let materialized = schema::from_text_columns(directive, field_names, records)?;
                 Ok(SourceRead::from_materialized(materialized, source_bytes))
             }
             "jsonl" => {
@@ -178,14 +184,15 @@ impl Source for LocalFileSource {
                     objects,
                     source_bytes,
                 } = read_local_jsonl(&self.path)?;
-                let materialized = schema::from_json_columns(field_names, objects)?;
+                let materialized = schema::from_json_columns(directive, field_names, objects)?;
                 Ok(SourceRead::from_materialized(materialized, source_bytes))
             }
             _ => Err(LoadFailure {
                 code: "unsupported_source_format",
                 message: "only local CSV and JSONL sources are supported by this load path"
                     .to_string(),
-            }),
+            }
+            .into()),
         }
     }
 }
@@ -651,8 +658,11 @@ mod tests {
             path: PathBuf::from("/does/not/exist.xml"),
             format: Some("xml".to_string()),
         };
-        let error = source.read().err().expect("unknown format rejected");
-        assert_eq!(error.code, "unsupported_source_format");
+        let error = source
+            .read(&SchemaDirective::Inferred)
+            .err()
+            .expect("unknown format rejected");
+        assert_eq!(error.failure.code, "unsupported_source_format");
     }
 
     #[test]
@@ -681,7 +691,7 @@ mod tests {
             path: source_path,
             format: Some("csv".to_string()),
         };
-        let read = source.read().expect("read csv");
+        let read = source.read(&SchemaDirective::Inferred).expect("read csv");
 
         assert_eq!(read.batch.num_rows(), 2);
         assert_eq!(
@@ -710,7 +720,7 @@ mod tests {
             path: source_path,
             format: Some("jsonl".to_string()),
         };
-        let read = source.read().expect("read jsonl");
+        let read = source.read(&SchemaDirective::Inferred).expect("read jsonl");
 
         assert_eq!(read.batch.num_rows(), 2);
         assert_eq!(
@@ -734,7 +744,7 @@ mod tests {
             path: source_path,
             format: Some("csv".to_string()),
         }
-        .read()
+        .read(&SchemaDirective::Inferred)
         .expect("read csv")
         .batch;
 
@@ -770,7 +780,7 @@ mod tests {
             path: source_path,
             format: Some("csv".to_string()),
         }
-        .read()
+        .read(&SchemaDirective::Inferred)
         .expect("read csv")
         .batch;
 
@@ -813,7 +823,7 @@ mod tests {
                 path: source_path,
                 format: Some("csv".to_string()),
             }
-            .read()
+            .read(&SchemaDirective::Inferred)
             .expect("read csv")
             .batch;
             destination
