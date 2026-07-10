@@ -97,6 +97,10 @@ load_mode: full_refresh
     assert_eq!(report["dataset"], "customers");
     assert_eq!(report["load_mode"], "full_refresh");
     assert_eq!(report["schema_decision"]["mode"], "inferred");
+    assert_eq!(
+        report["schema_decision"]["drift_status"], "not_applicable",
+        "an inferred load has no pinned schema to drift from"
+    );
     assert_eq!(report["row_counts"]["source"], 2);
     assert_eq!(report["row_counts"]["written"], 2);
     assert!(
@@ -1125,6 +1129,682 @@ load_mode: full_refresh
     assert!(report_path.ends_with("load-report.json"));
     assert!(stdout.contains(".data-spark/runs"));
     assert!(stdout.contains("load-report.json"));
+}
+
+#[test]
+fn local_csv_pinned_schema_bootstraps_then_reuses_the_pin_for_parquet() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(
+        &source_path,
+        "customer_id,name,total\n1,Ada,42.50\n2,Grace,7.25\n",
+    )
+    .expect("write source csv");
+
+    let destination_path = work.path().join("customers_dataset");
+    let pinned_path = work.path().join("customers.schema.yml");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+"#,
+            source_path.display(),
+            destination_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    // First load: no pinned schema file exists yet, so the inferred schema is
+    // persisted as the new pin.
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-first"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_to_string(&pinned_path).expect("pinned schema file persisted"),
+        "version: 1\n\
+         fields:\n\
+         - name: customer_id\n\
+         \x20 type: int64\n\
+         \x20 nullable: true\n\
+         - name: name\n\
+         \x20 type: utf8\n\
+         \x20 nullable: true\n\
+         - name: total\n\
+         \x20 type: float64\n\
+         \x20 nullable: true\n"
+    );
+    let (_, first_report) = read_single_report(
+        &work.path().join("artifacts-first"),
+        "first pinned load writes one artifact directory",
+    );
+    assert_eq!(
+        first_report["schema_decision"],
+        serde_json::json!({
+            "mode": "inferred",
+            "fields": [
+                {"name": "customer_id", "type": "int64", "nullable": true},
+                {"name": "name", "type": "utf8", "nullable": true},
+                {"name": "total", "type": "float64", "nullable": true}
+            ],
+            "drift_status": "not_applicable",
+            "pinned_schema_path": pinned_path.display().to_string(),
+            "pinned_schema_persisted": true
+        })
+    );
+
+    // Repeat load with matching records: validated against the pin.
+    fs::write(&source_path, "customer_id,name,total\n3,Katherine,100.00\n")
+        .expect("write replacement source csv");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-second"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, second_report) = read_single_report(
+        &work.path().join("artifacts-second"),
+        "second pinned load writes one artifact directory",
+    );
+    assert_eq!(
+        second_report["schema_decision"],
+        serde_json::json!({
+            "mode": "pinned",
+            "fields": [
+                {"name": "customer_id", "type": "int64", "nullable": true},
+                {"name": "name", "type": "utf8", "nullable": true},
+                {"name": "total", "type": "float64", "nullable": true}
+            ],
+            "drift_status": "none",
+            "pinned_schema_path": pinned_path.display().to_string()
+        })
+    );
+    assert_eq!(second_report["exit_status"], "succeeded");
+
+    let parquet_path = single_parquet_file(&destination_path);
+    let batch = read_single_parquet_batch(&parquet_path);
+    assert_eq!(batch.num_rows(), 1);
+    let customer_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_id is int64");
+    assert_eq!(customer_ids.value(0), 3);
+}
+
+#[test]
+fn local_jsonl_pinned_schema_bootstraps_then_reuses_the_pin_for_parquet() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    fs::write(
+        &source_path,
+        "{\"customer_id\": 1, \"name\": \"Ada\", \"total\": 42.50, \"active\": true}\n",
+    )
+    .expect("write source jsonl");
+
+    let destination_path = work.path().join("customers_dataset");
+    let pinned_path = work.path().join("customers.schema.yml");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+"#,
+            source_path.display(),
+            destination_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-first"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_to_string(&pinned_path).expect("pinned schema file persisted"),
+        "version: 1\n\
+         fields:\n\
+         - name: customer_id\n\
+         \x20 type: int64\n\
+         \x20 nullable: true\n\
+         - name: name\n\
+         \x20 type: utf8\n\
+         \x20 nullable: true\n\
+         - name: total\n\
+         \x20 type: float64\n\
+         \x20 nullable: true\n\
+         - name: active\n\
+         \x20 type: boolean\n\
+         \x20 nullable: true\n"
+    );
+
+    fs::write(
+        &source_path,
+        "{\"customer_id\": 3, \"name\": \"Katherine\", \"total\": 100.00, \"active\": false}\n",
+    )
+    .expect("write replacement source jsonl");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-second"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, second_report) = read_single_report(
+        &work.path().join("artifacts-second"),
+        "second pinned jsonl load writes one artifact directory",
+    );
+    assert_eq!(second_report["schema_decision"]["mode"], "pinned");
+    assert_eq!(second_report["schema_decision"]["drift_status"], "none");
+
+    let parquet_path = single_parquet_file(&destination_path);
+    let batch = read_single_parquet_batch(&parquet_path);
+    assert_eq!(batch.num_rows(), 1);
+    let customer_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_id is int64");
+    assert_eq!(customer_ids.value(0), 3);
+}
+
+#[test]
+fn local_csv_pinned_schema_bootstraps_then_reuses_the_pin_for_duckdb() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(
+        &source_path,
+        "customer_id,name,total\n1,Ada,42.50\n2,Grace,7.25\n",
+    )
+    .expect("write source csv");
+
+    let database_path = work.path().join("customers.duckdb");
+    let pinned_path = work.path().join("customers.schema.yml");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: duckdb
+  path: {}
+dataset: customers
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+"#,
+            source_path.display(),
+            database_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-first"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    assert!(
+        pinned_path.exists(),
+        "first load persists the pinned schema file"
+    );
+
+    fs::write(&source_path, "customer_id,name,total\n3,Katherine,100.00\n")
+        .expect("write replacement source csv");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-second"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, second_report) = read_single_report(
+        &work.path().join("artifacts-second"),
+        "second pinned duckdb load writes one artifact directory",
+    );
+    assert_eq!(second_report["schema_decision"]["mode"], "pinned");
+    assert_eq!(second_report["schema_decision"]["drift_status"], "none");
+
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 1);
+    let customer_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_id is int64");
+    assert_eq!(customer_ids.value(0), 3);
+}
+
+#[test]
+fn local_jsonl_pinned_schema_bootstraps_then_reuses_the_pin_for_duckdb() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    fs::write(
+        &source_path,
+        "{\"customer_id\": 1, \"name\": \"Ada\", \"total\": 42.50, \"active\": true}\n",
+    )
+    .expect("write source jsonl");
+
+    let database_path = work.path().join("customers.duckdb");
+    let pinned_path = work.path().join("customers.schema.yml");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: duckdb
+  path: {}
+dataset: customers
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+"#,
+            source_path.display(),
+            database_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-first"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    assert!(
+        pinned_path.exists(),
+        "first load persists the pinned schema file"
+    );
+
+    fs::write(
+        &source_path,
+        "{\"customer_id\": 3, \"name\": \"Katherine\", \"total\": 100.00, \"active\": false}\n",
+    )
+    .expect("write replacement source jsonl");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-second"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, second_report) = read_single_report(
+        &work.path().join("artifacts-second"),
+        "second pinned jsonl duckdb load writes one artifact directory",
+    );
+    assert_eq!(second_report["schema_decision"]["mode"], "pinned");
+    assert_eq!(second_report["schema_decision"]["drift_status"], "none");
+
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 1);
+    let names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name is string");
+    assert_eq!(names.value(0), "Katherine");
+}
+
+#[test]
+fn schema_drift_fails_fast_by_default_before_destination_writing() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "customer_id,name\n1,Ada\n").expect("write source csv");
+
+    let destination_path = work.path().join("customers_dataset");
+    let pinned_path = work.path().join("customers.schema.yml");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+"#,
+            source_path.display(),
+            destination_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-first"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    // The source grows a `vip` column; the default drift policy fails the load.
+    fs::write(&source_path, "customer_id,name,vip\n3,Katherine,true\n")
+        .expect("write drifted source csv");
+    let assert = Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-second"))
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    // Fail fast before destination writing: the destination still holds the
+    // first load's records.
+    let parquet_path = single_parquet_file(&destination_path);
+    let batch = read_single_parquet_batch(&parquet_path);
+    assert_eq!(batch.num_rows(), 1);
+    let customer_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_id is int64");
+    assert_eq!(customer_ids.value(0), 1);
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let (_, report) = read_single_report(
+        &work.path().join("artifacts-second"),
+        "drift-failed load writes one artifact directory",
+    );
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(report["row_counts"]["source"], 0);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+    assert_eq!(report["error_summary"]["code"], "schema_drift");
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("added fields: vip"));
+    assert_eq!(report["schema_decision"]["mode"], "pinned");
+    assert_eq!(report["schema_decision"]["drift_status"], "failed_on_drift");
+    assert_eq!(
+        report["schema_decision"]["drift"]["added_fields"],
+        serde_json::json!(["vip"])
+    );
+    assert_eq!(
+        report["schema_decision"]["pinned_schema_path"],
+        pinned_path.display().to_string()
+    );
+
+    assert!(stdout.contains("Status: failed"));
+    assert!(stdout.contains("schema drift against pinned schema"));
+}
+
+#[test]
+fn additive_nullable_drift_continues_and_extends_the_pin_when_explicitly_allowed() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    fs::write(
+        &source_path,
+        "{\"customer_id\": 1, \"name\": \"Ada\"}\n{\"customer_id\": 2, \"name\": \"Grace\"}\n",
+    )
+    .expect("write source jsonl");
+
+    let database_path = work.path().join("customers.duckdb");
+    let pinned_path = work.path().join("customers.schema.yml");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: duckdb
+  path: {}
+dataset: customers
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+  drift_policy: allow_additive_nullable
+"#,
+            source_path.display(),
+            database_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-first"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    // The source grows a `vip` field that one record leaves absent; the
+    // explicit additive policy lets the load continue.
+    fs::write(
+        &source_path,
+        "{\"customer_id\": 3, \"name\": \"Katherine\", \"vip\": true}\n\
+         {\"customer_id\": 4, \"name\": \"Lin\"}\n",
+    )
+    .expect("write additive source jsonl");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-second"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(
+        &work.path().join("artifacts-second"),
+        "additive load writes one artifact directory",
+    );
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["schema_decision"]["mode"], "pinned");
+    assert_eq!(
+        report["schema_decision"]["drift_status"],
+        "additive_fields_added"
+    );
+    assert_eq!(
+        report["schema_decision"]["added_fields"],
+        serde_json::json!([{"name": "vip", "type": "boolean", "nullable": true}])
+    );
+    assert_eq!(report["schema_decision"]["pinned_schema_persisted"], true);
+
+    // The pin now carries the added field.
+    assert_eq!(
+        fs::read_to_string(&pinned_path).expect("pinned schema file"),
+        "version: 1\n\
+         fields:\n\
+         - name: customer_id\n\
+         \x20 type: int64\n\
+         \x20 nullable: true\n\
+         - name: name\n\
+         \x20 type: utf8\n\
+         \x20 nullable: true\n\
+         - name: vip\n\
+         \x20 type: boolean\n\
+         \x20 nullable: true\n"
+    );
+
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 2);
+    let vips = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("vip is boolean");
+    assert!(vips.value(0), "customer 3 is vip");
+    assert!(vips.is_null(1), "absent vip lands as null");
+}
+
+#[test]
+fn non_additive_drift_still_fails_under_the_additive_policy() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "customer_id,total\n1,10.5\n").expect("write source csv");
+
+    let database_path = work.path().join("customers.duckdb");
+    let pinned_path = work.path().join("customers.schema.yml");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: duckdb
+  path: {}
+dataset: customers
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+  drift_policy: allow_additive_nullable
+"#,
+            source_path.display(),
+            database_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-first"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    // `customer_id` now observes as text: a type change is not additive, so
+    // the additive policy still fails the load.
+    fs::write(&source_path, "customer_id,total\nabc,7\n").expect("write drifted source csv");
+    let assert = Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-second"))
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let (_, report) = read_single_report(
+        &work.path().join("artifacts-second"),
+        "type-change load writes one artifact directory",
+    );
+    assert_eq!(report["error_summary"]["code"], "schema_drift");
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("type changes: customer_id (pinned int64, observed utf8)"));
+    assert_eq!(report["schema_decision"]["drift_status"], "failed_on_drift");
+    assert!(stdout.contains("Status: failed"));
+
+    // The destination still holds the first load's records.
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 1);
+    let customer_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_id is int64");
+    assert_eq!(customer_ids.value(0), 1);
 }
 
 fn read_single_report(artifacts_dir: &Path, artifact_count_message: &str) -> (PathBuf, Value) {

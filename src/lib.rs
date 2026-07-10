@@ -2,6 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -100,7 +101,7 @@ impl LoadReport {
             destination_summary: failure.destination_summary,
             dataset: failure.dataset,
             load_mode: failure.load_mode,
-            schema_decision: json!({ "mode": "not_evaluated" }),
+            schema_decision: failure.schema_decision,
             row_counts: RowCounts {
                 source: 0,
                 written: 0,
@@ -161,6 +162,16 @@ struct LoadDefinition {
     destination: Option<DestinationDefinition>,
     dataset: Option<String>,
     load_mode: Option<String>,
+    schema: Option<SchemaConfig>,
+}
+
+/// The `schema` block of a load definition: the path of the pinned schema file
+/// the load reuses (ADR-0033) and the drift policy that decides whether a load
+/// may continue when schema drift is detected (ADR-0007).
+#[derive(Debug, Deserialize, Serialize)]
+struct SchemaConfig {
+    pinned_path: Option<PathBuf>,
+    drift_policy: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -191,12 +202,16 @@ struct ExecutionDetails {
 }
 
 /// A failure joined with the load definition context (source, destination,
-/// dataset, load mode) that a load report echoes back.
+/// dataset, load mode) that a load report echoes back, plus the schema decision
+/// if one had already been made when the failure happened (a schema drift
+/// failure reports what was expected; every other failure reports
+/// `not_evaluated`).
 struct ReportableFailure {
     source_summary: Value,
     destination_summary: Value,
     dataset: Option<String>,
     load_mode: String,
+    schema_decision: Value,
     code: &'static str,
     message: String,
 }
@@ -211,10 +226,17 @@ impl ReportableFailure {
             destination_summary: json!({}),
             dataset: None,
             load_mode: "full_refresh".to_string(),
+            schema_decision: not_evaluated_schema_decision(),
             code,
             message,
         }
     }
+}
+
+/// The schema decision a report carries when the load failed before any schema
+/// decision was made.
+fn not_evaluated_schema_decision() -> Value {
+    json!({ "mode": "not_evaluated" })
 }
 
 #[derive(Debug)]
@@ -334,6 +356,7 @@ fn execute_load_definition(definition_path: &Path) -> Result<ExecutionDetails, R
                 destination_summary,
                 dataset,
                 load_mode,
+                schema_decision: not_evaluated_schema_decision(),
                 code: "unsupported_load_definition_version",
                 message: format!("unsupported load definition version: {version}"),
             })
@@ -344,23 +367,29 @@ fn execute_load_definition(definition_path: &Path) -> Result<ExecutionDetails, R
                 destination_summary,
                 dataset,
                 load_mode,
+                schema_decision: not_evaluated_schema_decision(),
                 code: "missing_load_definition_version",
                 message: "load definition version is required".to_string(),
             })
         }
     }
 
-    execute_supported_load(&definition).map_err(|failure| ReportableFailure {
+    execute_supported_load(&definition).map_err(|execution_failure| ReportableFailure {
         source_summary,
         destination_summary,
         dataset,
         load_mode,
-        code: failure.code,
-        message: failure.message,
+        schema_decision: execution_failure
+            .schema_decision
+            .unwrap_or_else(not_evaluated_schema_decision),
+        code: execution_failure.failure.code,
+        message: execution_failure.failure.message,
     })
 }
 
-fn execute_supported_load(definition: &LoadDefinition) -> Result<ExecutionDetails, LoadFailure> {
+fn execute_supported_load(
+    definition: &LoadDefinition,
+) -> Result<ExecutionDetails, ExecutionFailure> {
     let source = definition.source.as_ref().ok_or_else(|| LoadFailure {
         code: "missing_source",
         message: "load definition source is required".to_string(),
@@ -374,24 +403,37 @@ fn execute_supported_load(definition: &LoadDefinition) -> Result<ExecutionDetail
         .clone()
         .unwrap_or_else(|| "full_refresh".to_string());
 
-    // Validate the load mode and both connectors before any I/O so an
-    // unsupported definition fails without reading the source or touching the
-    // destination (ADR-0019), preserving the current error precedence: load
-    // mode -> source connector -> destination connector -> read -> write. The
-    // source format is validated inside read() so its precedence stays after the
-    // destination-connector check for a doubly-invalid definition.
+    // Validate the load mode, both connectors, and the schema directive before
+    // any source or destination I/O so an unsupported definition fails without
+    // reading the source or touching the destination (ADR-0019), preserving the
+    // error precedence: load mode -> source connector -> destination connector
+    // -> schema directive (config, then pinned schema file) -> read -> write.
+    // The source format is validated inside read() so its precedence stays
+    // after the destination-connector check for a doubly-invalid definition.
     let mode = LoadMode::parse(&load_mode)?;
     let source_port = source_connector(source)?;
     let destination_port = destination_connector(destination, definition.dataset.as_deref())?;
+    let directive = resolve_schema_directive(definition.schema.as_ref())?;
 
     let SourceRead {
         batch,
         schema_decision,
-        pinned_schema_yaml: _,
+        pinned_schema_yaml,
         source_bytes,
-    } = source_port
-        .read(&schema::SchemaDirective::Inferred)
-        .map_err(|execution_failure| execution_failure.failure)?;
+    } = source_port.read(&directive)?;
+
+    // Persist the produced or extended pin before the destination write: the
+    // pin records the schema decision of this load's source, which stays valid
+    // even if the write then fails, and a retry converges on the same pin.
+    if let Some(pinned_schema_yaml) = &pinned_schema_yaml {
+        let pinned_path = definition
+            .schema
+            .as_ref()
+            .and_then(|schema_config| schema_config.pinned_path.as_ref())
+            .expect("a pin is only produced when the definition names a pinned_path");
+        persist_pinned_schema(pinned_path, pinned_schema_yaml)?;
+    }
+
     let DestinationWrite {
         bytes_written,
         atomicity,
@@ -423,6 +465,77 @@ fn execute_supported_load(definition: &LoadDefinition) -> Result<ExecutionDetail
             "batch_count": 1
         }),
     })
+}
+
+/// Resolves the definition's `schema` block into the schema directive the
+/// source materializes under: no block means inference, a named pinned schema
+/// file that does not exist yet means this load persists the inferred schema as
+/// the new pin (ADR-0033), and an existing file is parsed and validated against
+/// (ADR-0034).
+fn resolve_schema_directive(
+    schema_config: Option<&SchemaConfig>,
+) -> Result<schema::SchemaDirective, LoadFailure> {
+    let Some(schema_config) = schema_config else {
+        return Ok(schema::SchemaDirective::Inferred);
+    };
+    let pinned_path = schema_config
+        .pinned_path
+        .as_ref()
+        .filter(|pinned_path| !pinned_path.as_os_str().is_empty())
+        .ok_or_else(|| LoadFailure {
+            code: "invalid_schema_config",
+            message: "schema.pinned_path is required when a load definition has a schema block"
+                .to_string(),
+        })?;
+    let drift_policy = match schema_config.drift_policy.as_deref() {
+        None | Some("fail") => schema::DriftPolicy::Fail,
+        Some("allow_additive_nullable") => schema::DriftPolicy::AllowAdditiveNullable,
+        Some(other) => {
+            return Err(LoadFailure {
+                code: "unsupported_drift_policy",
+                message: format!("unsupported drift policy: {other}"),
+            })
+        }
+    };
+
+    match fs::read_to_string(pinned_path) {
+        Ok(pin_text) => Ok(schema::SchemaDirective::Pinned {
+            pinned_path: path_string(pinned_path),
+            pin: schema::PinnedSchema::from_yaml(&pin_text)?,
+            drift_policy,
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok(schema::SchemaDirective::PinInferred {
+                pinned_path: path_string(pinned_path),
+            })
+        }
+        Err(error) => Err(LoadFailure {
+            code: "pinned_schema_read_failed",
+            message: format!(
+                "failed to read pinned schema {}: {error}",
+                pinned_path.display()
+            ),
+        }),
+    }
+}
+
+/// Writes the pinned schema file a load produced or extended, creating parent
+/// directories as needed.
+fn persist_pinned_schema(pinned_path: &Path, yaml: &str) -> Result<(), LoadFailure> {
+    let write_failure = |error: io::Error| LoadFailure {
+        code: "pinned_schema_write_failed",
+        message: format!(
+            "failed to persist pinned schema {}: {error}",
+            pinned_path.display()
+        ),
+    };
+    if let Some(parent) = pinned_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(write_failure)?;
+    }
+    fs::write(pinned_path, yaml).map_err(write_failure)
 }
 
 fn to_json<T: Serialize>(value: &T) -> Value {
@@ -553,6 +666,7 @@ mod tests {
             destination_summary: json!({ "connector": "parquet" }),
             dataset: Some("customers".to_string()),
             load_mode: "full_refresh".to_string(),
+            schema_decision: not_evaluated_schema_decision(),
             code: "missing_source",
             message: "load definition source is required".to_string(),
         };
@@ -600,6 +714,105 @@ mod tests {
         assert_eq!(error.message, "load definition source is required");
     }
 
+    // ---- Schema directive resolution ----
+
+    fn schema_config(pinned_path: Option<&str>, drift_policy: Option<&str>) -> SchemaConfig {
+        SchemaConfig {
+            pinned_path: pinned_path.map(PathBuf::from),
+            drift_policy: drift_policy.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn resolve_schema_directive_defaults_to_inference_without_a_schema_block() {
+        assert!(matches!(
+            resolve_schema_directive(None),
+            Ok(schema::SchemaDirective::Inferred)
+        ));
+    }
+
+    #[test]
+    fn resolve_schema_directive_requires_a_pinned_path_in_a_schema_block() {
+        for config in [
+            schema_config(None, None),
+            schema_config(None, Some("fail")),
+            schema_config(Some(""), None),
+        ] {
+            let error = resolve_schema_directive(Some(&config))
+                .err()
+                .expect("schema block without pinned_path rejected");
+            assert_eq!(error.code, "invalid_schema_config");
+            assert!(error.message.contains("schema.pinned_path is required"));
+        }
+    }
+
+    #[test]
+    fn resolve_schema_directive_rejects_unknown_drift_policies_before_reading_the_pin() {
+        // The pin path does not exist: an unknown policy must fail instead of
+        // silently bootstrapping.
+        let config = schema_config(Some("/does/not/exist.schema.yml"), Some("relaxed"));
+        let error = resolve_schema_directive(Some(&config))
+            .err()
+            .expect("unknown drift policy rejected");
+        assert_eq!(error.code, "unsupported_drift_policy");
+        assert_eq!(error.message, "unsupported drift policy: relaxed");
+    }
+
+    #[test]
+    fn resolve_schema_directive_bootstraps_when_the_pin_file_is_absent() {
+        let config = schema_config(Some("/does/not/exist/customers.schema.yml"), Some("fail"));
+        match resolve_schema_directive(Some(&config)).expect("absent pin bootstraps") {
+            schema::SchemaDirective::PinInferred { pinned_path } => {
+                assert_eq!(pinned_path, "/does/not/exist/customers.schema.yml");
+            }
+            _ => panic!("expected the PinInferred directive"),
+        }
+    }
+
+    #[test]
+    fn resolve_schema_directive_surfaces_an_invalid_pinned_schema_file() {
+        let work = tempfile::TempDir::new().expect("tempdir");
+        let pinned_path = work.path().join("customers.schema.yml");
+        fs::write(
+            &pinned_path,
+            "version: 7\nfields:\n- name: id\n  type: int64\n",
+        )
+        .expect("write pin");
+        let config = schema_config(Some(pinned_path.to_str().expect("utf8 path")), None);
+
+        let error = resolve_schema_directive(Some(&config))
+            .err()
+            .expect("invalid pin rejected");
+        assert_eq!(error.code, "invalid_pinned_schema");
+        assert!(error
+            .message
+            .contains("unsupported pinned schema version: 7"));
+    }
+
+    #[test]
+    fn resolve_schema_directive_loads_an_existing_pin_with_the_declared_policy() {
+        let work = tempfile::TempDir::new().expect("tempdir");
+        let pinned_path = work.path().join("customers.schema.yml");
+        fs::write(
+            &pinned_path,
+            "version: 1\nfields:\n- name: id\n  type: int64\n",
+        )
+        .expect("write pin");
+        let config = schema_config(
+            Some(pinned_path.to_str().expect("utf8 path")),
+            Some("allow_additive_nullable"),
+        );
+
+        match resolve_schema_directive(Some(&config)).expect("existing pin loads") {
+            schema::SchemaDirective::Pinned {
+                pinned_path: reported_path,
+                drift_policy: schema::DriftPolicy::AllowAdditiveNullable,
+                ..
+            } => assert_eq!(reported_path, pinned_path.display().to_string()),
+            _ => panic!("expected the Pinned directive with the additive policy"),
+        }
+    }
+
     #[test]
     fn without_context_reports_empty_summaries_and_the_default_load_mode() {
         let failure = ReportableFailure::without_context(
@@ -611,6 +824,7 @@ mod tests {
         assert_eq!(failure.destination_summary, json!({}));
         assert_eq!(failure.dataset, None);
         assert_eq!(failure.load_mode, "full_refresh");
+        assert_eq!(failure.schema_decision, json!({ "mode": "not_evaluated" }));
         assert_eq!(failure.code, "load_definition_read_failed");
         assert_eq!(
             failure.message,

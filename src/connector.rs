@@ -5,9 +5,10 @@
 //! sources; Parquet, DuckDB, BigQuery, ... as destinations) plugs in behind one
 //! of two trait-object ports — [`Source`] and [`Destination`] — reached only
 //! through the pure [`source_connector`] / [`destination_connector`] factories.
-//! A source owns reading and materialization ([`SourceRead`]); a destination
-//! owns writing and reports its own write facts ([`DestinationWrite`]) so the
-//! orchestrator never branches on connector identity. The load mode is parsed
+//! A source owns reading and materialization under the load's schema directive
+//! ([`SourceRead`]); a destination owns writing and reports its own write facts
+//! ([`DestinationWrite`]) so the orchestrator never branches on connector
+//! identity. The load mode is parsed
 //! once into [`LoadMode`] at the write-dispatch boundary. `local_file`,
 //! `parquet`, and `duckdb` are the first connectors; everything else here is
 //! private.

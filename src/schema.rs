@@ -1,12 +1,17 @@
-//! Inferred-schema deep module: the single home for the "type story" of a load.
+//! Schema deep module: the single home for the "type story" of a load.
 //!
-//! A column's type is decided once here by inference over the observed values
-//! and the same decision drives materialization into an Arrow [`RecordBatch`].
-//! CSV cells arrive as text ([`from_text_columns`]) and JSONL cells arrive as
-//! typed [`Value`]s ([`from_json_columns`]); both fold observations through the
-//! [`InferredType`] lattice, so the two formats produce schemas the same way.
-//! Everything type-related — the lattice, observation rules, materialization,
-//! and the `schema_decision` shape — is private behind these two entry points.
+//! A column's type is decided once here — by inference over the observed
+//! values, or by validating those observations against a pinned schema
+//! ([`SchemaDirective`]) — and the same decision drives materialization into an
+//! Arrow [`RecordBatch`]. CSV cells arrive as text ([`from_text_columns`]) and
+//! JSONL cells arrive as typed [`Value`]s ([`from_json_columns`]); both fold
+//! observations through the [`InferredType`] lattice, so the two formats
+//! produce and validate schemas the same way: a column fits a pinned field iff
+//! its observed type widens to the pinned type under that lattice (ADR-0034).
+//! Everything type-related — the lattice, observation rules, the pinned schema
+//! file contract ([`PinnedSchema`], ADR-0033), drift comparison,
+//! materialization, and the `schema_decision` shape — is private behind these
+//! two entry points.
 
 use crate::{ExecutionFailure, LoadFailure};
 use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
@@ -211,7 +216,9 @@ pub(crate) fn from_text_columns(
     let columns = plan
         .fields
         .iter()
-        .map(|planned| build_text_array(planned.materialized_type, &records, planned.observed_index))
+        .map(|planned| {
+            build_text_array(planned.materialized_type, &records, planned.observed_index)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     materialize(plan, columns)
 }
@@ -234,7 +241,12 @@ pub(crate) fn from_json_columns(
         .iter()
         .enumerate()
         .map(|(column_index, planned)| {
-            build_json_array(planned.materialized_type, &objects, &planned.name, column_index)
+            build_json_array(
+                planned.materialized_type,
+                &objects,
+                &planned.name,
+                column_index,
+            )
         })
         .collect::<Result<Vec<_>, _>>()?;
     materialize(plan, columns)
@@ -268,14 +280,22 @@ fn plan_fields(
 ) -> Result<FieldPlan, ExecutionFailure> {
     match directive {
         SchemaDirective::Inferred => Ok(inferred_plan(observed_names, observed_types, None)),
-        SchemaDirective::PinInferred { pinned_path } => {
-            Ok(inferred_plan(observed_names, observed_types, Some(pinned_path)))
-        }
+        SchemaDirective::PinInferred { pinned_path } => Ok(inferred_plan(
+            observed_names,
+            observed_types,
+            Some(pinned_path),
+        )),
         SchemaDirective::Pinned {
             pinned_path,
             pin,
             drift_policy,
-        } => pinned_plan(pinned_path, pin, drift_policy, observed_names, observed_types),
+        } => pinned_plan(
+            pinned_path,
+            pin,
+            drift_policy,
+            observed_names,
+            observed_types,
+        ),
     }
 }
 
@@ -361,7 +381,11 @@ fn pinned_plan(
                         observed_index,
                     });
                 } else {
-                    type_changes.push((pin_field.name.clone(), pin_field.field_type, observed_type));
+                    type_changes.push((
+                        pin_field.name.clone(),
+                        pin_field.field_type,
+                        observed_type,
+                    ));
                 }
             }
         }
@@ -661,9 +685,11 @@ fn build_text_array(
 /// Materializes a JSONL column straight from the parsed [`Value`]s, healing the
 /// old JSON → String → re-parse round-trip: integers come from `as_i64`, floats
 /// from `as_f64`, booleans are taken directly, and text columns reuse
-/// [`json_scalar_to_string`]. The coercion arms are unreachable on an inferred
-/// schema (inference only picks a type every cell already carries) but return a
-/// clean failure rather than panicking if a pinned schema (#7) ever supplies one.
+/// [`json_scalar_to_string`]. The coercion arms are unreachable: inference only
+/// picks a type every cell already carries, and a pinned schema only builds
+/// columns whose observed type widens to the pinned type (ADR-0034). They
+/// return a clean failure rather than panicking if that invariant is ever
+/// broken.
 fn build_json_array(
     inferred_type: InferredType,
     objects: &[serde_json::Map<String, Value>],
@@ -1137,8 +1163,12 @@ mod tests {
             json_object(r#"{"zip": "01234", "balance": 10, "active": true}"#),
             json_object(r#"{"zip": "00987", "balance": 5}"#),
         ];
-        let materialized =
-            from_json_columns(&SchemaDirective::Inferred, names(&["zip", "balance", "active"]), objects).expect("materialize");
+        let materialized = from_json_columns(
+            &SchemaDirective::Inferred,
+            names(&["zip", "balance", "active"]),
+            objects,
+        )
+        .expect("materialize");
         let batch = &materialized.batch;
 
         assert_eq!(
@@ -1162,7 +1192,9 @@ mod tests {
             json_object(r#"{"amount": 10}"#),
             json_object(r#"{"amount": 42.5}"#),
         ];
-        let materialized = from_json_columns(&SchemaDirective::Inferred, names(&["amount"]), objects).expect("materialize");
+        let materialized =
+            from_json_columns(&SchemaDirective::Inferred, names(&["amount"]), objects)
+                .expect("materialize");
         let batch = &materialized.batch;
 
         assert_eq!(schema_types(batch), vec![DataType::Float64]);
@@ -1176,8 +1208,12 @@ mod tests {
     #[test]
     fn from_json_columns_stringifies_composites_and_reports_schema_decision() {
         let objects = vec![json_object(r#"{"tags": ["a", "b"], "meta": {"k": 1}}"#)];
-        let materialized =
-            from_json_columns(&SchemaDirective::Inferred, names(&["tags", "meta"]), objects).expect("materialize");
+        let materialized = from_json_columns(
+            &SchemaDirective::Inferred,
+            names(&["tags", "meta"]),
+            objects,
+        )
+        .expect("materialize");
         let batch = &materialized.batch;
 
         assert_eq!(schema_types(batch), vec![DataType::Utf8, DataType::Utf8]);
@@ -1201,7 +1237,8 @@ mod tests {
     #[test]
     fn from_json_columns_defaults_all_null_columns_to_text() {
         let objects = vec![json_object(r#"{"note": null}"#), json_object("{}")];
-        let materialized = from_json_columns(&SchemaDirective::Inferred, names(&["note"]), objects).expect("materialize");
+        let materialized = from_json_columns(&SchemaDirective::Inferred, names(&["note"]), objects)
+            .expect("materialize");
         let batch = &materialized.batch;
 
         assert_eq!(schema_types(batch), vec![DataType::Utf8]);
@@ -1395,7 +1432,9 @@ mod tests {
              type changes: id (pinned int64, observed utf8)"
         );
         assert_eq!(
-            error.schema_decision.expect("drift failure carries decision"),
+            error
+                .schema_decision
+                .expect("drift failure carries decision"),
             json!({
                 "mode": "pinned",
                 "fields": [
