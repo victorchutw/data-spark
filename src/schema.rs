@@ -509,7 +509,7 @@ mod tests {
         assert_eq!(infer_text_type("NaN"), Utf8);
         assert_eq!(infer_text_type("NAN"), Utf8);
         assert_eq!(infer_text_type("1e400"), Utf8); // saturates to +infinity
-        assert_eq!(infer_text_type("1e-400"), Float64); // subnormal underflow parses to the finite 0.0
+        assert_eq!(infer_text_type("1e-400"), Float64); // underflows to the finite 0.0
     }
 
     #[test]
