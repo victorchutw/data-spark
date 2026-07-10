@@ -497,7 +497,7 @@ mod tests {
     // ---- Observation rules ----
 
     #[test]
-    fn infer_text_type_reads_the_narrowest_type_the_text_parses_into() {
+    fn infer_text_type_reads_the_narrowest_type_that_loses_nothing() {
         use InferredType::*;
         // Migrated smoke cases.
         assert_eq!(infer_text_type("true"), Boolean);
