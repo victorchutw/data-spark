@@ -364,6 +364,133 @@ load_mode: full_refresh
 }
 
 #[test]
+fn local_jsonl_full_refresh_writes_readable_duckdb_table_report_and_summary() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    fs::write(
+        &source_path,
+        "{\"customer_id\": 1, \"name\": \"Ada\", \"total\": 42.50, \"active\": true}\n\
+         {\"customer_id\": 2, \"name\": \"Grace\", \"total\": 7.25, \"active\": false}\n",
+    )
+    .expect("write source jsonl");
+
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: duckdb
+  path: {}
+dataset: customers
+load_mode: full_refresh
+"#,
+            source_path.display(),
+            database_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    let assert = Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let (report_path, report) = read_single_report(
+        &artifacts_dir,
+        "jsonl duckdb load writes one artifact directory",
+    );
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+
+    assert_eq!(batch.num_rows(), 2);
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name())
+            .collect::<Vec<_>>(),
+        vec!["customer_id", "name", "total", "active"]
+    );
+
+    let customer_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_id is int64");
+    let names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name is string");
+    let totals = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("total is float64");
+    let actives = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("active is boolean");
+
+    assert_eq!(customer_ids.value(0), 1);
+    assert_eq!(customer_ids.value(1), 2);
+    assert_eq!(names.value(0), "Ada");
+    assert_eq!(names.value(1), "Grace");
+    assert_eq!(totals.value(0), 42.50);
+    assert_eq!(totals.value(1), 7.25);
+    assert!(actives.value(0));
+    assert!(!actives.value(1));
+
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["process_exit_code"], 0);
+    assert_eq!(report["dataset"], "customers");
+    assert_eq!(report["load_mode"], "full_refresh");
+    assert_eq!(report["schema_decision"]["mode"], "inferred");
+    assert_eq!(report["row_counts"]["source"], 2);
+    assert_eq!(report["row_counts"]["written"], 2);
+    assert!(
+        report["byte_counts"]["source"]
+            .as_u64()
+            .expect("source byte count")
+            > 0
+    );
+    assert!(
+        report["byte_counts"]["destination"].is_null(),
+        "a duckdb destination reports no destination byte count"
+    );
+    assert_eq!(report["destination_write"]["atomicity"], "atomic");
+    assert_eq!(
+        report["destination_write"]["strategy"],
+        "transactional_replace"
+    );
+    assert_eq!(report["execution"]["record_format"], "arrow_record_batch");
+    assert_eq!(report["execution"]["batch_count"], 1);
+    assert!(report["error_summary"].is_null());
+    assert!(report_path.ends_with("load-report.json"));
+
+    assert!(stdout.contains("Status: succeeded"));
+    assert!(stdout.contains("Records read: 2"));
+    assert!(stdout.contains("Records written: 2"));
+    assert!(stdout.contains(report_path.to_str().expect("report path")));
+}
+
+#[test]
 fn local_csv_keeps_zero_padded_numeric_text_as_text() {
     let work = TempDir::new().expect("tempdir");
     let source_path = work.path().join("accounts.csv");
