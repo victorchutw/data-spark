@@ -126,10 +126,16 @@ pub(crate) fn destination_connector(
             path: definition.path.clone(),
         })),
         "duckdb" => {
-            let dataset = dataset.ok_or_else(|| LoadFailure {
-                code: "missing_dataset",
-                message: "load definition dataset is required for a duckdb destination".to_string(),
-            })?;
+            // An empty dataset is no address at all, so it fails here as
+            // missing rather than at write time; identifier content beyond
+            // presence is deliberately left to DuckDB (no allowlist, ADR-0030).
+            let dataset = dataset
+                .filter(|dataset| !dataset.is_empty())
+                .ok_or_else(|| LoadFailure {
+                    code: "missing_dataset",
+                    message: "load definition dataset is required for a duckdb destination"
+                        .to_string(),
+                })?;
             Ok(Box::new(DuckDbDestination {
                 path: definition.path.clone(),
                 dataset: dataset.to_string(),
@@ -627,6 +633,14 @@ mod tests {
             error.message,
             "load definition dataset is required for a duckdb destination"
         );
+
+        let error = destination_connector(
+            &destination_definition("duckdb", "customers.duckdb"),
+            Some(""),
+        )
+        .err()
+        .expect("duckdb destination with an empty dataset rejected");
+        assert_eq!(error.code, "missing_dataset");
     }
 
     #[test]
@@ -833,7 +847,10 @@ mod tests {
     fn read_single_duckdb_batch(database_path: &Path, dataset: &str) -> RecordBatch {
         let connection = Connection::open(database_path).expect("open duckdb database");
         let mut statement = connection
-            .prepare(&format!("SELECT * FROM \"{dataset}\" ORDER BY 1"))
+            .prepare(&format!(
+                "SELECT * FROM \"{}\" ORDER BY 1",
+                dataset.replace('"', "\"\"")
+            ))
             .expect("prepare duckdb read-back");
         let batches = statement
             .query_arrow([])
