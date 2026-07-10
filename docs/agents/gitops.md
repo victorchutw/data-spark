@@ -67,11 +67,38 @@ When moving an external PR through triage, use the same labels with
 3. Move the issue to `in-progress`.
 4. Implement the smallest vertical slice that satisfies the issue.
 5. Run local checks before opening a PR.
-6. Open a PR whose body contains `Closes #<issue-number>`.
-7. Keep the PR as draft while still changing behavior. Draft PRs keep referenced issues in `in-progress`.
-8. Mark the PR ready for review when it is ready to merge. The issue status sync workflow moves referenced issues to `in-review`.
-9. Merge only after CI passes.
-10. Let GitHub close the issue through the `Closes #<issue-number>` reference.
+6. Open a draft PR whose body contains `Closes #<issue-number>`.
+7. Keep the PR as draft while still changing behavior. Draft PRs keep referenced issues in `in-progress`, and Copilot auto-review stays quiet until the PR is marked ready.
+8. Mark the PR ready for review only when CI is green and behavior is no longer changing. The issue status sync workflow moves referenced issues to `in-review`, and Copilot reviews the ready-for-review snapshot.
+9. Settle the Copilot review as described in "Copilot code review" below.
+10. Merge only after CI passes and every review conversation is resolved.
+11. Let GitHub close the issue through the `Closes #<issue-number>` reference.
+
+## Copilot code review
+
+Copilot auto-review is enabled by the maintainer's account-level setting, not
+by a repository ruleset. Observed behavior on this repo:
+
+- A PR opened ready for review is reviewed immediately, in parallel with the
+  first CI run. A PR opened as draft is reviewed only when it is marked ready
+  for review.
+- A review takes about 2-3 minutes. The `rust` CI job takes about 4-5 minutes,
+  so review comments normally arrive before CI turns green.
+- Copilot does not re-review later pushes. It reviews the snapshot that was
+  current when the review was requested.
+
+Because there is no automatic re-review, open PRs as drafts and mark them
+ready only in their intended final state, so Copilot reviews the code that
+will actually merge. After marking a PR ready:
+
+1. Wait for the Copilot review before treating the PR as settled.
+2. Handle comments in one batch: fix real findings in a single push, and
+   reply to and resolve the threads that need no code change.
+3. Re-request a Copilot review manually if the fixes change behavior
+   substantially.
+
+Branch protection requires every conversation to be resolved before merging,
+so an unhandled Copilot thread blocks the merge even when CI is green.
 
 ## External PR triage
 
@@ -110,7 +137,9 @@ For agent-executable work, prefer this path:
 6. Keep the PR draft while behavior is still changing.
 7. Run a separate review pass focused on bugs, contract regressions, ADR
    conflicts, credentials, and missing tests.
-8. Stop for human judgment if the work conflicts with an ADR, needs a new domain
+8. After marking the PR ready, wait for the Copilot review and settle it as
+   described in "Copilot code review" before reporting the work done.
+9. Stop for human judgment if the work conflicts with an ADR, needs a new domain
    concept, requires credentials or production data, changes release automation,
    or repeats the same failing check three times.
 
@@ -172,6 +201,7 @@ The release workflow validates that the tag version matches `Cargo.toml`, runs t
 - Require status checks before merging.
 - Require the `rust` CI check.
 - Require branches to be up to date before merging.
+- Require conversation resolution before merging.
 - Block force pushes and branch deletion.
 
 Release publishing should stay limited to `.github/workflows/release.yml` with `contents: write`; routine CI and issue automation should use narrower permissions.
