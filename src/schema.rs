@@ -374,12 +374,16 @@ impl InferredType {
 }
 
 /// Observes the type carried by a text value, as CSV fields have no other type
-/// information than how they parse. Float64 requires a finite parse: text that
-/// parses non-finite (the `inf` / `infinity` / `nan` spellings and overflow
-/// that saturates to ±infinity) observes as text per ADR-0031.
+/// information than how they parse. A numeric reading that would lose
+/// information is not taken: zero-padded text observes as text per ADR-0032,
+/// and Float64 requires a finite parse — text that parses non-finite (the
+/// `inf` / `infinity` / `nan` spellings and overflow that saturates to
+/// ±infinity) observes as text per ADR-0031.
 fn infer_text_type(value: &str) -> InferredType {
     if parse_bool(value).is_some() {
         InferredType::Boolean
+    } else if is_zero_padded(value) {
+        InferredType::Utf8
     } else if value.parse::<i64>().is_ok() {
         InferredType::Int64
     } else if value.parse::<f64>().is_ok_and(f64::is_finite) {
@@ -387,6 +391,15 @@ fn infer_text_type(value: &str) -> InferredType {
     } else {
         InferredType::Utf8
     }
+}
+
+/// True when the text's integer part is zero-padded: after an optional leading
+/// sign, a `0` immediately followed by another ASCII digit, as in `007`,
+/// `0042`, or `007.5`. A numeric reading of such text would drop the leading
+/// zeros, so per ADR-0032 it observes as text.
+fn is_zero_padded(value: &str) -> bool {
+    let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
+    matches!(unsigned.as_bytes(), [b'0', next, ..] if next.is_ascii_digit())
 }
 
 /// Observes the type a JSON value already declares, so JSON strings stay text
@@ -481,10 +494,10 @@ mod tests {
         assert_eq!(Float64.merge(Utf8), Utf8);
     }
 
-    // ---- Observation rules (pinned as-is; policy call tracked in #22) ----
+    // ---- Observation rules ----
 
     #[test]
-    fn infer_text_type_reads_the_narrowest_type_the_text_parses_into() {
+    fn infer_text_type_reads_the_narrowest_type_that_loses_nothing() {
         use InferredType::*;
         // Migrated smoke cases.
         assert_eq!(infer_text_type("true"), Boolean);
@@ -493,13 +506,26 @@ mod tests {
         assert_eq!(infer_text_type("data-spark"), Utf8);
 
         // Reverse-behaviour table: unintuitive but pinned to keep the refactor
-        // behaviour-preserving. #22 tracks leading zeros.
-        assert_eq!(infer_text_type("007"), Int64); // leading zeros survive as Int64
+        // behaviour-preserving.
         assert_eq!(infer_text_type("+42"), Int64); // leading sign parses as Int64
         assert_eq!(infer_text_type("1e10"), Float64); // scientific notation is float
         assert_eq!(infer_text_type("99999999999999999999999"), Float64); // i64 overflow -> float
         assert_eq!(infer_text_type(" 42"), Utf8); // whitespace padding is not trimmed
         assert_eq!(infer_text_type("42 "), Utf8);
+
+        // ADR-0032: a zero-padded integer part (an optional sign, then `0`
+        // immediately followed by another digit) observes as text, because its
+        // numeric reading would drop the leading zeros.
+        assert_eq!(infer_text_type("007"), Utf8);
+        assert_eq!(infer_text_type("00"), Utf8);
+        assert_eq!(infer_text_type("0042"), Utf8);
+        assert_eq!(infer_text_type("+007"), Utf8);
+        assert_eq!(infer_text_type("-007"), Utf8);
+        assert_eq!(infer_text_type("007.5"), Utf8);
+        // Unpadded zeros keep their numeric reading.
+        assert_eq!(infer_text_type("0"), Int64);
+        assert_eq!(infer_text_type("-0"), Int64);
+        assert_eq!(infer_text_type("0.5"), Float64);
 
         // ADR-0031: only a finite parse observes Float64. Non-finite spellings
         // (any casing, optional sign) and f64-saturating overflow observe as text.
@@ -635,6 +661,23 @@ mod tests {
         assert_eq!(schema_types(batch), vec![DataType::Utf8]);
         assert_eq!(strings(batch, 0).value(0), "1.5");
         assert_eq!(strings(batch, 0).value(1), "inf");
+    }
+
+    #[test]
+    fn from_text_columns_keeps_a_column_mixing_zero_padded_and_plain_integers_as_text() {
+        // ADR-0032: `007` observes as text, so a column mixing it with plain
+        // integers falls to Utf8 under the disagreements-fall-to-text merge rule
+        // and stores the original strings verbatim.
+        let materialized = from_text_columns(
+            names(&["account"]),
+            vec![row(&[Some("007")]), row(&[Some("1234")])],
+        )
+        .expect("materialize");
+        let batch = &materialized.batch;
+
+        assert_eq!(schema_types(batch), vec![DataType::Utf8]);
+        assert_eq!(strings(batch, 0).value(0), "007");
+        assert_eq!(strings(batch, 0).value(1), "1234");
     }
 
     #[test]

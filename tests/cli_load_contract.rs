@@ -364,6 +364,77 @@ load_mode: full_refresh
 }
 
 #[test]
+fn local_csv_keeps_zero_padded_numeric_text_as_text() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("accounts.csv");
+    // `zip` values are zero-padded numeric text: per ADR-0032 they must stay
+    // text, not be retyped as int64 (which would drop the leading zeros).
+    fs::write(&source_path, "zip,balance\n00501,10\n02134,5\n").expect("write source csv");
+
+    let destination_path = work.path().join("accounts_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: accounts
+load_mode: full_refresh
+"#,
+            source_path.display(),
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "zero-padded csv load writes one artifact directory",
+    );
+    assert_eq!(report["schema_decision"]["fields"][0]["name"], "zip");
+    assert_eq!(report["schema_decision"]["fields"][0]["type"], "utf8");
+    assert_eq!(report["schema_decision"]["fields"][1]["name"], "balance");
+    assert_eq!(report["schema_decision"]["fields"][1]["type"], "int64");
+
+    let parquet_path = single_parquet_file(&destination_path);
+    let batch = read_single_parquet_batch(&parquet_path);
+
+    let zips = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("zip stays string");
+    let balances = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("balance is int64");
+
+    assert_eq!(zips.value(0), "00501");
+    assert_eq!(zips.value(1), "02134");
+    assert_eq!(balances.value(0), 10);
+    assert_eq!(balances.value(1), 5);
+}
+
+#[test]
 fn local_jsonl_infers_field_types_from_json_values_not_stringified_text() {
     let work = TempDir::new().expect("tempdir");
     let source_path = work.path().join("accounts.jsonl");
