@@ -8,12 +8,15 @@
 //! A source owns reading and materialization ([`SourceRead`]); a destination
 //! owns writing and reports its own write facts ([`DestinationWrite`]) so the
 //! orchestrator never branches on connector identity. The load mode is parsed
-//! once into [`LoadMode`] at the write-dispatch boundary. `local_file` and
-//! `parquet` are the first two connectors; everything else here is private.
+//! once into [`LoadMode`] at the write-dispatch boundary. `local_file`,
+//! `parquet`, and `duckdb` are the first connectors; everything else here is
+//! private.
 
 use crate::schema;
 use crate::{DestinationDefinition, LoadFailure, SourceDefinition};
 use arrow_array::RecordBatch;
+use duckdb::vtab::arrow::{arrow_recordbatch_to_query_params, ArrowVTab};
+use duckdb::Connection;
 use parquet::arrow::ArrowWriter;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -47,9 +50,12 @@ impl SourceRead {
 /// What a [`Destination`] hands back: the bytes it wrote plus the write facts it
 /// owns. `atomicity` / `strategy` are reported by the destination itself
 /// (ADR-0021) rather than hard-coded by the orchestrator, so a future
-/// destination reports its own without an orchestrator branch.
+/// destination reports its own without an orchestrator branch. `bytes_written`
+/// is `None` when the destination has no honest byte count to report: a
+/// database table, unlike a file directory, has no measurable on-disk extent of
+/// its own (ADR-0030).
 pub(crate) struct DestinationWrite {
-    pub(crate) bytes_written: u64,
+    pub(crate) bytes_written: Option<u64>,
     pub(crate) atomicity: &'static str,
     pub(crate) strategy: &'static str,
 }
@@ -107,15 +113,28 @@ pub(crate) fn source_connector(
 }
 
 /// Resolves a destination definition to its connector. Pure: validates the
-/// connector name only, doing no I/O, so an unsupported connector fails before
-/// any destination write (ADR-0019).
+/// connector name plus the addressing the connector needs — for `duckdb`, a
+/// present `dataset` naming the destination table (ADR-0030) — doing no I/O,
+/// so an unsupported or incomplete definition fails before any destination
+/// write (ADR-0019).
 pub(crate) fn destination_connector(
     definition: &DestinationDefinition,
+    dataset: Option<&str>,
 ) -> Result<Box<dyn Destination>, LoadFailure> {
     match definition.connector.as_str() {
         "parquet" => Ok(Box::new(ParquetDestination {
             path: definition.path.clone(),
         })),
+        "duckdb" => {
+            let dataset = dataset.ok_or_else(|| LoadFailure {
+                code: "missing_dataset",
+                message: "load definition dataset is required for a duckdb destination".to_string(),
+            })?;
+            Ok(Box::new(DuckDbDestination {
+                path: definition.path.clone(),
+                dataset: dataset.to_string(),
+            }))
+        }
         other => Err(LoadFailure {
             code: "unsupported_destination_connector",
             message: format!("unsupported destination connector: {other}"),
@@ -276,9 +295,89 @@ impl ParquetDestination {
             ),
         })?;
         Ok(DestinationWrite {
-            bytes_written,
+            bytes_written: Some(bytes_written),
             atomicity: "best_effort",
             strategy: "staging_then_replace",
+        })
+    }
+}
+
+/// Writes an Arrow batch into a table of a local DuckDB database file named by
+/// the destination path, with the table named by the load definition's
+/// `dataset`. Full refresh replaces the table in one
+/// `CREATE OR REPLACE TABLE "<dataset>" AS SELECT * FROM arrow(?, ?)` statement
+/// against the registered Arrow table function, so Arrow-to-DuckDB type mapping
+/// is delegated to DuckDB and the single statement auto-commits as an Atomic
+/// Commit: the new table becomes visible completely or the old table is left
+/// untouched (ADR-0030).
+struct DuckDbDestination {
+    path: PathBuf,
+    dataset: String,
+}
+
+impl Destination for DuckDbDestination {
+    fn write(&self, batch: &RecordBatch, mode: LoadMode) -> Result<DestinationWrite, LoadFailure> {
+        match mode {
+            LoadMode::FullRefresh => self.write_full_refresh(batch),
+        }
+    }
+}
+
+impl DuckDbDestination {
+    fn write_full_refresh(&self, batch: &RecordBatch) -> Result<DestinationWrite, LoadFailure> {
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent).map_err(|error| LoadFailure {
+            code: "destination_write_failed",
+            message: format!(
+                "failed to prepare destination parent {}: {error}",
+                parent.display()
+            ),
+        })?;
+
+        let connection = Connection::open(&self.path).map_err(|error| LoadFailure {
+            code: "destination_write_failed",
+            message: format!(
+                "failed to open DuckDB database {}: {error}",
+                self.path.display()
+            ),
+        })?;
+        connection
+            .register_table_function::<ArrowVTab>("arrow")
+            .map_err(|error| LoadFailure {
+                code: "destination_write_failed",
+                message: format!("failed to register the DuckDB Arrow table function: {error}"),
+            })?;
+
+        // The one statement auto-commits, so the replace needs no explicit
+        // BEGIN / COMMIT until a multi-statement load mode does (ADR-0030). The
+        // table identifier is always double-quote-escaped (`"` doubled) rather
+        // than restricted to a character allowlist.
+        let statement = format!(
+            "CREATE OR REPLACE TABLE \"{}\" AS SELECT * FROM arrow(?, ?)",
+            self.dataset.replace('"', "\"\"")
+        );
+        connection
+            .execute(&statement, arrow_recordbatch_to_query_params(batch.clone()))
+            .map_err(|error| LoadFailure {
+                code: "destination_write_failed",
+                message: format!(
+                    "failed to replace DuckDB table {} in {}: {error}",
+                    self.dataset,
+                    self.path.display()
+                ),
+            })?;
+        connection.close().map_err(|(_, error)| LoadFailure {
+            code: "destination_write_failed",
+            message: format!(
+                "failed to close DuckDB database {}: {error}",
+                self.path.display()
+            ),
+        })?;
+
+        Ok(DestinationWrite {
+            bytes_written: None,
+            atomicity: "atomic",
+            strategy: "transactional_replace",
         })
     }
 }
@@ -502,13 +601,32 @@ mod tests {
 
     #[test]
     fn destination_connector_accepts_parquet_and_rejects_unknown() {
-        assert!(destination_connector(&destination_definition("parquet", "out")).is_ok());
+        assert!(destination_connector(&destination_definition("parquet", "out"), None).is_ok());
 
-        let error = destination_connector(&destination_definition("duckdb", "out"))
+        let error = destination_connector(&destination_definition("bigquery", "out"), None)
             .err()
             .expect("unknown destination connector rejected");
         assert_eq!(error.code, "unsupported_destination_connector");
-        assert_eq!(error.message, "unsupported destination connector: duckdb");
+        assert_eq!(error.message, "unsupported destination connector: bigquery");
+    }
+
+    #[test]
+    fn destination_connector_requires_a_dataset_for_duckdb() {
+        assert!(destination_connector(
+            &destination_definition("duckdb", "customers.duckdb"),
+            Some("customers")
+        )
+        .is_ok());
+
+        let error =
+            destination_connector(&destination_definition("duckdb", "customers.duckdb"), None)
+                .err()
+                .expect("duckdb destination without a dataset rejected");
+        assert_eq!(error.code, "missing_dataset");
+        assert_eq!(
+            error.message,
+            "load definition dataset is required for a duckdb destination"
+        );
     }
 
     #[test]
@@ -614,7 +732,12 @@ mod tests {
             .write(&batch, LoadMode::FullRefresh)
             .expect("write parquet");
 
-        assert!(written.bytes_written > 0);
+        assert!(
+            written
+                .bytes_written
+                .expect("parquet measures written bytes")
+                > 0
+        );
         assert_eq!(written.atomicity, "best_effort");
         assert_eq!(written.strategy, "staging_then_replace");
 
@@ -622,6 +745,72 @@ mod tests {
         assert_eq!(read_back.num_rows(), 2);
         assert_eq!(ints(&read_back, 0).value(0), 1);
         assert_eq!(strings(&read_back, 1).value(1), "Grace");
+    }
+
+    #[test]
+    fn duckdb_destination_writes_a_readable_table_and_reports_write_facts() {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.csv");
+        fs::write(&source_path, "id,name\n1,Ada\n2,Grace\n").expect("write csv");
+        let batch = LocalFileSource {
+            path: source_path,
+            format: Some("csv".to_string()),
+        }
+        .read()
+        .expect("read csv")
+        .batch;
+
+        // The database file sits under a not-yet-existing parent to pin that
+        // the destination prepares the parent directory like Parquet does.
+        let database_path = work.path().join("warehouse").join("customers.duckdb");
+        let destination = DuckDbDestination {
+            path: database_path.clone(),
+            dataset: "customers".to_string(),
+        };
+        let written = destination
+            .write(&batch, LoadMode::FullRefresh)
+            .expect("write duckdb");
+
+        assert_eq!(written.bytes_written, None);
+        assert_eq!(written.atomicity, "atomic");
+        assert_eq!(written.strategy, "transactional_replace");
+
+        let read_back = read_single_duckdb_batch(&database_path, "customers");
+        assert_eq!(read_back.num_rows(), 2);
+        assert_eq!(ints(&read_back, 0).value(0), 1);
+        assert_eq!(strings(&read_back, 1).value(1), "Grace");
+    }
+
+    #[test]
+    fn duckdb_destination_full_refresh_replaces_the_existing_table() {
+        let work = TempDir::new().expect("tempdir");
+        let database_path = work.path().join("customers.duckdb");
+        let destination = DuckDbDestination {
+            path: database_path.clone(),
+            dataset: "customers".to_string(),
+        };
+
+        let first_path = work.path().join("first.csv");
+        fs::write(&first_path, "id,name\n1,Ada\n2,Grace\n").expect("write first csv");
+        let second_path = work.path().join("second.csv");
+        fs::write(&second_path, "id,name\n3,Katherine\n").expect("write second csv");
+        for source_path in [first_path, second_path] {
+            let batch = LocalFileSource {
+                path: source_path,
+                format: Some("csv".to_string()),
+            }
+            .read()
+            .expect("read csv")
+            .batch;
+            destination
+                .write(&batch, LoadMode::FullRefresh)
+                .expect("write duckdb");
+        }
+
+        let read_back = read_single_duckdb_batch(&database_path, "customers");
+        assert_eq!(read_back.num_rows(), 1);
+        assert_eq!(ints(&read_back, 0).value(0), 3);
+        assert_eq!(strings(&read_back, 1).value(0), "Katherine");
     }
 
     // ---- Test helpers ----
@@ -639,6 +828,19 @@ mod tests {
             connector: connector.to_string(),
             path: PathBuf::from(path),
         }
+    }
+
+    fn read_single_duckdb_batch(database_path: &Path, dataset: &str) -> RecordBatch {
+        let connection = duckdb::Connection::open(database_path).expect("open duckdb database");
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM \"{dataset}\" ORDER BY 1"))
+            .expect("prepare duckdb read-back");
+        let batches = statement
+            .query_arrow([])
+            .expect("query duckdb table")
+            .collect::<Vec<_>>();
+        assert_eq!(batches.len(), 1, "one duckdb batch expected");
+        batches.into_iter().next().expect("one duckdb batch")
     }
 
     fn read_single_parquet_batch(destination_path: &Path) -> RecordBatch {

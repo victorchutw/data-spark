@@ -43,6 +43,7 @@ struct LoadReport {
     artifact_dir: String,
     source_summary: Value,
     destination_summary: Value,
+    dataset: Option<String>,
     load_mode: String,
     schema_decision: Value,
     row_counts: RowCounts,
@@ -69,6 +70,7 @@ impl LoadReport {
             artifact_dir,
             source_summary: details.source_summary,
             destination_summary: details.destination_summary,
+            dataset: details.dataset,
             load_mode: details.load_mode,
             schema_decision: details.schema_decision,
             row_counts: details.row_counts,
@@ -96,6 +98,7 @@ impl LoadReport {
             artifact_dir,
             source_summary: failure.source_summary,
             destination_summary: failure.destination_summary,
+            dataset: failure.dataset,
             load_mode: failure.load_mode,
             schema_decision: json!({ "mode": "not_evaluated" }),
             row_counts: RowCounts {
@@ -178,6 +181,7 @@ struct DestinationDefinition {
 struct ExecutionDetails {
     source_summary: Value,
     destination_summary: Value,
+    dataset: Option<String>,
     load_mode: String,
     schema_decision: Value,
     row_counts: RowCounts,
@@ -187,10 +191,11 @@ struct ExecutionDetails {
 }
 
 /// A failure joined with the load definition context (source, destination,
-/// load mode) that a load report echoes back.
+/// dataset, load mode) that a load report echoes back.
 struct ReportableFailure {
     source_summary: Value,
     destination_summary: Value,
+    dataset: Option<String>,
     load_mode: String,
     code: &'static str,
     message: String,
@@ -198,12 +203,13 @@ struct ReportableFailure {
 
 impl ReportableFailure {
     /// For failures raised before the load definition is parsed (read / YAML),
-    /// when no definition context exists yet: empty summaries and the default
-    /// load mode.
+    /// when no definition context exists yet: empty summaries, no dataset, and
+    /// the default load mode.
     fn without_context(code: &'static str, message: String) -> Self {
         ReportableFailure {
             source_summary: json!({}),
             destination_summary: json!({}),
+            dataset: None,
             load_mode: "full_refresh".to_string(),
             code,
             message,
@@ -295,6 +301,7 @@ fn execute_load_definition(definition_path: &Path) -> Result<ExecutionDetails, R
         .as_ref()
         .map(to_json)
         .unwrap_or_else(|| json!({}));
+    let dataset = definition.dataset.clone();
     let load_mode = definition
         .load_mode
         .clone()
@@ -306,6 +313,7 @@ fn execute_load_definition(definition_path: &Path) -> Result<ExecutionDetails, R
             return Err(ReportableFailure {
                 source_summary,
                 destination_summary,
+                dataset,
                 load_mode,
                 code: "unsupported_load_definition_version",
                 message: format!("unsupported load definition version: {version}"),
@@ -315,6 +323,7 @@ fn execute_load_definition(definition_path: &Path) -> Result<ExecutionDetails, R
             return Err(ReportableFailure {
                 source_summary,
                 destination_summary,
+                dataset,
                 load_mode,
                 code: "missing_load_definition_version",
                 message: "load definition version is required".to_string(),
@@ -325,6 +334,7 @@ fn execute_load_definition(definition_path: &Path) -> Result<ExecutionDetails, R
     execute_supported_load(&definition).map_err(|failure| ReportableFailure {
         source_summary,
         destination_summary,
+        dataset,
         load_mode,
         code: failure.code,
         message: failure.message,
@@ -353,7 +363,7 @@ fn execute_supported_load(definition: &LoadDefinition) -> Result<ExecutionDetail
     // destination-connector check for a doubly-invalid definition.
     let mode = LoadMode::parse(&load_mode)?;
     let source_port = source_connector(source)?;
-    let destination_port = destination_connector(destination)?;
+    let destination_port = destination_connector(destination, definition.dataset.as_deref())?;
 
     let SourceRead {
         batch,
@@ -370,6 +380,7 @@ fn execute_supported_load(definition: &LoadDefinition) -> Result<ExecutionDetail
     Ok(ExecutionDetails {
         source_summary: to_json(source),
         destination_summary: to_json(destination),
+        dataset: definition.dataset.clone(),
         load_mode,
         schema_decision,
         row_counts: RowCounts {
@@ -379,7 +390,7 @@ fn execute_supported_load(definition: &LoadDefinition) -> Result<ExecutionDetail
         },
         byte_counts: ByteCounts {
             source: Some(source_bytes),
-            destination: Some(bytes_written),
+            destination: bytes_written,
         },
         destination_write: json!({
             "atomicity": atomicity,
@@ -455,6 +466,7 @@ mod tests {
         let details = ExecutionDetails {
             source_summary: json!({ "connector": "local_file" }),
             destination_summary: json!({ "connector": "parquet" }),
+            dataset: Some("customers".to_string()),
             load_mode: "full_refresh".to_string(),
             schema_decision: json!({ "mode": "inferred" }),
             row_counts: RowCounts {
@@ -488,6 +500,7 @@ mod tests {
             report.destination_summary,
             json!({ "connector": "parquet" })
         );
+        assert_eq!(report.dataset, Some("customers".to_string()));
         assert_eq!(report.load_mode, "full_refresh");
         assert_eq!(report.schema_decision, json!({ "mode": "inferred" }));
         assert_eq!(report.row_counts.source, 2);
@@ -516,6 +529,7 @@ mod tests {
         let failure = ReportableFailure {
             source_summary: json!({ "connector": "local_file" }),
             destination_summary: json!({ "connector": "parquet" }),
+            dataset: Some("customers".to_string()),
             load_mode: "full_refresh".to_string(),
             code: "missing_source",
             message: "load definition source is required".to_string(),
@@ -536,6 +550,7 @@ mod tests {
             report.destination_summary,
             json!({ "connector": "parquet" })
         );
+        assert_eq!(report.dataset, Some("customers".to_string()));
         assert_eq!(report.load_mode, "full_refresh");
         assert_eq!(report.schema_decision, json!({ "mode": "not_evaluated" }));
         assert_eq!(report.row_counts.source, 0);
@@ -572,6 +587,7 @@ mod tests {
 
         assert_eq!(failure.source_summary, json!({}));
         assert_eq!(failure.destination_summary, json!({}));
+        assert_eq!(failure.dataset, None);
         assert_eq!(failure.load_mode, "full_refresh");
         assert_eq!(failure.code, "load_definition_read_failed");
         assert_eq!(
