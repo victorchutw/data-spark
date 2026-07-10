@@ -13,6 +13,7 @@ mod schema;
 use connector::{destination_connector, source_connector, DestinationWrite, LoadMode, SourceRead};
 
 const LOAD_REPORT_VERSION: u8 = 1;
+const LOAD_REPORT_FILENAME: &str = "load-report.json";
 const SUPPORTED_LOAD_DEFINITION_VERSION: u64 = 1;
 
 #[derive(Parser)]
@@ -54,14 +55,84 @@ struct LoadReport {
     error_summary: Option<ErrorSummary>,
 }
 
-#[derive(Clone, Serialize)]
+impl LoadReport {
+    /// Assemble the report for a load whose execution succeeded.
+    fn from_success(
+        load_id: String,
+        artifact_dir: String,
+        timings: Timings,
+        details: ExecutionDetails,
+    ) -> Self {
+        LoadReport {
+            report_version: LOAD_REPORT_VERSION,
+            load_id,
+            artifact_dir,
+            source_summary: details.source_summary,
+            destination_summary: details.destination_summary,
+            load_mode: details.load_mode,
+            schema_decision: details.schema_decision,
+            row_counts: details.row_counts,
+            byte_counts: details.byte_counts,
+            destination_write: details.destination_write,
+            execution: details.execution,
+            timings,
+            exit_status: "succeeded",
+            process_exit_code: 0,
+            error_summary: None,
+        }
+    }
+
+    /// Assemble the report for a load that failed: the definition context is
+    /// echoed back and every execution field takes its not-run posture.
+    fn from_failure(
+        load_id: String,
+        artifact_dir: String,
+        timings: Timings,
+        failure: ReportableFailure,
+    ) -> Self {
+        LoadReport {
+            report_version: LOAD_REPORT_VERSION,
+            load_id,
+            artifact_dir,
+            source_summary: failure.source_summary,
+            destination_summary: failure.destination_summary,
+            load_mode: failure.load_mode,
+            schema_decision: json!({ "mode": "not_evaluated" }),
+            row_counts: RowCounts {
+                source: 0,
+                written: 0,
+                rejected: 0,
+            },
+            byte_counts: ByteCounts {
+                source: None,
+                destination: None,
+            },
+            destination_write: json!({
+                "atomicity": "not_applicable"
+            }),
+            execution: json!({
+                "record_format": "not_started",
+                "batch_count": 0
+            }),
+            timings,
+            exit_status: "failed",
+            process_exit_code: 1,
+            error_summary: Some(ErrorSummary {
+                code: failure.code,
+                message: failure.message,
+            }),
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct RowCounts {
     source: u64,
     written: u64,
     rejected: u64,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 struct ByteCounts {
     source: Option<u64>,
     destination: Option<u64>,
@@ -74,23 +145,10 @@ struct Timings {
     duration_ms: u128,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Serialize)]
 struct ErrorSummary {
     code: &'static str,
     message: String,
-}
-
-struct LoadOutcome {
-    load_id: String,
-    artifact_dir: PathBuf,
-    report_path: PathBuf,
-    source_summary: Value,
-    destination_summary: Value,
-    load_mode: String,
-    row_counts: RowCounts,
-    exit_status: &'static str,
-    process_exit_code: u8,
-    error_summary: Option<ErrorSummary>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -115,6 +173,8 @@ struct DestinationDefinition {
     path: PathBuf,
 }
 
+/// The execution facts of a load that succeeded. Failures travel as
+/// [`ReportableFailure`] instead.
 struct ExecutionDetails {
     source_summary: Value,
     destination_summary: Value,
@@ -124,7 +184,31 @@ struct ExecutionDetails {
     byte_counts: ByteCounts,
     destination_write: Value,
     execution: Value,
-    error_summary: Option<ErrorSummary>,
+}
+
+/// A failure joined with the load definition context (source, destination,
+/// load mode) that a load report echoes back.
+struct ReportableFailure {
+    source_summary: Value,
+    destination_summary: Value,
+    load_mode: String,
+    code: &'static str,
+    message: String,
+}
+
+impl ReportableFailure {
+    /// For failures raised before the load definition is parsed (read / YAML),
+    /// when no definition context exists yet: empty summaries and the default
+    /// load mode.
+    fn without_context(code: &'static str, message: String) -> Self {
+        ReportableFailure {
+            source_summary: json!({}),
+            destination_summary: json!({}),
+            load_mode: "full_refresh".to_string(),
+            code,
+            message,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -137,9 +221,9 @@ pub fn run() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Command::Load(args) => match run_load(args) {
-            Ok(outcome) => {
-                print_summary(&outcome);
-                ExitCode::from(outcome.process_exit_code)
+            Ok(report) => {
+                print_summary(&report);
+                ExitCode::from(report.process_exit_code)
             }
             Err(error) => {
                 eprintln!("data-spark: {error}");
@@ -149,7 +233,7 @@ pub fn run() -> ExitCode {
     }
 }
 
-fn run_load(args: LoadArgs) -> Result<LoadOutcome, Box<dyn std::error::Error>> {
+fn run_load(args: LoadArgs) -> Result<LoadReport, Box<dyn std::error::Error>> {
     let started_unix_ms = unix_ms();
     let load_id = Uuid::new_v4().to_string();
     let artifact_root = args
@@ -158,13 +242,7 @@ fn run_load(args: LoadArgs) -> Result<LoadOutcome, Box<dyn std::error::Error>> {
     let artifact_dir = artifact_root.join(&load_id);
     fs::create_dir_all(&artifact_dir)?;
 
-    let details = execute_load_definition(&args.definition);
-
-    let (exit_status, process_exit_code) = if details.error_summary.is_some() {
-        ("failed", 1)
-    } else {
-        ("succeeded", 0)
-    };
+    let execution = execute_load_definition(&args.definition);
 
     let finished_unix_ms = unix_ms();
     let timings = Timings {
@@ -172,67 +250,40 @@ fn run_load(args: LoadArgs) -> Result<LoadOutcome, Box<dyn std::error::Error>> {
         finished_unix_ms,
         duration_ms: finished_unix_ms.saturating_sub(started_unix_ms),
     };
-    let report = LoadReport {
-        report_version: LOAD_REPORT_VERSION,
-        load_id: load_id.clone(),
-        artifact_dir: path_string(&artifact_dir),
-        source_summary: details.source_summary.clone(),
-        destination_summary: details.destination_summary.clone(),
-        load_mode: details.load_mode.clone(),
-        schema_decision: details.schema_decision.clone(),
-        row_counts: details.row_counts.clone(),
-        byte_counts: details.byte_counts.clone(),
-        destination_write: details.destination_write.clone(),
-        execution: details.execution.clone(),
-        timings,
-        exit_status,
-        process_exit_code,
-        error_summary: details.error_summary.clone(),
+    let report = match execution {
+        Ok(details) => {
+            LoadReport::from_success(load_id, path_string(&artifact_dir), timings, details)
+        }
+        Err(failure) => {
+            LoadReport::from_failure(load_id, path_string(&artifact_dir), timings, failure)
+        }
     };
 
-    let report_path = artifact_dir.join("load-report.json");
-    fs::write(&report_path, serde_json::to_vec_pretty(&report)?)?;
+    fs::write(
+        artifact_dir.join(LOAD_REPORT_FILENAME),
+        serde_json::to_vec_pretty(&report)?,
+    )?;
 
-    Ok(LoadOutcome {
-        load_id,
-        artifact_dir,
-        report_path,
-        source_summary: report.source_summary,
-        destination_summary: report.destination_summary,
-        load_mode: report.load_mode,
-        row_counts: report.row_counts,
-        exit_status,
-        process_exit_code,
-        error_summary: report.error_summary,
-    })
+    Ok(report)
 }
 
-fn execute_load_definition(definition_path: &Path) -> ExecutionDetails {
-    let definition_text = match fs::read_to_string(definition_path) {
-        Ok(definition_text) => definition_text,
-        Err(error) => {
-            return failed_details(
-                json!({}),
-                json!({}),
-                "full_refresh".to_string(),
-                "load_definition_read_failed",
-                format!("failed to read load definition: {error}"),
-            )
-        }
-    };
+// Called once per load, so the size of the Err variant (which carries the
+// definition context the report echoes back) is irrelevant.
+#[allow(clippy::result_large_err)]
+fn execute_load_definition(definition_path: &Path) -> Result<ExecutionDetails, ReportableFailure> {
+    let definition_text = fs::read_to_string(definition_path).map_err(|error| {
+        ReportableFailure::without_context(
+            "load_definition_read_failed",
+            format!("failed to read load definition: {error}"),
+        )
+    })?;
 
-    let definition = match serde_yaml::from_str::<LoadDefinition>(&definition_text) {
-        Ok(definition) => definition,
-        Err(error) => {
-            return failed_details(
-                json!({}),
-                json!({}),
-                "full_refresh".to_string(),
-                "invalid_load_definition_yaml",
-                format!("failed to parse load definition: {error}"),
-            )
-        }
-    };
+    let definition = serde_yaml::from_str::<LoadDefinition>(&definition_text).map_err(|error| {
+        ReportableFailure::without_context(
+            "invalid_load_definition_yaml",
+            format!("failed to parse load definition: {error}"),
+        )
+    })?;
 
     let source_summary = definition
         .source
@@ -252,35 +303,32 @@ fn execute_load_definition(definition_path: &Path) -> ExecutionDetails {
     match definition.version {
         Some(SUPPORTED_LOAD_DEFINITION_VERSION) => {}
         Some(version) => {
-            return failed_details(
+            return Err(ReportableFailure {
                 source_summary,
                 destination_summary,
                 load_mode,
-                "unsupported_load_definition_version",
-                format!("unsupported load definition version: {version}"),
-            )
+                code: "unsupported_load_definition_version",
+                message: format!("unsupported load definition version: {version}"),
+            })
         }
         None => {
-            return failed_details(
+            return Err(ReportableFailure {
                 source_summary,
                 destination_summary,
                 load_mode,
-                "missing_load_definition_version",
-                "load definition version is required".to_string(),
-            )
+                code: "missing_load_definition_version",
+                message: "load definition version is required".to_string(),
+            })
         }
     }
 
-    match execute_supported_load(&definition) {
-        Ok(details) => details,
-        Err(failure) => failed_details(
-            source_summary,
-            destination_summary,
-            load_mode,
-            failure.code,
-            failure.message,
-        ),
-    }
+    execute_supported_load(&definition).map_err(|failure| ReportableFailure {
+        source_summary,
+        destination_summary,
+        load_mode,
+        code: failure.code,
+        message: failure.message,
+    })
 }
 
 fn execute_supported_load(definition: &LoadDefinition) -> Result<ExecutionDetails, LoadFailure> {
@@ -341,40 +389,7 @@ fn execute_supported_load(definition: &LoadDefinition) -> Result<ExecutionDetail
             "record_format": "arrow_record_batch",
             "batch_count": 1
         }),
-        error_summary: None,
     })
-}
-
-fn failed_details(
-    source_summary: Value,
-    destination_summary: Value,
-    load_mode: String,
-    code: &'static str,
-    message: String,
-) -> ExecutionDetails {
-    ExecutionDetails {
-        source_summary,
-        destination_summary,
-        load_mode,
-        schema_decision: json!({ "mode": "not_evaluated" }),
-        row_counts: RowCounts {
-            source: 0,
-            written: 0,
-            rejected: 0,
-        },
-        byte_counts: ByteCounts {
-            source: None,
-            destination: None,
-        },
-        destination_write: json!({
-            "atomicity": "not_applicable"
-        }),
-        execution: json!({
-            "record_format": "not_started",
-            "batch_count": 0
-        }),
-        error_summary: Some(ErrorSummary { code, message }),
-    }
 }
 
 fn to_json<T: Serialize>(value: &T) -> Value {
@@ -388,20 +403,18 @@ fn unix_ms() -> u128 {
         .as_millis()
 }
 
-fn print_summary(outcome: &LoadOutcome) {
-    println!("Data Spark load {}", outcome.load_id);
-    println!("Status: {}", outcome.exit_status);
-    println!("Load mode: {}", outcome.load_mode);
-    println!("Source: {}", summary_text(&outcome.source_summary));
-    println!(
-        "Destination: {}",
-        summary_text(&outcome.destination_summary)
-    );
-    println!("Records read: {}", outcome.row_counts.source);
-    println!("Records written: {}", outcome.row_counts.written);
-    println!("Artifact directory: {}", path_string(&outcome.artifact_dir));
-    println!("Load report: {}", path_string(&outcome.report_path));
-    if let Some(error) = &outcome.error_summary {
+fn print_summary(report: &LoadReport) {
+    let report_path = Path::new(&report.artifact_dir).join(LOAD_REPORT_FILENAME);
+    println!("Data Spark load {}", report.load_id);
+    println!("Status: {}", report.exit_status);
+    println!("Load mode: {}", report.load_mode);
+    println!("Source: {}", summary_text(&report.source_summary));
+    println!("Destination: {}", summary_text(&report.destination_summary));
+    println!("Records read: {}", report.row_counts.source);
+    println!("Records written: {}", report.row_counts.written);
+    println!("Artifact directory: {}", report.artifact_dir);
+    println!("Load report: {}", path_string(&report_path));
+    if let Some(error) = &report.error_summary {
         println!("Error: {}", error.message);
     }
 }
@@ -423,4 +436,147 @@ fn summary_text(summary: &Value) -> String {
 
 fn path_string(path: &Path) -> String {
     path.display().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn timings() -> Timings {
+        Timings {
+            started_unix_ms: 100,
+            finished_unix_ms: 250,
+            duration_ms: 150,
+        }
+    }
+
+    #[test]
+    fn from_success_reports_the_success_posture_around_the_execution_facts() {
+        let details = ExecutionDetails {
+            source_summary: json!({ "connector": "local_file" }),
+            destination_summary: json!({ "connector": "parquet" }),
+            load_mode: "full_refresh".to_string(),
+            schema_decision: json!({ "mode": "inferred" }),
+            row_counts: RowCounts {
+                source: 2,
+                written: 2,
+                rejected: 0,
+            },
+            byte_counts: ByteCounts {
+                source: Some(64),
+                destination: Some(128),
+            },
+            destination_write: json!({
+                "atomicity": "best_effort",
+                "strategy": "replace_directory"
+            }),
+            execution: json!({ "record_format": "arrow_record_batch", "batch_count": 1 }),
+        };
+
+        let report = LoadReport::from_success(
+            "load-under-test".to_string(),
+            "artifacts/load-under-test".to_string(),
+            timings(),
+            details,
+        );
+
+        assert_eq!(report.report_version, LOAD_REPORT_VERSION);
+        assert_eq!(report.load_id, "load-under-test");
+        assert_eq!(report.artifact_dir, "artifacts/load-under-test");
+        assert_eq!(report.source_summary, json!({ "connector": "local_file" }));
+        assert_eq!(
+            report.destination_summary,
+            json!({ "connector": "parquet" })
+        );
+        assert_eq!(report.load_mode, "full_refresh");
+        assert_eq!(report.schema_decision, json!({ "mode": "inferred" }));
+        assert_eq!(report.row_counts.source, 2);
+        assert_eq!(report.row_counts.written, 2);
+        assert_eq!(report.row_counts.rejected, 0);
+        assert_eq!(report.byte_counts.source, Some(64));
+        assert_eq!(report.byte_counts.destination, Some(128));
+        assert_eq!(
+            report.destination_write,
+            json!({ "atomicity": "best_effort", "strategy": "replace_directory" })
+        );
+        assert_eq!(
+            report.execution,
+            json!({ "record_format": "arrow_record_batch", "batch_count": 1 })
+        );
+        assert_eq!(report.timings.started_unix_ms, 100);
+        assert_eq!(report.timings.finished_unix_ms, 250);
+        assert_eq!(report.timings.duration_ms, 150);
+        assert_eq!(report.exit_status, "succeeded");
+        assert_eq!(report.process_exit_code, 0);
+        assert!(report.error_summary.is_none());
+    }
+
+    #[test]
+    fn from_failure_reports_the_failure_posture_around_the_error() {
+        let failure = ReportableFailure {
+            source_summary: json!({ "connector": "local_file" }),
+            destination_summary: json!({ "connector": "parquet" }),
+            load_mode: "full_refresh".to_string(),
+            code: "missing_source",
+            message: "load definition source is required".to_string(),
+        };
+
+        let report = LoadReport::from_failure(
+            "load-under-test".to_string(),
+            "artifacts/load-under-test".to_string(),
+            timings(),
+            failure,
+        );
+
+        assert_eq!(report.report_version, LOAD_REPORT_VERSION);
+        assert_eq!(report.load_id, "load-under-test");
+        assert_eq!(report.artifact_dir, "artifacts/load-under-test");
+        assert_eq!(report.source_summary, json!({ "connector": "local_file" }));
+        assert_eq!(
+            report.destination_summary,
+            json!({ "connector": "parquet" })
+        );
+        assert_eq!(report.load_mode, "full_refresh");
+        assert_eq!(report.schema_decision, json!({ "mode": "not_evaluated" }));
+        assert_eq!(report.row_counts.source, 0);
+        assert_eq!(report.row_counts.written, 0);
+        assert_eq!(report.row_counts.rejected, 0);
+        assert_eq!(report.byte_counts.source, None);
+        assert_eq!(report.byte_counts.destination, None);
+        assert_eq!(
+            report.destination_write,
+            json!({ "atomicity": "not_applicable" })
+        );
+        assert_eq!(
+            report.execution,
+            json!({ "record_format": "not_started", "batch_count": 0 })
+        );
+        assert_eq!(report.timings.started_unix_ms, 100);
+        assert_eq!(report.timings.finished_unix_ms, 250);
+        assert_eq!(report.timings.duration_ms, 150);
+        assert_eq!(report.exit_status, "failed");
+        assert_eq!(report.process_exit_code, 1);
+        let error = report
+            .error_summary
+            .expect("failed load report carries an error summary");
+        assert_eq!(error.code, "missing_source");
+        assert_eq!(error.message, "load definition source is required");
+    }
+
+    #[test]
+    fn without_context_reports_empty_summaries_and_the_default_load_mode() {
+        let failure = ReportableFailure::without_context(
+            "load_definition_read_failed",
+            "failed to read load definition: file is gone".to_string(),
+        );
+
+        assert_eq!(failure.source_summary, json!({}));
+        assert_eq!(failure.destination_summary, json!({}));
+        assert_eq!(failure.load_mode, "full_refresh");
+        assert_eq!(failure.code, "load_definition_read_failed");
+        assert_eq!(
+            failure.message,
+            "failed to read load definition: file is gone"
+        );
+    }
 }
