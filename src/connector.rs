@@ -831,7 +831,7 @@ mod tests {
     }
 
     fn read_single_duckdb_batch(database_path: &Path, dataset: &str) -> RecordBatch {
-        let connection = duckdb::Connection::open(database_path).expect("open duckdb database");
+        let connection = Connection::open(database_path).expect("open duckdb database");
         let mut statement = connection
             .prepare(&format!("SELECT * FROM \"{dataset}\" ORDER BY 1"))
             .expect("prepare duckdb read-back");
