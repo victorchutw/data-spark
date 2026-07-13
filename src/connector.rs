@@ -13,6 +13,7 @@
 //! `parquet`, and `duckdb` are the first connectors; everything else here is
 //! private.
 
+use crate::rejection::{self, RejectedRecord};
 use crate::schema::{self, SchemaDirective};
 use crate::{DestinationDefinition, ExecutionFailure, LoadFailure, SourceDefinition};
 use arrow_array::RecordBatch;
@@ -26,27 +27,38 @@ use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-/// What a [`Source`] hands back: the materialized Arrow batch, the
-/// `schema_decision` shape the report echoes, the pinned schema file write the
-/// orchestrator performs when the load produces or extends a pin, and the
-/// source bytes the source measured. Recombines [`schema::Materialized`] with
-/// the byte count so `schema.rs` stays types-only.
+/// What a [`Source`] hands back: the materialized Arrow batch of the surviving
+/// records, the `schema_decision` shape the report echoes, the pinned schema
+/// file write the orchestrator performs when the load produces or extends a
+/// pin, the source bytes the source measured, and the rejected records — parse
+/// rejections from the reader merged with per-record validation rejections
+/// from materialization (ADR-0035). Recombines [`schema::Materialized`] with
+/// the source-owned facts so `schema.rs` stays types-only.
 pub(crate) struct SourceRead {
     pub(crate) batch: RecordBatch,
     pub(crate) schema_decision: Value,
     pub(crate) pinned_schema_write: Option<schema::PinnedSchemaWrite>,
     pub(crate) source_bytes: u64,
+    pub(crate) rejected: Vec<RejectedRecord>,
 }
 
 impl SourceRead {
     /// Recombines a materialized batch with the source bytes the source measured
-    /// into one read result, keeping `schema.rs` types-only.
-    fn from_materialized(materialized: schema::Materialized, source_bytes: u64) -> Self {
+    /// and the reader's parse rejections into one read result, keeping
+    /// `schema.rs` types-only.
+    fn from_materialized(
+        materialized: schema::Materialized,
+        source_bytes: u64,
+        parse_rejected: Vec<RejectedRecord>,
+    ) -> Self {
+        let mut rejected = parse_rejected;
+        rejected.extend(materialized.rejected);
         SourceRead {
             batch: materialized.batch,
             schema_decision: materialized.schema_decision,
             pinned_schema_write: materialized.pinned_schema_write,
             source_bytes,
+            rejected,
         }
     }
 }
@@ -173,19 +185,48 @@ impl Source for LocalFileSource {
                 let CsvRecords {
                     field_names,
                     records,
+                    rejected,
                     source_bytes,
                 } = read_local_csv(&self.path)?;
-                let materialized = schema::from_text_columns(directive, field_names, records)?;
-                Ok(SourceRead::from_materialized(materialized, source_bytes))
+                merge_read_result(
+                    schema::from_text_columns(directive, field_names, records),
+                    source_bytes,
+                    rejected,
+                )
             }
             "jsonl" => {
                 let JsonlRecords {
                     field_names,
-                    objects,
+                    records,
+                    rejected,
                     source_bytes,
                 } = read_local_jsonl(&self.path)?;
-                let materialized = schema::from_json_columns(directive, field_names, objects)?;
-                Ok(SourceRead::from_materialized(materialized, source_bytes))
+                // No record ever parsed with fields, so no schema can be
+                // inferred or validated: the load fails, with the parse
+                // rejections travelling on the failure so their artifact is
+                // still written. This is asymmetric with CSV on purpose — a
+                // CSV header declares the source's fields even when every
+                // record is rejected, while JSONL fields exist only in
+                // records.
+                if field_names.is_empty() {
+                    return Err(ExecutionFailure {
+                        failure: LoadFailure {
+                            code: "malformed_jsonl",
+                            message: format!(
+                                "JSONL source {} must include at least one record with fields",
+                                self.path.display()
+                            ),
+                        },
+                        schema_decision: None,
+                        source_rows: None,
+                        rejected,
+                    });
+                }
+                merge_read_result(
+                    schema::from_json_columns(directive, field_names, records),
+                    source_bytes,
+                    rejected,
+                )
             }
             _ => Err(LoadFailure {
                 code: "unsupported_source_format",
@@ -395,19 +436,50 @@ impl DuckDbDestination {
     }
 }
 
+/// Joins a materialization outcome with the source-owned facts: the byte
+/// count and the reader's parse rejections, which merge with the
+/// materialization's validation rejections on success and travel with the
+/// failure otherwise, so the rejected-records artifact is written either way.
+fn merge_read_result(
+    result: Result<schema::Materialized, ExecutionFailure>,
+    source_bytes: u64,
+    parse_rejected: Vec<RejectedRecord>,
+) -> Result<SourceRead, ExecutionFailure> {
+    match result {
+        Ok(materialized) => Ok(SourceRead::from_materialized(
+            materialized,
+            source_bytes,
+            parse_rejected,
+        )),
+        Err(failure) => {
+            let mut rejected = parse_rejected;
+            rejected.extend(failure.rejected);
+            Err(ExecutionFailure {
+                rejected,
+                ..failure
+            })
+        }
+    }
+}
+
 /// CSV cells arrive untyped as text; `schema::from_text_columns` infers their
-/// types. `source_bytes` is measured separately from the values.
+/// types. Records that fail to parse as a record of the header's fields are
+/// rejected, not the load. `source_bytes` is measured separately from the
+/// values.
 struct CsvRecords {
     field_names: Vec<String>,
-    records: Vec<Vec<Option<String>>>,
+    records: Vec<schema::TextRecord>,
+    rejected: Vec<RejectedRecord>,
     source_bytes: u64,
 }
 
 /// JSONL cells arrive as parsed [`Value`]s carrying their own type;
-/// `schema::from_json_columns` reads types from them directly.
+/// `schema::from_json_columns` reads types from them directly. Lines that are
+/// not a JSON object are rejected, not the load.
 struct JsonlRecords {
     field_names: Vec<String>,
-    objects: Vec<serde_json::Map<String, Value>>,
+    records: Vec<schema::JsonRecord>,
+    rejected: Vec<RejectedRecord>,
     source_bytes: u64,
 }
 
@@ -430,9 +502,12 @@ fn read_local_csv(source_path: &Path) -> Result<CsvRecords, LoadFailure> {
         })?
         .len();
 
+    // Flexible parsing so a record with the wrong field count arrives as a
+    // record and is rejected here with a clear message, instead of failing
+    // the whole read (ADR-0036).
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(true)
-        .flexible(false)
+        .flexible(true)
         .from_reader(file);
     let field_names = reader
         .headers()
@@ -452,25 +527,71 @@ fn read_local_csv(source_path: &Path) -> Result<CsvRecords, LoadFailure> {
     }
 
     let mut records = Vec::new();
+    let mut rejected = Vec::new();
     for record in reader.records() {
-        let record = record.map_err(|error| malformed_csv(source_path, error))?;
-        records.push(
-            record
-                .iter()
-                .map(|value| {
-                    if value.is_empty() {
-                        None
-                    } else {
-                        Some(value.to_string())
-                    }
-                })
-                .collect::<Vec<_>>(),
-        );
+        match record {
+            // The reader keeps yielding records after a per-record parse
+            // error, so one unreadable record rejects only itself.
+            Err(error) => {
+                let line = error
+                    .position()
+                    .map(|position| position.line())
+                    .unwrap_or(0);
+                rejected.push(RejectedRecord {
+                    line,
+                    code: rejection::MALFORMED_CSV_RECORD,
+                    field: None,
+                    message: error.to_string(),
+                    record: Value::Null,
+                });
+            }
+            Ok(record) => {
+                let line = record
+                    .position()
+                    .map(|position| position.line())
+                    .unwrap_or(0);
+                if record.len() != field_names.len() {
+                    // A wrong-length record cannot map onto the header, so
+                    // its cells are recovered as an array.
+                    rejected.push(RejectedRecord {
+                        line,
+                        code: rejection::MALFORMED_CSV_RECORD,
+                        field: None,
+                        message: format!(
+                            "expected {} fields, found {}",
+                            field_names.len(),
+                            record.len()
+                        ),
+                        record: Value::Array(
+                            record
+                                .iter()
+                                .map(|value| Value::String(value.to_string()))
+                                .collect(),
+                        ),
+                    });
+                    continue;
+                }
+                records.push(schema::TextRecord {
+                    line,
+                    cells: record
+                        .iter()
+                        .map(|value| {
+                            if value.is_empty() {
+                                None
+                            } else {
+                                Some(value.to_string())
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                });
+            }
+        }
     }
 
     Ok(CsvRecords {
         field_names,
         records,
+        rejected,
         source_bytes,
     })
 }
@@ -498,29 +619,43 @@ fn read_local_jsonl(source_path: &Path) -> Result<JsonlRecords, LoadFailure> {
     // than an extra whole-file string copy, matching the CSV reader.
     let mut field_names: Vec<String> = Vec::new();
     let mut seen_fields: HashSet<String> = HashSet::new();
-    let mut objects: Vec<serde_json::Map<String, Value>> = Vec::new();
+    let mut records: Vec<schema::JsonRecord> = Vec::new();
+    let mut rejected = Vec::new();
     for (line_index, line) in BufReader::new(file).lines().enumerate() {
+        let line_number = line_index as u64 + 1;
         let line = line.map_err(|error| LoadFailure {
             code: "source_read_failed",
             message: format!(
-                "failed to read JSONL source {} line {}: {error}",
+                "failed to read JSONL source {} line {line_number}: {error}",
                 source_path.display(),
-                line_index + 1
             ),
         })?;
         if line.trim().is_empty() {
             continue;
         }
-        let value = serde_json::from_str::<Value>(&line)
-            .map_err(|error| malformed_jsonl(source_path, line_index + 1, error.to_string()))?;
-        let object = match value {
-            Value::Object(object) => object,
-            _ => {
-                return Err(malformed_jsonl(
-                    source_path,
-                    line_index + 1,
-                    "each JSONL record must be a JSON object".to_string(),
-                ))
+        // A line that is not a JSON object rejects that record, not the load;
+        // the raw line is recovered for troubleshooting.
+        let object = match serde_json::from_str::<Value>(&line) {
+            Ok(Value::Object(object)) => object,
+            Ok(_) => {
+                rejected.push(RejectedRecord {
+                    line: line_number,
+                    code: rejection::MALFORMED_JSONL_RECORD,
+                    field: None,
+                    message: "each JSONL record must be a JSON object".to_string(),
+                    record: Value::String(line),
+                });
+                continue;
+            }
+            Err(error) => {
+                rejected.push(RejectedRecord {
+                    line: line_number,
+                    code: rejection::MALFORMED_JSONL_RECORD,
+                    field: None,
+                    message: error.to_string(),
+                    record: Value::String(line),
+                });
+                continue;
             }
         };
         for key in object.keys() {
@@ -528,22 +663,16 @@ fn read_local_jsonl(source_path: &Path) -> Result<JsonlRecords, LoadFailure> {
                 field_names.push(key.clone());
             }
         }
-        objects.push(object);
-    }
-
-    if field_names.is_empty() {
-        return Err(LoadFailure {
-            code: "malformed_jsonl",
-            message: format!(
-                "JSONL source {} must include at least one record with fields",
-                source_path.display()
-            ),
+        records.push(schema::JsonRecord {
+            line: line_number,
+            object,
         });
     }
 
     Ok(JsonlRecords {
         field_names,
-        objects,
+        records,
+        rejected,
         source_bytes,
     })
 }
@@ -552,16 +681,6 @@ fn malformed_csv(source_path: &Path, error: csv::Error) -> LoadFailure {
     LoadFailure {
         code: "malformed_csv",
         message: format!("malformed CSV syntax in {}: {error}", source_path.display()),
-    }
-}
-
-fn malformed_jsonl(source_path: &Path, line_number: usize, detail: String) -> LoadFailure {
-    LoadFailure {
-        code: "malformed_jsonl",
-        message: format!(
-            "malformed JSONL record in {} line {line_number}: {detail}",
-            source_path.display()
-        ),
     }
 }
 
@@ -733,6 +852,177 @@ mod tests {
         assert!(!bools(&read.batch, 2).value(1));
         assert!(read.source_bytes > 0);
         assert_eq!(read.schema_decision["mode"], "inferred");
+    }
+
+    #[test]
+    fn local_file_source_rejects_csv_records_with_the_wrong_field_count_and_reads_on() {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.csv");
+        fs::write(
+            &source_path,
+            "id,name\n1,Ada\n2,Grace,extra-field\n3,Cara\n",
+        )
+        .expect("write csv");
+
+        let source = LocalFileSource {
+            path: source_path,
+            format: Some("csv".to_string()),
+        };
+        let read = source
+            .read(&SchemaDirective::Inferred)
+            .expect("a bad record rejects the record, not the load");
+
+        assert_eq!(read.batch.num_rows(), 2);
+        assert_eq!(ints(&read.batch, 0).value(0), 1);
+        assert_eq!(ints(&read.batch, 0).value(1), 3);
+
+        assert_eq!(read.rejected.len(), 1);
+        let rejected = &read.rejected[0];
+        assert_eq!(rejected.line, 3);
+        assert_eq!(rejected.code, "malformed_csv_record");
+        assert_eq!(rejected.field, None);
+        assert_eq!(rejected.message, "expected 2 fields, found 3");
+        // A wrong-length record cannot map onto the header, so its cells are
+        // recovered as an array.
+        assert_eq!(
+            rejected.record,
+            serde_json::json!(["2", "Grace", "extra-field"])
+        );
+    }
+
+    #[test]
+    fn local_file_source_rejects_csv_records_that_fail_to_parse_and_reads_on() {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.csv");
+        // Record 2 carries invalid UTF-8: the reader rejects that record and
+        // keeps reading.
+        fs::write(&source_path, b"id,name\n1,Ada\n2,\xFF\n3,Cara\n").expect("write csv");
+
+        let source = LocalFileSource {
+            path: source_path,
+            format: Some("csv".to_string()),
+        };
+        let read = source
+            .read(&SchemaDirective::Inferred)
+            .expect("an unparseable record rejects the record, not the load");
+
+        assert_eq!(read.batch.num_rows(), 2);
+        assert_eq!(ints(&read.batch, 0).value(1), 3);
+        assert_eq!(read.rejected.len(), 1);
+        let rejected = &read.rejected[0];
+        assert_eq!(rejected.line, 3);
+        assert_eq!(rejected.code, "malformed_csv_record");
+        assert!(
+            rejected.message.to_lowercase().contains("utf-8"),
+            "message {:?} names the parse problem",
+            rejected.message
+        );
+        // Nothing could be recovered from the record.
+        assert_eq!(rejected.record, Value::Null);
+    }
+
+    #[test]
+    fn local_file_source_rejects_malformed_jsonl_lines_and_reads_on() {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.jsonl");
+        // Line 2 is truncated JSON, line 3 is valid JSON but not an object,
+        // line 4 is blank (skipped, not a record), line 5 is valid.
+        fs::write(
+            &source_path,
+            "{\"id\": 1}\n{\"id\": 2, \n[1, 2]\n\n{\"id\": 4}\n",
+        )
+        .expect("write jsonl");
+
+        let source = LocalFileSource {
+            path: source_path,
+            format: Some("jsonl".to_string()),
+        };
+        let read = source
+            .read(&SchemaDirective::Inferred)
+            .expect("bad lines reject their records, not the load");
+
+        assert_eq!(read.batch.num_rows(), 2);
+        assert_eq!(ints(&read.batch, 0).value(0), 1);
+        assert_eq!(ints(&read.batch, 0).value(1), 4);
+
+        assert_eq!(read.rejected.len(), 2);
+        assert_eq!(read.rejected[0].line, 2);
+        assert_eq!(read.rejected[0].code, "malformed_jsonl_record");
+        assert_eq!(read.rejected[0].field, None);
+        assert!(!read.rejected[0].message.is_empty());
+        // The raw line is recovered for troubleshooting.
+        assert_eq!(read.rejected[0].record, serde_json::json!("{\"id\": 2, "));
+        assert_eq!(read.rejected[1].line, 3);
+        assert_eq!(read.rejected[1].code, "malformed_jsonl_record");
+        assert_eq!(
+            read.rejected[1].message,
+            "each JSONL record must be a JSON object"
+        );
+        assert_eq!(read.rejected[1].record, serde_json::json!("[1, 2]"));
+    }
+
+    #[test]
+    fn local_file_source_merges_parse_and_validation_rejections() {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.csv");
+        // Line 3 has the wrong field count (parse rejection); line 4 misfits
+        // the pinned int64 (validation rejection); lines 2 survives.
+        fs::write(&source_path, "id\n1\n2,extra\nabc\n").expect("write csv");
+
+        let source = LocalFileSource {
+            path: source_path,
+            format: Some("csv".to_string()),
+        };
+        let directive = SchemaDirective::Pinned {
+            pinned_path: "customers.schema.yml".to_string(),
+            pin: schema::PinnedSchema::from_yaml(
+                "version: 1\nfields:\n- name: id\n  type: int64\n",
+            )
+            .expect("test pin parses"),
+            drift_policy: schema::DriftPolicy::Fail,
+        };
+        let read = source
+            .read(&directive)
+            .expect("rejections do not fail the read");
+
+        assert_eq!(read.batch.num_rows(), 1);
+        assert_eq!(ints(&read.batch, 0).value(0), 1);
+        assert_eq!(read.rejected.len(), 2);
+        let lines_and_codes = read
+            .rejected
+            .iter()
+            .map(|rejected| (rejected.line, rejected.code))
+            .collect::<Vec<_>>();
+        assert!(lines_and_codes.contains(&(3, "malformed_csv_record")));
+        assert!(lines_and_codes.contains(&(4, "type_coercion_failed")));
+    }
+
+    #[test]
+    fn local_file_source_fails_jsonl_with_no_parseable_records_but_reports_the_rejections() {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.jsonl");
+        fs::write(&source_path, "not json\n[1]\n").expect("write jsonl");
+
+        let source = LocalFileSource {
+            path: source_path,
+            format: Some("jsonl".to_string()),
+        };
+        let error = source
+            .read(&SchemaDirective::Inferred)
+            .err()
+            .expect("a source with no parseable records fails the load");
+
+        // No record ever parsed, so no schema can be inferred: the load fails,
+        // but the parse rejections still travel with the failure so the
+        // orchestrator can write their artifact.
+        assert_eq!(error.failure.code, "malformed_jsonl");
+        assert!(error
+            .failure
+            .message
+            .contains("must include at least one record with fields"));
+        assert_eq!(error.rejected.len(), 2);
+        assert_eq!(error.rejected[0].line, 1);
+        assert_eq!(error.rejected[1].line, 2);
     }
 
     #[test]

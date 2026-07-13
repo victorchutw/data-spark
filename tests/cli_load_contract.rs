@@ -631,7 +631,7 @@ load_mode: full_refresh
 }
 
 #[test]
-fn malformed_local_jsonl_fails_with_report_before_destination_writing() {
+fn malformed_local_jsonl_rejects_the_record_and_fails_the_default_threshold() {
     let work = TempDir::new().expect("tempdir");
     let source_path = work.path().join("customers.jsonl");
     fs::write(
@@ -676,7 +676,7 @@ load_mode: full_refresh
 
     assert!(
         !destination_path.exists(),
-        "malformed JSONL must fail before destination writing"
+        "a load failing its reject threshold must not touch the destination"
     );
 
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
@@ -685,25 +685,52 @@ load_mode: full_refresh
         "failed jsonl load writes one artifact directory",
     );
 
+    // The malformed line became a rejected record; the default reject
+    // threshold of 0 then failed the load (ADR-0020).
     assert_eq!(report["report_version"], 1);
     assert_eq!(report["exit_status"], "failed");
     assert_eq!(report["process_exit_code"], 1);
-    assert_eq!(report["row_counts"]["source"], 0);
+    assert_eq!(report["row_counts"]["source"], 2);
     assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 1);
+    assert_eq!(report["rejected_records"]["count"], 1);
     assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
-    assert_eq!(report["error_summary"]["code"], "malformed_jsonl");
-    assert!(report["error_summary"]["message"]
+    assert_eq!(report["error_summary"]["code"], "reject_threshold_exceeded");
+    assert_eq!(
+        report["error_summary"]["message"],
+        "rejected 1 of 2 records, exceeding the reject threshold of 0"
+    );
+
+    // The rejected-record artifact holds the source context a troubleshooter
+    // needs: the line, the parse problem, and the raw line text.
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let rejected_lines = read_rejected_records(&artifact_path);
+    assert_eq!(rejected_lines.len(), 1);
+    assert_eq!(rejected_lines[0]["line"], 2);
+    assert_eq!(rejected_lines[0]["code"], "malformed_jsonl_record");
+    assert_eq!(rejected_lines[0]["field"], Value::Null);
+    assert!(!rejected_lines[0]["message"]
         .as_str()
-        .expect("error message")
-        .contains("malformed JSONL"));
+        .expect("rejection message")
+        .is_empty());
+    assert_eq!(
+        rejected_lines[0]["record"],
+        "{\"customer_id\": 2, \"name\": "
+    );
 
     assert!(stdout.contains("Status: failed"));
-    assert!(stdout.contains("malformed JSONL"));
+    assert!(stdout.contains("Records rejected: 1"));
+    assert!(stdout.contains(artifact_path.to_str().expect("artifact path")));
+    assert!(stdout.contains("exceeding the reject threshold of 0"));
     assert!(stdout.contains(report_path.to_str().expect("report path")));
 }
 
 #[test]
-fn malformed_local_csv_fails_with_report_before_destination_writing() {
+fn malformed_local_csv_rejects_the_record_and_fails_the_default_threshold() {
     let work = TempDir::new().expect("tempdir");
     let source_path = work.path().join("customers.csv");
     fs::write(
@@ -748,7 +775,7 @@ load_mode: full_refresh
 
     assert!(
         !destination_path.exists(),
-        "malformed CSV must fail before destination writing"
+        "a load failing its reject threshold must not touch the destination"
     );
 
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
@@ -760,17 +787,37 @@ load_mode: full_refresh
     assert_eq!(report["report_version"], 1);
     assert_eq!(report["exit_status"], "failed");
     assert_eq!(report["process_exit_code"], 1);
-    assert_eq!(report["row_counts"]["source"], 0);
+    assert_eq!(report["row_counts"]["source"], 2);
     assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 1);
+    assert_eq!(report["rejected_records"]["count"], 1);
     assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
-    assert_eq!(report["error_summary"]["code"], "malformed_csv");
-    assert!(report["error_summary"]["message"]
-        .as_str()
-        .expect("error message")
-        .contains("malformed CSV syntax"));
+    assert_eq!(report["error_summary"]["code"], "reject_threshold_exceeded");
+    assert_eq!(
+        report["error_summary"]["message"],
+        "rejected 1 of 2 records, exceeding the reject threshold of 0"
+    );
+
+    // The wrong-length record is recovered as an array of its cells, with the
+    // line number and the field-count mismatch spelled out.
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let rejected_lines = read_rejected_records(&artifact_path);
+    assert_eq!(rejected_lines.len(), 1);
+    assert_eq!(rejected_lines[0]["line"], 3);
+    assert_eq!(rejected_lines[0]["code"], "malformed_csv_record");
+    assert_eq!(rejected_lines[0]["message"], "expected 2 fields, found 3");
+    assert_eq!(
+        rejected_lines[0]["record"],
+        serde_json::json!(["2", "Grace", "extra-field"])
+    );
 
     assert!(stdout.contains("Status: failed"));
-    assert!(stdout.contains("malformed CSV syntax"));
+    assert!(stdout.contains("Records rejected: 1"));
+    assert!(stdout.contains("exceeding the reject threshold of 0"));
     assert!(stdout.contains(report_path.to_str().expect("report path")));
 }
 
@@ -1727,7 +1774,7 @@ schema:
 }
 
 #[test]
-fn non_additive_drift_still_fails_under_the_additive_policy() {
+fn type_misfits_under_a_pin_reject_records_and_respect_the_write_boundary() {
     let work = TempDir::new().expect("tempdir");
     let source_path = work.path().join("customers.csv");
     fs::write(&source_path, "customer_id,total\n1,10.5\n").expect("write source csv");
@@ -1770,9 +1817,10 @@ schema:
         .assert()
         .success();
 
-    // `customer_id` now observes as text: a type change is not additive, so
-    // the additive policy still fails the load.
-    fs::write(&source_path, "customer_id,total\nabc,7\n").expect("write drifted source csv");
+    // `customer_id` value "abc" misfits the pinned int64: the record is
+    // rejected (ADR-0035) and the default reject threshold of 0 fails the
+    // load. The source shape still matches the pin, so this is not drift.
+    fs::write(&source_path, "customer_id,total\nabc,7\n").expect("write misfit source csv");
     let assert = Command::cargo_bin("data-spark")
         .expect("binary")
         .current_dir(work.path())
@@ -1786,17 +1834,40 @@ schema:
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
     let (_, report) = read_single_report(
         &work.path().join("artifacts-second"),
-        "type-change load writes one artifact directory",
+        "type-misfit load writes one artifact directory",
     );
-    assert_eq!(report["error_summary"]["code"], "schema_drift");
-    assert!(report["error_summary"]["message"]
-        .as_str()
-        .expect("error message")
-        .contains("type changes: customer_id (pinned int64, observed utf8)"));
-    assert_eq!(report["schema_decision"]["drift_status"], "failed_on_drift");
+    assert_eq!(report["error_summary"]["code"], "reject_threshold_exceeded");
+    assert_eq!(
+        report["error_summary"]["message"],
+        "rejected 1 of 1 records, exceeding the reject threshold of 0"
+    );
+    assert_eq!(report["schema_decision"]["mode"], "pinned");
+    assert_eq!(report["schema_decision"]["drift_status"], "none");
+    assert_eq!(report["row_counts"]["rejected"], 1);
     assert!(stdout.contains("Status: failed"));
 
-    // The destination still holds the first load's records.
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let rejected_lines = read_rejected_records(&artifact_path);
+    assert_eq!(rejected_lines.len(), 1);
+    assert_eq!(rejected_lines[0]["line"], 2);
+    assert_eq!(rejected_lines[0]["code"], "type_coercion_failed");
+    assert_eq!(rejected_lines[0]["field"], "customer_id");
+    assert_eq!(
+        rejected_lines[0]["message"],
+        "value \"abc\" does not fit pinned type int64 for field \"customer_id\""
+    );
+    assert_eq!(
+        rejected_lines[0]["record"],
+        serde_json::json!({"customer_id": "abc", "total": "7"})
+    );
+
+    // Write boundary (ADR-0019): the threshold failed the load before any
+    // destination write, so the destination still holds the first load's
+    // records.
     let batch = read_single_duckdb_batch(&database_path, "customers");
     assert_eq!(batch.num_rows(), 1);
     let customer_ids = batch
@@ -1805,6 +1876,297 @@ schema:
         .downcast_ref::<Int64Array>()
         .expect("customer_id is int64");
     assert_eq!(customer_ids.value(0), 1);
+}
+
+#[test]
+fn a_configured_reject_threshold_lets_a_load_complete_with_rejected_records() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    // Line 3 has the wrong field count; the two other records are loadable.
+    fs::write(
+        &source_path,
+        "customer_id,name\n1,Ada\n2,Grace,extra-field\n3,Cara\n",
+    )
+    .expect("write source csv");
+
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+reject_threshold: 1
+"#,
+            source_path.display(),
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    let assert = Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "within-threshold load writes one artifact directory",
+    );
+
+    // One rejection at a threshold of exactly 1: at-or-below completes,
+    // writing the surviving records under the configured load rules
+    // (ADR-0020), with the destination's write facts reported honestly.
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["process_exit_code"], 0);
+    assert_eq!(report["row_counts"]["source"], 3);
+    assert_eq!(report["row_counts"]["written"], 2);
+    assert_eq!(report["row_counts"]["rejected"], 1);
+    assert_eq!(report["rejected_records"]["count"], 1);
+    assert_eq!(report["destination_write"]["atomicity"], "best_effort");
+    assert!(report["error_summary"].is_null());
+
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let rejected_lines = read_rejected_records(&artifact_path);
+    assert_eq!(rejected_lines.len(), 1);
+    assert_eq!(rejected_lines[0]["line"], 3);
+    assert_eq!(rejected_lines[0]["code"], "malformed_csv_record");
+
+    // Only the surviving records reached the destination.
+    let parquet_path = single_parquet_file(&destination_path);
+    let batch = read_single_parquet_batch(&parquet_path);
+    assert_eq!(batch.num_rows(), 2);
+    let customer_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_id is int64");
+    assert_eq!(customer_ids.value(0), 1);
+    assert_eq!(customer_ids.value(1), 3);
+
+    assert!(stdout.contains("Status: succeeded"));
+    assert!(stdout.contains("Records read: 3"));
+    assert!(stdout.contains("Records written: 2"));
+    assert!(stdout.contains("Records rejected: 1"));
+    assert!(stdout.contains(artifact_path.to_str().expect("artifact path")));
+}
+
+#[test]
+fn a_destination_write_failure_still_reports_the_accepted_rejections() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(
+        &source_path,
+        "customer_id,name\n1,Ada\n2,Grace,extra-field\n",
+    )
+    .expect("write source csv");
+
+    // The destination's parent path is an existing file, so the destination
+    // write fails only after the within-threshold rejection was accepted and
+    // its artifact written.
+    let blocker_path = work.path().join("blocker");
+    fs::write(&blocker_path, "not a directory").expect("write blocker file");
+    let destination_path = blocker_path.join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+reject_threshold: 1
+"#,
+            source_path.display(),
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    let assert = Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "write-failed load writes one artifact directory",
+    );
+
+    // The write failure happened after the read and the threshold decision:
+    // the report stays honest about what was established — the schema
+    // decision, the source count, and the rejections with their artifact —
+    // while claiming nothing about the write.
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert_eq!(report["schema_decision"]["mode"], "inferred");
+    assert_eq!(report["row_counts"]["source"], 2);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 1);
+    assert_eq!(report["rejected_records"]["count"], 1);
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let rejected_lines = read_rejected_records(&artifact_path);
+    assert_eq!(rejected_lines.len(), 1);
+    assert_eq!(rejected_lines[0]["code"], "malformed_csv_record");
+
+    assert!(stdout.contains("Records rejected: 1"));
+    assert!(stdout.contains(artifact_path.to_str().expect("artifact path")));
+}
+
+#[test]
+fn missing_required_fields_reject_records_under_a_hand_tightened_pin() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    // One record carries `name`, one nulls it, one omits it entirely: under a
+    // `nullable: false` pin the null and the omission are required-field
+    // violations (ADR-0035).
+    fs::write(
+        &source_path,
+        "{\"customer_id\": 1, \"name\": \"Ada\"}\n\
+         {\"customer_id\": 2, \"name\": null}\n\
+         {\"customer_id\": 3}\n",
+    )
+    .expect("write source jsonl");
+
+    // The pin is hand-tightened (ADR-0033: hand edits stay possible):
+    // bootstrap infers nullable fields only, so `nullable: false` enters by
+    // editing the pinned schema file.
+    let pinned_path = work.path().join("customers.schema.yml");
+    fs::write(
+        &pinned_path,
+        "version: 1\n\
+         fields:\n\
+         - name: customer_id\n\
+         \x20 type: int64\n\
+         - name: name\n\
+         \x20 type: utf8\n\
+         \x20 nullable: false\n",
+    )
+    .expect("write pinned schema");
+
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: duckdb
+  path: {}
+dataset: customers
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+reject_threshold: 2
+"#,
+            source_path.display(),
+            database_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "required-field load writes one artifact directory",
+    );
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["row_counts"]["source"], 3);
+    assert_eq!(report["row_counts"]["written"], 1);
+    assert_eq!(report["row_counts"]["rejected"], 2);
+    // The schema decision echoes the required field.
+    assert_eq!(
+        report["schema_decision"]["fields"][1],
+        serde_json::json!({"name": "name", "type": "utf8", "nullable": false})
+    );
+
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let rejected_lines = read_rejected_records(&artifact_path);
+    assert_eq!(rejected_lines.len(), 2);
+    for (rejected, line, record) in [
+        (
+            &rejected_lines[0],
+            2,
+            serde_json::json!({"customer_id": 2, "name": null}),
+        ),
+        (&rejected_lines[1], 3, serde_json::json!({"customer_id": 3})),
+    ] {
+        assert_eq!(rejected["line"], line);
+        assert_eq!(rejected["code"], "missing_required_field");
+        assert_eq!(rejected["field"], "name");
+        assert_eq!(rejected["message"], "required field \"name\" is null");
+        assert_eq!(rejected["record"], record);
+    }
+
+    // Only the record satisfying the required field reached the destination.
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 1);
+    let names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name is string");
+    assert_eq!(names.value(0), "Ada");
 }
 
 fn read_single_report(artifacts_dir: &Path, artifact_count_message: &str) -> (PathBuf, Value) {
@@ -1818,6 +2180,14 @@ fn read_single_report(artifacts_dir: &Path, artifact_count_message: &str) -> (Pa
     let report =
         serde_json::from_slice(&fs::read(&report_path).expect("load report")).expect("json report");
     (report_path, report)
+}
+
+fn read_rejected_records(artifact_path: &Path) -> Vec<Value> {
+    fs::read_to_string(artifact_path)
+        .expect("rejected-records artifact")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("artifact line is json"))
+        .collect()
 }
 
 fn single_parquet_file(destination_path: &Path) -> PathBuf {

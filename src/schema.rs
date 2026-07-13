@@ -6,13 +6,19 @@
 //! Arrow [`RecordBatch`]. CSV cells arrive as text ([`from_text_columns`]) and
 //! JSONL cells arrive as typed [`Value`]s ([`from_json_columns`]); both fold
 //! observations through the [`InferredType`] lattice, so the two formats
-//! produce and validate schemas the same way: a column fits a pinned field iff
+//! produce and validate schemas the same way: a value fits a pinned field iff
 //! its observed type widens to the pinned type under that lattice (ADR-0034).
+//! Source shape problems — a missing pinned field, an added field the drift
+//! policy does not allow, duplicate source field names — fail the whole load
+//! as `schema_drift`, while value fit is judged per record: a record whose
+//! cell misfits its pinned type or leaves a `nullable: false` field null
+//! becomes a rejected record instead of failing the load (ADR-0035).
 //! Everything type-related — the lattice, observation rules, the pinned schema
-//! file contract ([`PinnedSchema`], ADR-0033), drift comparison,
-//! materialization, and the `schema_decision` shape — is private behind these
-//! two entry points.
+//! file contract ([`PinnedSchema`], ADR-0033), drift comparison, per-record
+//! validation, materialization, and the `schema_decision` shape — is private
+//! behind these two entry points.
 
+use crate::rejection::{self, RejectedRecord};
 use crate::{ExecutionFailure, LoadFailure};
 use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
 use arrow_array::{ArrayRef, RecordBatch};
@@ -24,19 +30,17 @@ use std::sync::Arc;
 
 const PINNED_SCHEMA_VERSION: u64 = 1;
 
-/// A materialized load: the typed Arrow batch, the `schema_decision` shape
-/// that the load report echoes back to the caller, and the pinned schema file
-/// write the caller performs when this load produces or extends a pin
-/// (ADR-0033).
-///
-/// Rejected records (#8) will arrive here later as an **additive** `rejected`
-/// field, so callers pattern-match by name rather than positionally. That
-/// promise is why this is a struct today even though materialization currently
-/// never rejects a row — do not collapse it back to a bare `RecordBatch`.
+/// A materialized load: the typed Arrow batch of the surviving records, the
+/// `schema_decision` shape that the load report echoes back to the caller,
+/// the pinned schema file write the caller performs when this load produces
+/// or extends a pin (ADR-0033), and the records per-record validation
+/// rejected (ADR-0035) — the caller owns the artifact write and the reject
+/// threshold, so this module stays types-only.
 pub(crate) struct Materialized {
     pub(crate) batch: RecordBatch,
     pub(crate) schema_decision: Value,
     pub(crate) pinned_schema_write: Option<PinnedSchemaWrite>,
+    pub(crate) rejected: Vec<RejectedRecord>,
 }
 
 /// A pinned schema file write the load must perform: the path the load
@@ -46,6 +50,20 @@ pub(crate) struct Materialized {
 pub(crate) struct PinnedSchemaWrite {
     pub(crate) pinned_path: String,
     pub(crate) yaml: String,
+}
+
+/// One CSV record positioned at its source line, with one cell per observed
+/// field in header order. The line travels with the record so a rejection can
+/// point back into the source file.
+pub(crate) struct TextRecord {
+    pub(crate) line: u64,
+    pub(crate) cells: Vec<Option<String>>,
+}
+
+/// One JSONL record positioned at its source line, as the parsed JSON object.
+pub(crate) struct JsonRecord {
+    pub(crate) line: u64,
+    pub(crate) object: serde_json::Map<String, Value>,
 }
 
 /// How a load decides its dataset schema: infer it from observed records,
@@ -92,13 +110,13 @@ pub(crate) struct PinnedSchema {
     fields: Vec<PinnedField>,
 }
 
-/// One field of a pinned schema. Only nullable fields are representable today;
-/// `nullable: false` is rejected at parse until rejected-record handling (#8)
-/// gives non-null contracts per-record semantics.
+/// One field of a pinned schema. A `nullable: false` field is a required
+/// field: a record that leaves it null is rejected per record (ADR-0035).
 #[derive(Debug, PartialEq)]
 struct PinnedField {
     name: String,
     field_type: InferredType,
+    nullable: bool,
 }
 
 /// The raw serde shape of a pinned schema file, kept separate from
@@ -119,8 +137,9 @@ struct PinnedFieldFile {
 
 impl PinnedSchema {
     /// Parses a pinned schema file's YAML text, validating the contract:
-    /// `version: 1`, at least one field, unique field names, known field types,
-    /// and nullable fields only.
+    /// `version: 1`, at least one field, unique field names, and known field
+    /// types. `nullable` defaults to true; a `nullable: false` field declares
+    /// a required field.
     pub(crate) fn from_yaml(text: &str) -> Result<Self, LoadFailure> {
         let file = serde_yaml::from_str::<PinnedSchemaFile>(text).map_err(|error| {
             invalid_pinned_schema(format!("failed to parse pinned schema: {error}"))
@@ -155,12 +174,6 @@ impl PinnedSchema {
                     raw_field.name
                 )));
             }
-            if raw_field.nullable == Some(false) {
-                return Err(invalid_pinned_schema(format!(
-                    "pinned schema field {:?} must be nullable until rejected records exist",
-                    raw_field.name
-                )));
-            }
             let field_type = parse_type_name(&raw_field.field_type).ok_or_else(|| {
                 invalid_pinned_schema(format!(
                     "unsupported pinned schema field type: {}",
@@ -170,6 +183,7 @@ impl PinnedSchema {
             fields.push(PinnedField {
                 name: raw_field.name,
                 field_type,
+                nullable: raw_field.nullable.unwrap_or(true),
             });
         }
 
@@ -187,7 +201,7 @@ impl PinnedSchema {
                     .map(|field| PinnedFieldFile {
                         name: field.name.clone(),
                         field_type: data_type_name(&field.field_type.data_type()).to_string(),
-                        nullable: Some(true),
+                        nullable: Some(field.nullable),
                     })
                     .collect(),
             ),
@@ -218,19 +232,40 @@ fn parse_type_name(name: &str) -> Option<InferredType> {
 pub(crate) fn from_text_columns(
     directive: &SchemaDirective,
     field_names: Vec<String>,
-    records: Vec<Vec<Option<String>>>,
+    records: Vec<TextRecord>,
 ) -> Result<Materialized, ExecutionFailure> {
-    // CSV fields arrive untyped, so their types are observed from the text values.
-    let observed_types = observe_text_types(field_names.len(), &records);
-    let plan = plan_fields(directive, &field_names, &observed_types)?;
-    let columns = plan
-        .fields
-        .iter()
-        .map(|planned| {
-            build_text_array(planned.materialized_type, &records, planned.observed_index)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    materialize(plan, columns)
+    match directive {
+        SchemaDirective::Inferred => {
+            let plan = inferred_text_plan(&field_names, &records, None);
+            build_text(plan, &records, Vec::new())
+        }
+        SchemaDirective::PinInferred { pinned_path } => {
+            let plan = inferred_text_plan(&field_names, &records, Some(pinned_path));
+            build_text(plan, &records, Vec::new())
+        }
+        SchemaDirective::Pinned {
+            pinned_path,
+            pin,
+            drift_policy,
+        } => {
+            let ShapeMatch { matched, added } =
+                match_shape(pinned_path, pin, drift_policy, &field_names)?;
+            let mut survivors = Vec::with_capacity(records.len());
+            let mut rejected = Vec::new();
+            for record in records {
+                match validate_text_record(&record, &matched, &field_names) {
+                    Some(rejection) => rejected.push(rejection),
+                    None => survivors.push(record),
+                }
+            }
+            // Added fields take their types from the surviving records only,
+            // so a rejected record's values never shape the destination.
+            let survivor_types = observe_text_types(field_names.len(), &survivors);
+            let added = planned_added_fields(added, &survivor_types);
+            let plan = assemble_pinned_plan(pinned_path, matched, added);
+            build_text(plan, &survivors, rejected)
+        }
+    }
 }
 
 /// Materializes JSONL columns from their parsed [`Value`]s directly, owning the
@@ -239,35 +274,47 @@ pub(crate) fn from_text_columns(
 pub(crate) fn from_json_columns(
     directive: &SchemaDirective,
     field_names: Vec<String>,
-    objects: Vec<serde_json::Map<String, Value>>,
+    records: Vec<JsonRecord>,
 ) -> Result<Materialized, ExecutionFailure> {
-    // JSON values carry their own type, so a field's type is observed from the
-    // JSON kinds rather than by re-parsing stringified values. This keeps JSON
-    // strings like "01234" as text instead of retyping them as numbers.
-    let observed_types = observe_json_types(&field_names, &objects);
-    let plan = plan_fields(directive, &field_names, &observed_types)?;
-    let columns = plan
-        .fields
-        .iter()
-        .enumerate()
-        .map(|(column_index, planned)| {
-            build_json_array(
-                planned.materialized_type,
-                &objects,
-                &planned.name,
-                column_index,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    materialize(plan, columns)
+    match directive {
+        SchemaDirective::Inferred => {
+            let plan = inferred_json_plan(&field_names, &records, None);
+            build_json(plan, &records, Vec::new())
+        }
+        SchemaDirective::PinInferred { pinned_path } => {
+            let plan = inferred_json_plan(&field_names, &records, Some(pinned_path));
+            build_json(plan, &records, Vec::new())
+        }
+        SchemaDirective::Pinned {
+            pinned_path,
+            pin,
+            drift_policy,
+        } => {
+            let ShapeMatch { matched, added } =
+                match_shape(pinned_path, pin, drift_policy, &field_names)?;
+            let mut survivors = Vec::with_capacity(records.len());
+            let mut rejected = Vec::new();
+            for record in records {
+                match validate_json_record(&record, &matched) {
+                    Some(rejection) => rejected.push(rejection),
+                    None => survivors.push(record),
+                }
+            }
+            let survivor_types = observe_json_types(&field_names, &survivors);
+            let added = planned_added_fields(added, &survivor_types);
+            let plan = assemble_pinned_plan(pinned_path, matched, added);
+            build_json(plan, &survivors, rejected)
+        }
+    }
 }
 
 /// One field the load will materialize: its output name, the type its column is
-/// built as (never `Null`), and the index of the observed source column it
-/// reads from.
+/// built as (never `Null`), whether its values may be null, and the index of
+/// the observed source column it reads from.
 struct PlannedField {
     name: String,
     materialized_type: InferredType,
+    nullable: bool,
     observed_index: usize,
 }
 
@@ -280,33 +327,26 @@ struct FieldPlan {
     pinned_schema_write: Option<PinnedSchemaWrite>,
 }
 
-/// Resolves the observed columns against the schema directive into the field
-/// plan, failing with `schema_drift` before any column is built when observed
-/// records do not fit a pinned schema (ADR-0034).
-fn plan_fields(
-    directive: &SchemaDirective,
-    observed_names: &[String],
-    observed_types: &[InferredType],
-) -> Result<FieldPlan, ExecutionFailure> {
-    match directive {
-        SchemaDirective::Inferred => Ok(inferred_plan(observed_names, observed_types, None)),
-        SchemaDirective::PinInferred { pinned_path } => Ok(inferred_plan(
-            observed_names,
-            observed_types,
-            Some(pinned_path),
-        )),
-        SchemaDirective::Pinned {
-            pinned_path,
-            pin,
-            drift_policy,
-        } => pinned_plan(
-            pinned_path,
-            pin,
-            drift_policy,
-            observed_names,
-            observed_types,
-        ),
-    }
+/// Plans an inference-driven CSV load: every observed column keeps its
+/// observed type. Inference derives types from the records themselves, so an
+/// inference-driven load never rejects a record.
+fn inferred_text_plan(
+    field_names: &[String],
+    records: &[TextRecord],
+    pinned_path: Option<&str>,
+) -> FieldPlan {
+    let observed_types = observe_text_types(field_names.len(), records);
+    inferred_plan(field_names, &observed_types, pinned_path)
+}
+
+/// Plans an inference-driven JSONL load; see [`inferred_text_plan`].
+fn inferred_json_plan(
+    field_names: &[String],
+    records: &[JsonRecord],
+    pinned_path: Option<&str>,
+) -> FieldPlan {
+    let observed_types = observe_json_types(field_names, records);
+    inferred_plan(field_names, &observed_types, pinned_path)
 }
 
 /// Plans an inference-driven load: every observed column keeps its observed
@@ -324,6 +364,7 @@ fn inferred_plan(
         .map(|(observed_index, (name, observed_type))| PlannedField {
             name: name.clone(),
             materialized_type: default_null_to_text(*observed_type),
+            nullable: true,
             observed_index,
         })
         .collect::<Vec<_>>();
@@ -349,17 +390,25 @@ fn inferred_plan(
     }
 }
 
-/// Validates the observed columns against a pinned schema and plans the load
-/// that keeps the destination stable: matching fields materialize in pin order
-/// with pinned types, and additive fields are appended only under the additive
-/// drift policy (ADR-0034).
-fn pinned_plan(
+/// The outcome of matching observed source fields against the pin by name:
+/// the pin's fields planned in pin order, and the added fields (name and
+/// observed column index) awaiting their survivor-observed types.
+struct ShapeMatch {
+    matched: Vec<PlannedField>,
+    added: Vec<(String, usize)>,
+}
+
+/// Matches the observed source fields against the pinned schema by name and
+/// fails with `schema_drift` on shape drift: duplicate source field names, a
+/// pinned field absent from every record, or an added field the drift policy
+/// does not allow (ADR-0034). Value fit is not judged here — that is
+/// per-record work (ADR-0035).
+fn match_shape(
     pinned_path: &str,
     pin: &PinnedSchema,
     drift_policy: &DriftPolicy,
     observed_names: &[String],
-    observed_types: &[InferredType],
-) -> Result<FieldPlan, ExecutionFailure> {
+) -> Result<ShapeMatch, ExecutionFailure> {
     // Observed columns match pin fields by name, so duplicate observed names
     // are unmatchable shape drift.
     let mut observed_indexes = HashMap::with_capacity(observed_names.len());
@@ -375,32 +424,16 @@ fn pinned_plan(
     }
 
     let mut missing_fields = Vec::new();
-    let mut type_changes = Vec::new();
-    let mut matched_fields = Vec::new();
+    let mut matched = Vec::new();
     for pin_field in &pin.fields {
         match observed_indexes.get(pin_field.name.as_str()) {
             None => missing_fields.push(pin_field.name.clone()),
-            Some(&observed_index) => {
-                let observed_type = observed_types[observed_index];
-                // Compatible iff the observed type widens to the pinned type
-                // under the inference lattice (ADR-0034): all-null columns
-                // match anything, integers widen to floats, anything widens to
-                // text. Building a column with a compatible pinned type can
-                // then never fail per value.
-                if observed_type.merge(pin_field.field_type) == pin_field.field_type {
-                    matched_fields.push(PlannedField {
-                        name: pin_field.name.clone(),
-                        materialized_type: pin_field.field_type,
-                        observed_index,
-                    });
-                } else {
-                    type_changes.push((
-                        pin_field.name.clone(),
-                        pin_field.field_type,
-                        observed_type,
-                    ));
-                }
-            }
+            Some(&observed_index) => matched.push(PlannedField {
+                name: pin_field.name.clone(),
+                materialized_type: pin_field.field_type,
+                nullable: pin_field.nullable,
+                observed_index,
+            }),
         }
     }
     let pinned_names = pin
@@ -408,25 +441,18 @@ fn pinned_plan(
         .iter()
         .map(|field| field.name.as_str())
         .collect::<HashSet<_>>();
-    let added_fields = observed_names
+    let added = observed_names
         .iter()
         .enumerate()
         .filter(|(_, name)| !pinned_names.contains(name.as_str()))
-        .map(|(observed_index, name)| PlannedField {
-            name: name.clone(),
-            materialized_type: default_null_to_text(observed_types[observed_index]),
-            observed_index,
-        })
+        .map(|(observed_index, name)| (name.clone(), observed_index))
         .collect::<Vec<_>>();
 
     let additive_allowed = matches!(drift_policy, DriftPolicy::AllowAdditiveNullable);
-    if !missing_fields.is_empty()
-        || !type_changes.is_empty()
-        || (!added_fields.is_empty() && !additive_allowed)
-    {
-        let added_names = added_fields
+    if !missing_fields.is_empty() || (!added.is_empty() && !additive_allowed) {
+        let added_names = added
             .iter()
-            .map(|field| field.name.as_str())
+            .map(|(name, _)| name.as_str())
             .collect::<Vec<_>>();
         let mut segments = Vec::new();
         if !missing_fields.is_empty() {
@@ -435,20 +461,6 @@ fn pinned_plan(
         if !added_names.is_empty() {
             segments.push(format!("added fields: {}", added_names.join(", ")));
         }
-        if !type_changes.is_empty() {
-            segments.push(format!(
-                "type changes: {}",
-                type_changes
-                    .iter()
-                    .map(|(name, pinned, observed)| format!(
-                        "{name} (pinned {}, observed {})",
-                        pinned.name(),
-                        observed.name()
-                    ))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-        }
         return Err(drift_failure(
             pinned_path,
             pin,
@@ -456,38 +468,176 @@ fn pinned_plan(
             json!({
                 "missing_fields": missing_fields,
                 "added_fields": added_names,
-                "type_changes": type_changes
-                    .iter()
-                    .map(|(name, pinned, observed)| json!({
-                        "name": name,
-                        "pinned": pinned.name(),
-                        "observed": observed.name()
-                    }))
-                    .collect::<Vec<_>>(),
             }),
         ));
     }
 
-    if added_fields.is_empty() {
+    Ok(ShapeMatch { matched, added })
+}
+
+/// Validates one CSV record against the matched pinned fields, in pin order:
+/// the first null cell in a non-nullable field or the first cell whose
+/// observed type does not widen to its pinned type rejects the record
+/// (ADR-0035).
+fn validate_text_record(
+    record: &TextRecord,
+    matched: &[PlannedField],
+    field_names: &[String],
+) -> Option<RejectedRecord> {
+    for planned in matched {
+        match record.cells[planned.observed_index].as_deref() {
+            None => {
+                if !planned.nullable {
+                    return Some(required_field_rejection(
+                        record.line,
+                        planned,
+                        text_record_json(field_names, &record.cells),
+                    ));
+                }
+            }
+            Some(value) => {
+                if !fits_pinned_type(infer_text_type(value), planned.materialized_type) {
+                    return Some(type_rejection(
+                        record.line,
+                        planned,
+                        json!(value),
+                        text_record_json(field_names, &record.cells),
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Validates one JSONL record against the matched pinned fields; see
+/// [`validate_text_record`]. A field absent from the record reads as null.
+fn validate_json_record(record: &JsonRecord, matched: &[PlannedField]) -> Option<RejectedRecord> {
+    for planned in matched {
+        match record.object.get(&planned.name) {
+            None | Some(Value::Null) => {
+                if !planned.nullable {
+                    return Some(required_field_rejection(
+                        record.line,
+                        planned,
+                        Value::Object(record.object.clone()),
+                    ));
+                }
+            }
+            Some(value) => {
+                if !fits_pinned_type(infer_json_type(value), planned.materialized_type) {
+                    return Some(type_rejection(
+                        record.line,
+                        planned,
+                        value.clone(),
+                        Value::Object(record.object.clone()),
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A value fits a pinned field iff its observed type widens to the pinned
+/// type under the inference lattice — the per-cell restriction of the
+/// ADR-0034 column rule (ADR-0035). Building a surviving record's cell with
+/// its pinned type can then never fail per value.
+fn fits_pinned_type(observed: InferredType, pinned: InferredType) -> bool {
+    observed.merge(pinned) == pinned
+}
+
+fn required_field_rejection(line: u64, planned: &PlannedField, record: Value) -> RejectedRecord {
+    RejectedRecord {
+        line,
+        code: rejection::MISSING_REQUIRED_FIELD,
+        field: Some(planned.name.clone()),
+        message: format!("required field {:?} is null", planned.name),
+        record,
+    }
+}
+
+fn type_rejection(
+    line: u64,
+    planned: &PlannedField,
+    value: Value,
+    record: Value,
+) -> RejectedRecord {
+    RejectedRecord {
+        line,
+        code: rejection::TYPE_COERCION_FAILED,
+        field: Some(planned.name.clone()),
+        message: format!(
+            "value {value} does not fit pinned type {} for field {:?}",
+            planned.materialized_type.name(),
+            planned.name
+        ),
+        record,
+    }
+}
+
+/// Renders a CSV record as the JSON object a rejection's artifact line
+/// carries: header names to cell text, with an empty cell as null.
+fn text_record_json(field_names: &[String], cells: &[Option<String>]) -> Value {
+    Value::Object(
+        field_names
+            .iter()
+            .zip(cells)
+            .map(|(name, cell)| {
+                (
+                    name.clone(),
+                    cell.as_ref()
+                        .map_or(Value::Null, |value| Value::String(value.clone())),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// Types the added fields a pinned load appends under the additive policy
+/// from the observed types of the surviving records (all-null defaults to
+/// text). Added fields are always nullable: inference cannot prove more.
+fn planned_added_fields(
+    added: Vec<(String, usize)>,
+    survivor_types: &[InferredType],
+) -> Vec<PlannedField> {
+    added
+        .into_iter()
+        .map(|(name, observed_index)| PlannedField {
+            name,
+            materialized_type: default_null_to_text(survivor_types[observed_index]),
+            nullable: true,
+            observed_index,
+        })
+        .collect()
+}
+
+/// Assembles the plan of a pinned load that passed shape validation: matched
+/// fields materialize in pin order with pinned types, and added fields are
+/// appended with the persisted pin extended to carry them (ADR-0033), so a
+/// field that later disappears again is caught as drift.
+fn assemble_pinned_plan(
+    pinned_path: &str,
+    matched: Vec<PlannedField>,
+    added: Vec<PlannedField>,
+) -> FieldPlan {
+    if added.is_empty() {
         let decision = json!({
             "mode": "pinned",
-            "fields": fields_json(&matched_fields),
+            "fields": fields_json(&matched),
             "drift_status": "none",
             "pinned_schema_path": pinned_path,
         });
-        return Ok(FieldPlan {
-            fields: matched_fields,
+        return FieldPlan {
+            fields: matched,
             decision,
             pinned_schema_write: None,
-        });
+        };
     }
 
-    // Additive nullable drift under the additive policy: append the added
-    // fields after the pinned ones and extend the persisted pin (ADR-0033) so a
-    // field that later disappears again is caught as drift.
-    let added_json = fields_json(&added_fields);
-    let mut fields = matched_fields;
-    fields.extend(added_fields);
+    let added_json = fields_json(&added);
+    let mut fields = matched;
+    fields.extend(added);
     let decision = json!({
         "mode": "pinned",
         "fields": fields_json(&fields),
@@ -500,11 +650,11 @@ fn pinned_plan(
         pinned_path: pinned_path.to_string(),
         yaml: pin_yaml(&fields),
     });
-    Ok(FieldPlan {
+    FieldPlan {
         fields,
         decision,
         pinned_schema_write,
-    })
+    }
 }
 
 /// Builds the `schema_drift` failure whose report echoes the pinned expectation
@@ -528,7 +678,9 @@ fn drift_failure(
             code: "schema_drift",
             message: format!("schema drift against pinned schema {pinned_path}: {detail}"),
         },
-        schema_decision: Some(decision),
+        schema_decision: Some(Box::new(decision)),
+        source_rows: None,
+        rejected: Vec::new(),
     }
 }
 
@@ -541,7 +693,7 @@ fn pinned_fields_json(pin: &PinnedSchema) -> Value {
                 json!({
                     "name": field.name,
                     "type": field.field_type.name(),
-                    "nullable": true
+                    "nullable": field.nullable
                 })
             })
             .collect(),
@@ -557,7 +709,7 @@ fn fields_json(fields: &[PlannedField]) -> Value {
                 json!({
                     "name": planned.name,
                     "type": planned.materialized_type.name(),
-                    "nullable": true
+                    "nullable": planned.nullable
                 })
             })
             .collect(),
@@ -572,21 +724,70 @@ fn pin_yaml(fields: &[PlannedField]) -> String {
             .map(|planned| PinnedField {
                 name: planned.name.clone(),
                 field_type: planned.materialized_type,
+                nullable: planned.nullable,
             })
             .collect(),
     }
     .to_yaml()
 }
 
+/// Builds the planned columns over the surviving CSV records and assembles
+/// the batch.
+fn build_text(
+    plan: FieldPlan,
+    records: &[TextRecord],
+    rejected: Vec<RejectedRecord>,
+) -> Result<Materialized, ExecutionFailure> {
+    let columns = plan
+        .fields
+        .iter()
+        .map(|planned| build_text_array(planned.materialized_type, records, planned.observed_index))
+        .collect::<Result<Vec<_>, _>>()?;
+    materialize(plan, columns, rejected)
+}
+
+/// Builds the planned columns over the surviving JSONL records and assembles
+/// the batch.
+fn build_json(
+    plan: FieldPlan,
+    records: &[JsonRecord],
+    rejected: Vec<RejectedRecord>,
+) -> Result<Materialized, ExecutionFailure> {
+    let columns = plan
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(column_index, planned)| {
+            build_json_array(
+                planned.materialized_type,
+                records,
+                &planned.name,
+                column_index,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    materialize(plan, columns, rejected)
+}
+
 /// Assembles the planned fields and their pre-built columns into a
 /// [`RecordBatch`]. The batch schema and the reported `schema_decision` derive
 /// from the same plan, so the report can never disagree with the batch that was
 /// written.
-fn materialize(plan: FieldPlan, columns: Vec<ArrayRef>) -> Result<Materialized, ExecutionFailure> {
+fn materialize(
+    plan: FieldPlan,
+    columns: Vec<ArrayRef>,
+    rejected: Vec<RejectedRecord>,
+) -> Result<Materialized, ExecutionFailure> {
     let schema = Arc::new(Schema::new(
         plan.fields
             .iter()
-            .map(|planned| Field::new(&planned.name, planned.materialized_type.data_type(), true))
+            .map(|planned| {
+                Field::new(
+                    &planned.name,
+                    planned.materialized_type.data_type(),
+                    planned.nullable,
+                )
+            })
             .collect::<Vec<_>>(),
     ));
     let batch = RecordBatch::try_new(schema, columns).map_err(|error| LoadFailure {
@@ -598,13 +799,14 @@ fn materialize(plan: FieldPlan, columns: Vec<ArrayRef>) -> Result<Materialized, 
         batch,
         schema_decision: plan.decision,
         pinned_schema_write: plan.pinned_schema_write,
+        rejected,
     })
 }
 
-fn observe_text_types(field_count: usize, records: &[Vec<Option<String>>]) -> Vec<InferredType> {
+fn observe_text_types(field_count: usize, records: &[TextRecord]) -> Vec<InferredType> {
     let mut observed_types = vec![InferredType::Null; field_count];
     for record in records {
-        for (column_index, value) in record.iter().enumerate() {
+        for (column_index, value) in record.cells.iter().enumerate() {
             if let Some(value) = value {
                 observed_types[column_index] =
                     observed_types[column_index].merge(infer_text_type(value));
@@ -614,14 +816,11 @@ fn observe_text_types(field_count: usize, records: &[Vec<Option<String>>]) -> Ve
     observed_types
 }
 
-fn observe_json_types(
-    field_names: &[String],
-    objects: &[serde_json::Map<String, Value>],
-) -> Vec<InferredType> {
+fn observe_json_types(field_names: &[String], records: &[JsonRecord]) -> Vec<InferredType> {
     let mut observed_types = vec![InferredType::Null; field_names.len()];
-    for object in objects {
+    for record in records {
         for (column_index, field_name) in field_names.iter().enumerate() {
-            if let Some(value) = object.get(field_name) {
+            if let Some(value) = record.object.get(field_name) {
                 observed_types[column_index] =
                     observed_types[column_index].merge(infer_json_type(value));
             }
@@ -640,14 +839,14 @@ fn default_null_to_text(inferred_type: InferredType) -> InferredType {
 
 fn build_text_array(
     inferred_type: InferredType,
-    records: &[Vec<Option<String>>],
+    records: &[TextRecord],
     column_index: usize,
 ) -> Result<ArrayRef, LoadFailure> {
     match inferred_type {
         InferredType::Null | InferredType::Utf8 => {
             let mut builder = StringBuilder::new();
             for record in records {
-                match &record[column_index] {
+                match &record.cells[column_index] {
                     Some(value) => builder.append_value(value),
                     None => builder.append_null(),
                 }
@@ -657,7 +856,7 @@ fn build_text_array(
         InferredType::Boolean => {
             let mut builder = BooleanBuilder::new();
             for record in records {
-                match &record[column_index] {
+                match &record.cells[column_index] {
                     Some(value) => builder.append_value(
                         parse_bool(value)
                             .ok_or_else(|| coercion_failure(column_index, value, "boolean"))?,
@@ -670,7 +869,7 @@ fn build_text_array(
         InferredType::Int64 => {
             let mut builder = Int64Builder::new();
             for record in records {
-                match &record[column_index] {
+                match &record.cells[column_index] {
                     Some(value) => builder.append_value(
                         value
                             .parse::<i64>()
@@ -684,7 +883,7 @@ fn build_text_array(
         InferredType::Float64 => {
             let mut builder = Float64Builder::new();
             for record in records {
-                match &record[column_index] {
+                match &record.cells[column_index] {
                     Some(value) => builder.append_value(
                         value
                             .parse::<f64>()
@@ -702,21 +901,21 @@ fn build_text_array(
 /// old JSON → String → re-parse round-trip: integers come from `as_i64`, floats
 /// from `as_f64`, booleans are taken directly, and text columns reuse
 /// [`json_scalar_to_string`]. The coercion arms are unreachable: inference only
-/// picks a type every cell already carries, and a pinned schema only builds
-/// columns whose observed type widens to the pinned type (ADR-0034). They
-/// return a clean failure rather than panicking if that invariant is ever
-/// broken.
+/// picks a type every cell already carries, and a pinned load builds only over
+/// surviving records, whose cells per-record validation proved to fit
+/// (ADR-0035). They return a clean failure rather than panicking if that
+/// invariant is ever broken.
 fn build_json_array(
     inferred_type: InferredType,
-    objects: &[serde_json::Map<String, Value>],
+    records: &[JsonRecord],
     field_name: &str,
     column_index: usize,
 ) -> Result<ArrayRef, LoadFailure> {
     match inferred_type {
         InferredType::Null | InferredType::Utf8 => {
             let mut builder = StringBuilder::new();
-            for object in objects {
-                match json_scalar_to_string(object.get(field_name)) {
+            for record in records {
+                match json_scalar_to_string(record.object.get(field_name)) {
                     Some(value) => builder.append_value(value),
                     None => builder.append_null(),
                 }
@@ -725,8 +924,8 @@ fn build_json_array(
         }
         InferredType::Boolean => {
             let mut builder = BooleanBuilder::new();
-            for object in objects {
-                match object.get(field_name) {
+            for record in records {
+                match record.object.get(field_name) {
                     None | Some(Value::Null) => builder.append_null(),
                     Some(Value::Bool(flag)) => builder.append_value(*flag),
                     Some(other) => {
@@ -742,8 +941,8 @@ fn build_json_array(
         }
         InferredType::Int64 => {
             let mut builder = Int64Builder::new();
-            for object in objects {
-                match object.get(field_name) {
+            for record in records {
+                match record.object.get(field_name) {
                     None | Some(Value::Null) => builder.append_null(),
                     Some(Value::Number(number)) => match number.as_i64() {
                         Some(value) => builder.append_value(value),
@@ -764,8 +963,8 @@ fn build_json_array(
         }
         InferredType::Float64 => {
             let mut builder = Float64Builder::new();
-            for object in objects {
-                match object.get(field_name) {
+            for record in records {
+                match record.object.get(field_name) {
                     None | Some(Value::Null) => builder.append_null(),
                     Some(Value::Number(number)) => match number.as_f64() {
                         Some(value) => builder.append_value(value),
@@ -1073,8 +1272,8 @@ mod tests {
             &SchemaDirective::Inferred,
             names(&["id", "name", "total"]),
             vec![
-                row(&[Some("1"), Some("Ada"), Some("42.50")]),
-                row(&[Some("2"), Some("Grace"), Some("7.25")]),
+                record(2, &[Some("1"), Some("Ada"), Some("42.50")]),
+                record(3, &[Some("2"), Some("Grace"), Some("7.25")]),
             ],
         )
         .expect("materialize");
@@ -1091,6 +1290,9 @@ mod tests {
         assert_eq!(floats(batch, 2).value(0), 42.50);
         assert_eq!(floats(batch, 2).value(1), 7.25);
 
+        // Inference derives types from the records themselves, so an
+        // inference-driven load never rejects a record.
+        assert!(materialized.rejected.is_empty());
         assert_eq!(
             materialized.schema_decision,
             json!({
@@ -1111,8 +1313,8 @@ mod tests {
             &SchemaDirective::Inferred,
             names(&["mixed", "widened", "empty"]),
             vec![
-                row(&[Some("1"), Some("1"), None]),
-                row(&[Some("x"), Some("2.5"), None]),
+                record(2, &[Some("1"), Some("1"), None]),
+                record(3, &[Some("x"), Some("2.5"), None]),
             ],
         )
         .expect("materialize");
@@ -1143,7 +1345,7 @@ mod tests {
         let materialized = from_text_columns(
             &SchemaDirective::Inferred,
             names(&["reading"]),
-            vec![row(&[Some("1.5")]), row(&[Some("inf")])],
+            vec![record(2, &[Some("1.5")]), record(3, &[Some("inf")])],
         )
         .expect("materialize");
         let batch = &materialized.batch;
@@ -1161,7 +1363,7 @@ mod tests {
         let materialized = from_text_columns(
             &SchemaDirective::Inferred,
             names(&["account"]),
-            vec![row(&[Some("007")]), row(&[Some("1234")])],
+            vec![record(2, &[Some("007")]), record(3, &[Some("1234")])],
         )
         .expect("materialize");
         let batch = &materialized.batch;
@@ -1175,14 +1377,14 @@ mod tests {
     fn from_json_columns_keeps_numeric_strings_as_text_and_maps_absent_to_null() {
         // `zip` is a JSON string of digits: it must stay text (the heal), not be
         // retyped as a number. `active` is missing on the second row -> null.
-        let objects = vec![
-            json_object(r#"{"zip": "01234", "balance": 10, "active": true}"#),
-            json_object(r#"{"zip": "00987", "balance": 5}"#),
+        let records = vec![
+            json_record(1, r#"{"zip": "01234", "balance": 10, "active": true}"#),
+            json_record(2, r#"{"zip": "00987", "balance": 5}"#),
         ];
         let materialized = from_json_columns(
             &SchemaDirective::Inferred,
             names(&["zip", "balance", "active"]),
-            objects,
+            records,
         )
         .expect("materialize");
         let batch = &materialized.batch;
@@ -1197,6 +1399,7 @@ mod tests {
         assert_eq!(ints(batch, 1).value(1), 5);
         assert!(bools(batch, 2).value(0));
         assert!(bools(batch, 2).is_null(1)); // missing field -> null
+        assert!(materialized.rejected.is_empty());
     }
 
     #[test]
@@ -1204,12 +1407,12 @@ mod tests {
         // A column mixing a JSON integer and a JSON float widens to Float64. The
         // healed path reads f64 straight from the number; assert the exact bits
         // the old String -> re-parse hop produced.
-        let objects = vec![
-            json_object(r#"{"amount": 10}"#),
-            json_object(r#"{"amount": 42.5}"#),
+        let records = vec![
+            json_record(1, r#"{"amount": 10}"#),
+            json_record(2, r#"{"amount": 42.5}"#),
         ];
         let materialized =
-            from_json_columns(&SchemaDirective::Inferred, names(&["amount"]), objects)
+            from_json_columns(&SchemaDirective::Inferred, names(&["amount"]), records)
                 .expect("materialize");
         let batch = &materialized.batch;
 
@@ -1223,11 +1426,11 @@ mod tests {
 
     #[test]
     fn from_json_columns_stringifies_composites_and_reports_schema_decision() {
-        let objects = vec![json_object(r#"{"tags": ["a", "b"], "meta": {"k": 1}}"#)];
+        let records = vec![json_record(1, r#"{"tags": ["a", "b"], "meta": {"k": 1}}"#)];
         let materialized = from_json_columns(
             &SchemaDirective::Inferred,
             names(&["tags", "meta"]),
-            objects,
+            records,
         )
         .expect("materialize");
         let batch = &materialized.batch;
@@ -1252,8 +1455,8 @@ mod tests {
 
     #[test]
     fn from_json_columns_defaults_all_null_columns_to_text() {
-        let objects = vec![json_object(r#"{"note": null}"#), json_object("{}")];
-        let materialized = from_json_columns(&SchemaDirective::Inferred, names(&["note"]), objects)
+        let records = vec![json_record(1, r#"{"note": null}"#), json_record(2, "{}")];
+        let materialized = from_json_columns(&SchemaDirective::Inferred, names(&["note"]), records)
             .expect("materialize");
         let batch = &materialized.batch;
 
@@ -1284,10 +1487,12 @@ mod tests {
                     PinnedField {
                         name: "customer_id".to_string(),
                         field_type: InferredType::Int64,
+                        nullable: true,
                     },
                     PinnedField {
                         name: "name".to_string(),
                         field_type: InferredType::Utf8,
+                        nullable: true,
                     },
                 ],
             }
@@ -1296,11 +1501,33 @@ mod tests {
 
     #[test]
     fn pinned_schema_defaults_omitted_nullable_to_true() {
-        // A hand-written pin may omit `nullable`; all fields are nullable today.
+        // A hand-written pin may omit `nullable`; an omitted contract stays
+        // permissive.
         let pin = PinnedSchema::from_yaml("version: 1\nfields:\n- name: id\n  type: int64\n")
             .expect("parse pinned schema without nullable");
         assert_eq!(pin.fields[0].name, "id");
         assert_eq!(pin.fields[0].field_type, InferredType::Int64);
+        assert!(pin.fields[0].nullable);
+    }
+
+    #[test]
+    fn pinned_schema_accepts_non_nullable_fields_and_round_trips_them() {
+        // ADR-0035: `nullable: false` declares a required field with
+        // per-record semantics, so the pin contract now accepts it — and the
+        // persisted YAML keeps it, so a rewrite cannot silently relax a
+        // required field.
+        let yaml = "version: 1\n\
+                    fields:\n\
+                    - name: id\n\
+                    \x20 type: int64\n\
+                    \x20 nullable: false\n\
+                    - name: note\n\
+                    \x20 type: utf8\n\
+                    \x20 nullable: true\n";
+        let pin = PinnedSchema::from_yaml(yaml).expect("non-nullable pin parses");
+        assert!(!pin.fields[0].nullable);
+        assert!(pin.fields[1].nullable);
+        assert_eq!(pin.to_yaml(), yaml);
     }
 
     #[test]
@@ -1317,10 +1544,6 @@ mod tests {
             (
                 "version: 1\nfields:\n- name: id\n  type: date\n",
                 "unsupported pinned schema field type: date",
-            ),
-            (
-                "version: 1\nfields:\n- name: id\n  type: int64\n  nullable: false\n",
-                "pinned schema field \"id\" must be nullable",
             ),
             ("version: 1\nfields: []\n", "at least one field"),
             ("version: 1\n", "at least one field"),
@@ -1374,8 +1597,8 @@ mod tests {
             &directive,
             names(&["name", "id", "total"]),
             vec![
-                row(&[Some("Ada"), Some("1"), Some("42")]),
-                row(&[Some("Grace"), Some("2"), Some("7")]),
+                record(2, &[Some("Ada"), Some("1"), Some("42")]),
+                record(3, &[Some("Grace"), Some("2"), Some("7")]),
             ],
         )
         .expect("materialize");
@@ -1399,7 +1622,9 @@ mod tests {
         assert_eq!(floats(batch, 1).value(1), 7.0);
         assert_eq!(strings(batch, 2).value(1), "Grace");
 
-        // A matching load persists nothing and reports the pinned posture.
+        // A matching load rejects nothing, persists nothing, and reports the
+        // pinned posture.
+        assert!(materialized.rejected.is_empty());
         assert!(materialized.pinned_schema_write.is_none());
         assert_eq!(
             materialized.schema_decision,
@@ -1417,10 +1642,10 @@ mod tests {
     }
 
     #[test]
-    fn from_text_columns_fails_on_missing_fields_and_type_changes_before_building() {
-        // `name` is missing, `id` observes as text, and `nickname` is new; all
-        // three surface in one schema_drift failure that echoes the pinned
-        // expectation.
+    fn from_text_columns_fails_on_missing_and_added_fields_before_validating_records() {
+        // `name` is missing and `nickname` is new: shape drift fails the load
+        // before any record is validated, echoing the pinned expectation
+        // (ADR-0034); per-record value fit never runs (ADR-0035).
         let directive = pinned_directive(
             "version: 1\n\
              fields:\n\
@@ -1435,7 +1660,7 @@ mod tests {
         let error = from_text_columns(
             &directive,
             names(&["id", "total", "nickname"]),
-            vec![row(&[Some("abc"), Some("1.5"), Some("Ada")])],
+            vec![record(2, &[Some("abc"), Some("1.5"), Some("Ada")])],
         )
         .err()
         .expect("drift rejected");
@@ -1444,11 +1669,11 @@ mod tests {
         assert_eq!(
             error.failure.message,
             "schema drift against pinned schema customers.schema.yml: \
-             missing fields: name; added fields: nickname; \
-             type changes: id (pinned int64, observed utf8)"
+             missing fields: name; added fields: nickname"
         );
+        assert!(error.rejected.is_empty());
         assert_eq!(
-            error
+            *error
                 .schema_decision
                 .expect("drift failure carries decision"),
             json!({
@@ -1461,10 +1686,7 @@ mod tests {
                 "drift_status": "failed_on_drift",
                 "drift": {
                     "missing_fields": ["name"],
-                    "added_fields": ["nickname"],
-                    "type_changes": [
-                        {"name": "id", "pinned": "int64", "observed": "utf8"}
-                    ]
+                    "added_fields": ["nickname"]
                 },
                 "pinned_schema_path": "customers.schema.yml"
             })
@@ -1480,7 +1702,7 @@ mod tests {
         let error = from_text_columns(
             &directive,
             names(&["id", "extra"]),
-            vec![row(&[Some("1"), Some("x")])],
+            vec![record(2, &[Some("1"), Some("x")])],
         )
         .err()
         .expect("added field rejected by default");
@@ -1489,6 +1711,185 @@ mod tests {
         assert_eq!(
             error.failure.message,
             "schema drift against pinned schema customers.schema.yml: added fields: extra"
+        );
+    }
+
+    #[test]
+    fn from_text_columns_rejects_records_whose_cells_misfit_the_pinned_type() {
+        // ADR-0035: a value misfit rejects only its record; the surviving
+        // records materialize and the schema decision reports no drift.
+        let directive = pinned_directive(
+            "version: 1\n\
+             fields:\n\
+             - name: id\n\
+             \x20 type: int64\n\
+             - name: name\n\
+             \x20 type: utf8\n",
+            DriftPolicy::Fail,
+        );
+        let materialized = from_text_columns(
+            &directive,
+            names(&["id", "name"]),
+            vec![
+                record(2, &[Some("1"), Some("Ada")]),
+                record(3, &[Some("abc"), Some("Bad")]),
+                record(4, &[Some("3"), Some("Cara")]),
+            ],
+        )
+        .expect("misfits reject records, not the load");
+        let batch = &materialized.batch;
+
+        assert_eq!(batch.num_rows(), 2);
+        assert_eq!(ints(batch, 0).value(0), 1);
+        assert_eq!(ints(batch, 0).value(1), 3);
+        assert_eq!(strings(batch, 1).value(1), "Cara");
+
+        assert_eq!(materialized.rejected.len(), 1);
+        let rejected = &materialized.rejected[0];
+        assert_eq!(rejected.line, 3);
+        assert_eq!(rejected.code, "type_coercion_failed");
+        assert_eq!(rejected.field.as_deref(), Some("id"));
+        assert_eq!(
+            rejected.message,
+            "value \"abc\" does not fit pinned type int64 for field \"id\""
+        );
+        assert_eq!(rejected.record, json!({ "id": "abc", "name": "Bad" }));
+
+        // Rejections are threshold business, not drift: the decision stays
+        // clean.
+        assert_eq!(materialized.schema_decision["drift_status"], "none");
+    }
+
+    #[test]
+    fn from_text_columns_rejects_lossy_numeric_text_under_a_pin() {
+        // The per-cell fit uses observation, not a raw parse: `007` parses as
+        // an i64 but observes as text (ADR-0032), and `inf` parses as an f64
+        // but observes as text (ADR-0031) — both would lose information under
+        // their pinned numeric reading, so both records are rejected. This
+        // also pins that a load whose records are all rejected materializes an
+        // empty batch of the pinned fields.
+        let directive = pinned_directive(
+            "version: 1\n\
+             fields:\n\
+             - name: account\n\
+             \x20 type: int64\n\
+             - name: reading\n\
+             \x20 type: float64\n",
+            DriftPolicy::Fail,
+        );
+        let materialized = from_text_columns(
+            &directive,
+            names(&["account", "reading"]),
+            vec![
+                record(2, &[Some("007"), Some("1.5")]),
+                record(3, &[Some("42"), Some("inf")]),
+            ],
+        )
+        .expect("lossy numeric text rejects records, not the load");
+
+        assert_eq!(materialized.batch.num_rows(), 0);
+        assert_eq!(
+            schema_types(&materialized.batch),
+            vec![DataType::Int64, DataType::Float64]
+        );
+        assert_eq!(materialized.rejected.len(), 2);
+        assert_eq!(materialized.rejected[0].line, 2);
+        assert_eq!(materialized.rejected[0].field.as_deref(), Some("account"));
+        assert_eq!(
+            materialized.rejected[0].message,
+            "value \"007\" does not fit pinned type int64 for field \"account\""
+        );
+        assert_eq!(materialized.rejected[1].line, 3);
+        assert_eq!(materialized.rejected[1].field.as_deref(), Some("reading"));
+        assert_eq!(
+            materialized.rejected[1].message,
+            "value \"inf\" does not fit pinned type float64 for field \"reading\""
+        );
+    }
+
+    #[test]
+    fn from_text_columns_rejects_null_in_a_non_nullable_pinned_field() {
+        // ADR-0035: `nullable: false` is a required field; an empty CSV cell
+        // reads as null and rejects the record. The materialized Arrow field
+        // is non-nullable, which the surviving records satisfy by
+        // construction.
+        let directive = pinned_directive(
+            "version: 1\n\
+             fields:\n\
+             - name: id\n\
+             \x20 type: int64\n\
+             \x20 nullable: false\n\
+             - name: name\n\
+             \x20 type: utf8\n",
+            DriftPolicy::Fail,
+        );
+        let materialized = from_text_columns(
+            &directive,
+            names(&["id", "name"]),
+            vec![
+                record(2, &[Some("1"), Some("Ada")]),
+                record(3, &[None, Some("Bad")]),
+            ],
+        )
+        .expect("required-field violations reject records, not the load");
+        let batch = &materialized.batch;
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(ints(batch, 0).value(0), 1);
+        assert!(!batch.schema().field(0).is_nullable());
+        assert!(batch.schema().field(1).is_nullable());
+
+        assert_eq!(materialized.rejected.len(), 1);
+        let rejected = &materialized.rejected[0];
+        assert_eq!(rejected.line, 3);
+        assert_eq!(rejected.code, "missing_required_field");
+        assert_eq!(rejected.field.as_deref(), Some("id"));
+        assert_eq!(rejected.message, "required field \"id\" is null");
+        assert_eq!(rejected.record, json!({ "id": null, "name": "Bad" }));
+
+        // The schema decision echoes the required field.
+        assert_eq!(
+            materialized.schema_decision["fields"][0],
+            json!({"name": "id", "type": "int64", "nullable": false})
+        );
+    }
+
+    #[test]
+    fn from_text_columns_types_added_fields_from_surviving_records_only() {
+        // The rejected record carries text in the added `extra` column; its
+        // values must not widen the added field, which types from survivors.
+        let directive = pinned_directive(
+            "version: 1\nfields:\n- name: id\n  type: int64\n",
+            DriftPolicy::AllowAdditiveNullable,
+        );
+        let materialized = from_text_columns(
+            &directive,
+            names(&["id", "extra"]),
+            vec![
+                record(2, &[Some("1"), Some("7")]),
+                record(3, &[Some("abc"), Some("hello")]),
+            ],
+        )
+        .expect("materialize");
+        let batch = &materialized.batch;
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(schema_types(batch), vec![DataType::Int64, DataType::Int64]);
+        assert_eq!(materialized.rejected.len(), 1);
+        assert_eq!(
+            materialized.schema_decision["added_fields"],
+            json!([{"name": "extra", "type": "int64", "nullable": true}])
+        );
+        assert_eq!(
+            materialized.pinned_schema_write.expect("extended pin").yaml,
+            "version: 1\n\
+             fields:\n\
+             - name: id\n\
+             \x20 type: int64\n\
+             \x20 nullable: true\n\
+             - name: extra\n\
+             \x20 type: int64\n\
+             \x20 nullable: true\n"
         );
     }
 
@@ -1507,8 +1908,8 @@ mod tests {
             &directive,
             names(&["id", "name", "vip"]),
             vec![
-                row(&[Some("1"), Some("Ada"), Some("true")]),
-                row(&[Some("2"), Some("Grace"), None]),
+                record(2, &[Some("1"), Some("Ada"), Some("true")]),
+                record(3, &[Some("2"), Some("Grace"), None]),
             ],
         )
         .expect("additive drift allowed");
@@ -1563,7 +1964,7 @@ mod tests {
                 pinned_path: "customers.schema.yml".to_string(),
             },
             names(&["id", "total"]),
-            vec![row(&[Some("1"), Some("42.5")])],
+            vec![record(2, &[Some("1"), Some("42.5")])],
         )
         .expect("materialize");
 
@@ -1597,9 +1998,9 @@ mod tests {
 
     #[test]
     fn from_text_columns_matches_all_null_columns_against_any_pinned_type() {
-        // `score` never carries a value in this batch: the Null observation is
-        // the lattice identity, so it matches the pinned int64 and materializes
-        // as an all-null int64 column.
+        // `score` never carries a value in this batch: a null cell fits any
+        // nullable pinned field, so no record is rejected and the column
+        // materializes as an all-null int64 column.
         let directive = pinned_directive(
             "version: 1\n\
              fields:\n\
@@ -1612,7 +2013,7 @@ mod tests {
         let materialized = from_text_columns(
             &directive,
             names(&["id", "score"]),
-            vec![row(&[Some("1"), None]), row(&[Some("2"), None])],
+            vec![record(2, &[Some("1"), None]), record(3, &[Some("2"), None])],
         )
         .expect("all-null column matches");
         let batch = &materialized.batch;
@@ -1620,6 +2021,7 @@ mod tests {
         assert_eq!(schema_types(batch), vec![DataType::Int64, DataType::Int64]);
         assert!(ints(batch, 1).is_null(0));
         assert!(ints(batch, 1).is_null(1));
+        assert!(materialized.rejected.is_empty());
         assert_eq!(materialized.schema_decision["drift_status"], "none");
     }
 
@@ -1632,7 +2034,7 @@ mod tests {
         let error = from_text_columns(
             &directive,
             names(&["id", "id"]),
-            vec![row(&[Some("1"), Some("2")])],
+            vec![record(2, &[Some("1"), Some("2")])],
         )
         .err()
         .expect("duplicate names rejected");
@@ -1660,38 +2062,89 @@ mod tests {
              \x20 type: float64\n",
             DriftPolicy::Fail,
         );
-        let objects = vec![
-            json_object(r#"{"zip": "01234", "balance": 10}"#),
-            json_object(r#"{"zip": "00987", "balance": 5}"#),
+        let records = vec![
+            json_record(1, r#"{"zip": "01234", "balance": 10}"#),
+            json_record(2, r#"{"zip": "00987", "balance": 5}"#),
         ];
-        let materialized = from_json_columns(&directive, names(&["zip", "balance"]), objects)
+        let materialized = from_json_columns(&directive, names(&["zip", "balance"]), records)
             .expect("materialize");
         let batch = &materialized.batch;
 
         assert_eq!(schema_types(batch), vec![DataType::Utf8, DataType::Float64]);
         assert_eq!(strings(batch, 0).value(0), "01234");
         assert_eq!(floats(batch, 1).value(0), 10.0);
+        assert!(materialized.rejected.is_empty());
         assert_eq!(materialized.schema_decision["mode"], "pinned");
         assert_eq!(materialized.schema_decision["drift_status"], "none");
     }
 
     #[test]
-    fn from_json_columns_fails_when_a_json_string_hits_a_pinned_numeric_field() {
+    fn from_json_columns_rejects_a_json_string_against_a_pinned_numeric_field() {
+        // ADR-0035: a JSON string that merely looks numeric misfits a pinned
+        // int64 per record — the record is rejected, not the load.
         let directive = pinned_directive(
             "version: 1\nfields:\n- name: balance\n  type: int64\n",
             DriftPolicy::Fail,
         );
-        let objects = vec![json_object(r#"{"balance": "10"}"#)];
-        let error = from_json_columns(&directive, names(&["balance"]), objects)
-            .err()
-            .expect("string vs pinned int64 rejected");
+        let records = vec![
+            json_record(1, r#"{"balance": 7}"#),
+            json_record(2, r#"{"balance": "10"}"#),
+        ];
+        let materialized = from_json_columns(&directive, names(&["balance"]), records)
+            .expect("string vs pinned int64 rejects the record");
 
-        assert_eq!(error.failure.code, "schema_drift");
+        assert_eq!(materialized.batch.num_rows(), 1);
+        assert_eq!(ints(&materialized.batch, 0).value(0), 7);
+        assert_eq!(materialized.rejected.len(), 1);
+        let rejected = &materialized.rejected[0];
+        assert_eq!(rejected.line, 2);
+        assert_eq!(rejected.code, "type_coercion_failed");
+        assert_eq!(rejected.field.as_deref(), Some("balance"));
         assert_eq!(
-            error.failure.message,
-            "schema drift against pinned schema customers.schema.yml: \
-             type changes: balance (pinned int64, observed utf8)"
+            rejected.message,
+            "value \"10\" does not fit pinned type int64 for field \"balance\""
         );
+        assert_eq!(rejected.record, json!({ "balance": "10" }));
+    }
+
+    #[test]
+    fn from_json_columns_rejects_null_and_absent_in_a_non_nullable_pinned_field() {
+        // A JSON null and an absent field both read as null (ADR-0034), so
+        // both violate a `nullable: false` pinned field per record.
+        let directive = pinned_directive(
+            "version: 1\n\
+             fields:\n\
+             - name: id\n\
+             \x20 type: int64\n\
+             - name: note\n\
+             \x20 type: utf8\n\
+             \x20 nullable: false\n",
+            DriftPolicy::Fail,
+        );
+        let records = vec![
+            json_record(1, r#"{"id": 1, "note": "x"}"#),
+            json_record(2, r#"{"id": 2, "note": null}"#),
+            json_record(3, r#"{"id": 3}"#),
+        ];
+        let materialized = from_json_columns(&directive, names(&["id", "note"]), records)
+            .expect("required-field violations reject records, not the load");
+
+        assert_eq!(materialized.batch.num_rows(), 1);
+        assert_eq!(materialized.rejected.len(), 2);
+        for (rejected, line, record) in [
+            (
+                &materialized.rejected[0],
+                2,
+                json!({ "id": 2, "note": null }),
+            ),
+            (&materialized.rejected[1], 3, json!({ "id": 3 })),
+        ] {
+            assert_eq!(rejected.line, line);
+            assert_eq!(rejected.code, "missing_required_field");
+            assert_eq!(rejected.field.as_deref(), Some("note"));
+            assert_eq!(rejected.message, "required field \"note\" is null");
+            assert_eq!(rejected.record, record);
+        }
     }
 
     #[test]
@@ -1709,8 +2162,11 @@ mod tests {
              \x20 type: utf8\n",
             DriftPolicy::AllowAdditiveNullable,
         );
-        let objects = vec![json_object(r#"{"id": 1}"#), json_object(r#"{"id": 2}"#)];
-        let error = from_json_columns(&directive, names(&["id"]), objects)
+        let records = vec![
+            json_record(1, r#"{"id": 1}"#),
+            json_record(2, r#"{"id": 2}"#),
+        ];
+        let error = from_json_columns(&directive, names(&["id"]), records)
             .err()
             .expect("batch-wide absence rejected");
 
@@ -1724,12 +2180,12 @@ mod tests {
             "version: 1\nfields:\n- name: id\n  type: int64\n",
             DriftPolicy::AllowAdditiveNullable,
         );
-        let objects = vec![
-            json_object(r#"{"id": 1, "note": null}"#),
-            json_object(r#"{"id": 2}"#),
+        let records = vec![
+            json_record(1, r#"{"id": 1, "note": null}"#),
+            json_record(2, r#"{"id": 2}"#),
         ];
         let materialized =
-            from_json_columns(&directive, names(&["id", "note"]), objects).expect("materialize");
+            from_json_columns(&directive, names(&["id", "note"]), records).expect("materialize");
         let batch = &materialized.batch;
 
         assert_eq!(schema_types(batch), vec![DataType::Int64, DataType::Utf8]);
@@ -1771,13 +2227,16 @@ mod tests {
         field_names.iter().map(|name| name.to_string()).collect()
     }
 
-    fn row(cells: &[Option<&str>]) -> Vec<Option<String>> {
-        cells.iter().map(|cell| cell.map(str::to_string)).collect()
+    fn record(line: u64, cells: &[Option<&str>]) -> TextRecord {
+        TextRecord {
+            line,
+            cells: cells.iter().map(|cell| cell.map(str::to_string)).collect(),
+        }
     }
 
-    fn json_object(text: &str) -> serde_json::Map<String, Value> {
+    fn json_record(line: u64, text: &str) -> JsonRecord {
         match serde_json::from_str::<Value>(text).expect("valid json") {
-            Value::Object(map) => map,
+            Value::Object(object) => JsonRecord { line, object },
             _ => panic!("expected a JSON object"),
         }
     }
