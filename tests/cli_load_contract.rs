@@ -798,7 +798,7 @@ load_mode: full_refresh
         "rejected 1 of 2 records, exceeding the reject threshold of 0"
     );
 
-    // The wrong-length row is recovered as an array of its cells, with the
+    // The wrong-length record is recovered as an array of its cells, with the
     // line number and the field-count mismatch spelled out.
     let artifact_path = PathBuf::from(
         report["rejected_records"]["artifact"]
@@ -1967,6 +1967,88 @@ reject_threshold: 1
     assert!(stdout.contains("Status: succeeded"));
     assert!(stdout.contains("Records read: 3"));
     assert!(stdout.contains("Records written: 2"));
+    assert!(stdout.contains("Records rejected: 1"));
+    assert!(stdout.contains(artifact_path.to_str().expect("artifact path")));
+}
+
+#[test]
+fn a_destination_write_failure_still_reports_the_accepted_rejections() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(
+        &source_path,
+        "customer_id,name\n1,Ada\n2,Grace,extra-field\n",
+    )
+    .expect("write source csv");
+
+    // The destination's parent path is an existing file, so the destination
+    // write fails only after the within-threshold rejection was accepted and
+    // its artifact written.
+    let blocker_path = work.path().join("blocker");
+    fs::write(&blocker_path, "not a directory").expect("write blocker file");
+    let destination_path = blocker_path.join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+reject_threshold: 1
+"#,
+            source_path.display(),
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    let assert = Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "write-failed load writes one artifact directory",
+    );
+
+    // The write failure happened after the read and the threshold decision:
+    // the report stays honest about what was established — the schema
+    // decision, the source count, and the rejections with their artifact —
+    // while claiming nothing about the write.
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert_eq!(report["schema_decision"]["mode"], "inferred");
+    assert_eq!(report["row_counts"]["source"], 2);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 1);
+    assert_eq!(report["rejected_records"]["count"], 1);
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let rejected_lines = read_rejected_records(&artifact_path);
+    assert_eq!(rejected_lines.len(), 1);
+    assert_eq!(rejected_lines[0]["code"], "malformed_csv_record");
+
     assert!(stdout.contains("Records rejected: 1"));
     assert!(stdout.contains(artifact_path.to_str().expect("artifact path")));
 }

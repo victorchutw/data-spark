@@ -204,7 +204,10 @@ impl Source for LocalFileSource {
                 // No record ever parsed with fields, so no schema can be
                 // inferred or validated: the load fails, with the parse
                 // rejections travelling on the failure so their artifact is
-                // still written.
+                // still written. This is asymmetric with CSV on purpose — a
+                // CSV header declares the source's fields even when every
+                // record is rejected, while JSONL fields exist only in
+                // records.
                 if field_names.is_empty() {
                     return Err(ExecutionFailure {
                         failure: LoadFailure {

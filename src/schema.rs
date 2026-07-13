@@ -598,10 +598,10 @@ fn text_record_json(field_names: &[String], cells: &[Option<String>]) -> Value {
 /// from the observed types of the surviving records (all-null defaults to
 /// text). Added fields are always nullable: inference cannot prove more.
 fn planned_added_fields(
-    added_names: Vec<(String, usize)>,
+    added: Vec<(String, usize)>,
     survivor_types: &[InferredType],
 ) -> Vec<PlannedField> {
-    added_names
+    added
         .into_iter()
         .map(|(name, observed_index)| PlannedField {
             name,

@@ -50,7 +50,7 @@ struct LoadReport {
     schema_decision: Value,
     row_counts: RowCounts,
     byte_counts: ByteCounts,
-    rejected_records: RejectedRecords,
+    rejected_records: RejectedRecordFacts,
     destination_write: Value,
     execution: Value,
     timings: Timings,
@@ -67,7 +67,8 @@ impl LoadReport {
         timings: Timings,
         details: ExecutionDetails,
     ) -> Self {
-        let rejected_records = RejectedRecords::facts(details.rejected.len() as u64, &artifact_dir);
+        let rejected_records =
+            RejectedRecordFacts::facts(details.rejected.len() as u64, &artifact_dir);
         LoadReport {
             report_version: LOAD_REPORT_VERSION,
             load_id,
@@ -100,7 +101,7 @@ impl LoadReport {
         failure: ReportableFailure,
     ) -> Self {
         let rejected_count = failure.rejected.len() as u64;
-        let rejected_records = RejectedRecords::facts(rejected_count, &artifact_dir);
+        let rejected_records = RejectedRecordFacts::facts(rejected_count, &artifact_dir);
         LoadReport {
             report_version: LOAD_REPORT_VERSION,
             load_id,
@@ -149,14 +150,14 @@ struct RowCounts {
 /// records the load rejected and, when any were, the `rejected-records.jsonl`
 /// artifact they were written to.
 #[derive(Serialize)]
-struct RejectedRecords {
+struct RejectedRecordFacts {
     count: u64,
     artifact: Option<String>,
 }
 
-impl RejectedRecords {
+impl RejectedRecordFacts {
     fn facts(count: u64, artifact_dir: &str) -> Self {
-        RejectedRecords {
+        RejectedRecordFacts {
             count,
             artifact: (count > 0).then(|| {
                 path_string(&Path::new(artifact_dir).join(rejection::REJECTED_RECORDS_FILENAME))
@@ -240,8 +241,8 @@ struct ExecutionDetails {
 /// A failure joined with the load definition context (source, destination,
 /// dataset, load mode) that a load report echoes back, plus the facts the
 /// load had already established when it failed: the schema decision if one
-/// had been made (`not_evaluated` otherwise), the source rows counted once
-/// the read completed (`0` otherwise), and the records rejected before the
+/// had been made (`not_evaluated` otherwise), the source records counted
+/// once the read completed (`0` otherwise), and the records rejected before
 /// failure, whose artifact is still written.
 struct ReportableFailure {
     source_summary: Value,
@@ -289,8 +290,8 @@ struct LoadFailure {
 /// A load failure joined with the facts the load had already established when
 /// the failure happened, so the report can echo them: the schema decision if
 /// one had been made (a failure before any decision reports `not_evaluated`),
-/// the source rows once the read completed, and the records rejected before
-/// the failure, whose artifact the orchestrator still writes. Failures raised
+/// the source records counted once the read completed, and the records
+/// rejected before the failure, whose artifact the orchestrator still writes. Failures raised
 /// before or without those facts lift via `From` with none of them.
 #[derive(Debug)]
 struct ExecutionFailure {
@@ -668,7 +669,7 @@ fn print_summary(report: &LoadReport) {
     println!("Artifact directory: {}", report.artifact_dir);
     println!("Load report: {}", path_string(&report_path));
     if let Some(artifact) = &report.rejected_records.artifact {
-        println!("Rejected records: {artifact}");
+        println!("Rejected records artifact: {artifact}");
     }
     if let Some(error) = &report.error_summary {
         println!("Error: {}", error.message);
@@ -980,6 +981,30 @@ mod tests {
         assert_eq!(details.row_counts.rejected, 1);
         assert_eq!(details.rejected.len(), 1);
         assert!(work.path().join("customers_dataset").exists());
+    }
+
+    #[test]
+    fn execute_supported_load_does_not_persist_the_pin_when_the_threshold_fails() {
+        // A first pin-requesting load that fails its reject threshold is a
+        // validation failure: it must leave no pinned schema behind
+        // (ADR-0036), so a fixed source retries onto a clean bootstrap.
+        let work = tempfile::TempDir::new().expect("tempdir");
+        let pinned_path = work.path().join("customers.schema.yml");
+        let mut definition = threshold_definition(&work, None);
+        definition.schema = Some(SchemaConfig {
+            pinned_path: Some(pinned_path.clone()),
+            drift_policy: None,
+        });
+
+        let failure = execute_supported_load(&definition)
+            .err()
+            .expect("one rejection exceeds the default threshold of 0");
+
+        assert_eq!(failure.failure.code, "reject_threshold_exceeded");
+        assert!(
+            !pinned_path.exists(),
+            "a threshold-failed load must not persist the pin"
+        );
     }
 
     #[test]
