@@ -18,6 +18,7 @@
 //! validation, materialization, and the `schema_decision` shape — is private
 //! behind these two entry points.
 
+use crate::connector::DestinationWriteFacts;
 use crate::rejection::{self, RejectedRecord};
 use crate::{ExecutionFailure, LoadFailure};
 use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
@@ -680,7 +681,9 @@ fn drift_failure(
         },
         schema_decision: Some(Box::new(decision)),
         source_rows: None,
+        written_rows: 0,
         rejected: Vec::new(),
+        destination_write: Box::new(DestinationWriteFacts::not_applicable()),
     }
 }
 
