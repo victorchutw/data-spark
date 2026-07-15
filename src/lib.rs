@@ -194,10 +194,18 @@ struct LoadDefinition {
     dataset: Option<String>,
     load_mode: Option<String>,
     schema: Option<SchemaConfig>,
+    artifacts: Option<ArtifactsConfig>,
     /// The number of rejected records this load tolerates before failing.
     /// Defaults to `0`: any rejected record fails the load unless the
     /// definition explicitly allows more (ADR-0020).
     reject_threshold: Option<u64>,
+}
+
+/// The `artifacts` block of a load definition: the root under which this load's
+/// unique artifact directory is created (ADR-0015).
+#[derive(Debug, Deserialize, Serialize)]
+struct ArtifactsConfig {
+    dir: Option<PathBuf>,
 }
 
 /// The `schema` block of a load definition: the path of the pinned schema file
@@ -309,6 +317,22 @@ struct ExecutionFailure {
     destination_write: Box<DestinationWriteFacts>,
 }
 
+impl ExecutionFailure {
+    /// Applies the flat reject threshold to source failures that happened before
+    /// a schema decision but already established rejected-record facts. This
+    /// keeps malformed records under ADR-0036 even when none survive to provide
+    /// an inferable schema.
+    fn apply_pending_reject_threshold(mut self, reject_threshold: u64) -> Self {
+        let rejected_count = self.rejected.len() as u64;
+        if self.schema_decision.is_none() && rejected_count > reject_threshold {
+            let source_rows = self.source_rows.unwrap_or(rejected_count);
+            self.failure = reject_threshold_failure(rejected_count, source_rows, reject_threshold);
+            self.source_rows = Some(source_rows);
+        }
+        self
+    }
+}
+
 impl From<LoadFailure> for ExecutionFailure {
     fn from(failure: LoadFailure) -> Self {
         ExecutionFailure {
@@ -341,13 +365,23 @@ pub fn run() -> ExitCode {
 fn run_load(args: LoadArgs) -> Result<LoadReport, Box<dyn std::error::Error>> {
     let started_unix_ms = unix_ms();
     let load_id = Uuid::new_v4().to_string();
+    let definition = read_load_definition(&args.definition);
+    // The one-off CLI redirect overrides the repeatable definition setting;
+    // otherwise loads use the repository-wide default (ADR-0015).
     let artifact_root = args
         .output_dir
+        .or_else(|| {
+            definition
+                .as_ref()
+                .ok()
+                .and_then(|definition| definition.artifacts.as_ref())
+                .and_then(|artifacts| artifacts.dir.clone())
+        })
         .unwrap_or_else(|| PathBuf::from(".data-spark").join("runs"));
     let artifact_dir = artifact_root.join(&load_id);
     fs::create_dir_all(&artifact_dir)?;
 
-    let execution = execute_load_definition(&args.definition);
+    let execution = definition.and_then(execute_load_definition);
 
     // The rejected-records artifact is written before the report that names
     // it, from whichever side of the outcome carries rejections (ADR-0036).
@@ -388,7 +422,7 @@ fn run_load(args: LoadArgs) -> Result<LoadReport, Box<dyn std::error::Error>> {
 // Called once per load, so the size of the Err variant (which carries the
 // definition context the report echoes back) is irrelevant.
 #[allow(clippy::result_large_err)]
-fn execute_load_definition(definition_path: &Path) -> Result<ExecutionDetails, ReportableFailure> {
+fn read_load_definition(definition_path: &Path) -> Result<LoadDefinition, ReportableFailure> {
     let definition_text = fs::read_to_string(definition_path).map_err(|error| {
         ReportableFailure::without_context(
             "load_definition_read_failed",
@@ -396,13 +430,20 @@ fn execute_load_definition(definition_path: &Path) -> Result<ExecutionDetails, R
         )
     })?;
 
-    let definition = serde_yaml::from_str::<LoadDefinition>(&definition_text).map_err(|error| {
+    serde_yaml::from_str::<LoadDefinition>(&definition_text).map_err(|error| {
         ReportableFailure::without_context(
             "invalid_load_definition_yaml",
             format!("failed to parse load definition: {error}"),
         )
-    })?;
+    })
+}
 
+// Called once per load, so the size of the Err variant (which carries the
+// definition context the report echoes back) is irrelevant.
+#[allow(clippy::result_large_err)]
+fn execute_load_definition(
+    definition: LoadDefinition,
+) -> Result<ExecutionDetails, ReportableFailure> {
     let source_summary = definition
         .source
         .as_ref()
@@ -471,6 +512,20 @@ fn execute_load_definition(definition_path: &Path) -> Result<ExecutionDetails, R
     })
 }
 
+fn reject_threshold_failure(
+    rejected_count: u64,
+    source_rows: u64,
+    reject_threshold: u64,
+) -> LoadFailure {
+    LoadFailure {
+        code: "reject_threshold_exceeded",
+        message: format!(
+            "rejected {rejected_count} of {source_rows} records, \
+             exceeding the reject threshold of {reject_threshold}"
+        ),
+    }
+}
+
 fn execute_supported_load(
     definition: &LoadDefinition,
 ) -> Result<ExecutionDetails, ExecutionFailure> {
@@ -500,13 +555,16 @@ fn execute_supported_load(
     destination_port.validate_mode(mode)?;
     let directive = resolve_schema_directive(definition.schema.as_ref())?;
 
+    let reject_threshold = definition.reject_threshold.unwrap_or(0);
     let SourceRead {
         batch,
         schema_decision,
         pinned_schema_write,
         source_bytes,
         rejected,
-    } = source_port.read(&directive)?;
+    } = source_port
+        .read(&directive)
+        .map_err(|failure| failure.apply_pending_reject_threshold(reject_threshold))?;
 
     let rejected_count = rejected.len() as u64;
     let row_count = batch.num_rows() as u64;
@@ -517,16 +575,9 @@ fn execute_supported_load(
     // (`reject_threshold`, default 0 per ADR-0020) is a validation failure,
     // which must leave the pin unpersisted and the destination untouched
     // (ADR-0019).
-    let reject_threshold = definition.reject_threshold.unwrap_or(0);
     if rejected_count > reject_threshold {
         return Err(ExecutionFailure {
-            failure: LoadFailure {
-                code: "reject_threshold_exceeded",
-                message: format!(
-                    "rejected {rejected_count} of {source_rows} records, \
-                     exceeding the reject threshold of {reject_threshold}"
-                ),
-            },
+            failure: reject_threshold_failure(rejected_count, source_rows, reject_threshold),
             schema_decision: Some(Box::new(schema_decision)),
             source_rows: Some(source_rows),
             written_records: 0,
@@ -954,6 +1005,7 @@ mod tests {
             dataset: Some("customers".to_string()),
             load_mode: None,
             schema: None,
+            artifacts: None,
             reject_threshold,
         }
     }

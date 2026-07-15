@@ -328,7 +328,7 @@ impl Source for LocalFileSource {
                             ),
                         },
                         schema_decision: None,
-                        source_rows: None,
+                        source_rows: Some(records.len() as u64 + rejected.len() as u64),
                         written_records: 0,
                         rejected,
                         destination_write: Box::new(DestinationWriteFacts::not_applicable()),
@@ -1050,7 +1050,7 @@ fn read_local_csv(source_path: &Path) -> Result<CsvRecords, LoadFailure> {
     })
 }
 
-fn read_local_jsonl(source_path: &Path) -> Result<JsonlRecords, LoadFailure> {
+fn read_local_jsonl(source_path: &Path) -> Result<JsonlRecords, ExecutionFailure> {
     let file = File::open(source_path).map_err(|error| LoadFailure {
         code: "source_read_failed",
         message: format!(
@@ -1070,26 +1070,63 @@ fn read_local_jsonl(source_path: &Path) -> Result<JsonlRecords, LoadFailure> {
         .len();
 
     // Read one record per line so peak memory tracks the parsed records rather
-    // than an extra whole-file string copy, matching the CSV reader.
+    // than an extra whole-file string copy, matching the CSV reader. Reading
+    // bytes first lets invalid UTF-8 reject only its record instead of erasing
+    // the source facts established by earlier lines.
     let mut field_names: Vec<String> = Vec::new();
     let mut seen_fields: HashSet<String> = HashSet::new();
     let mut records: Vec<schema::JsonRecord> = Vec::new();
     let mut rejected = Vec::new();
-    for (line_index, line) in BufReader::new(file).lines().enumerate() {
-        let line_number = line_index as u64 + 1;
-        let line = line.map_err(|error| LoadFailure {
-            code: "source_read_failed",
-            message: format!(
-                "failed to read JSONL source {} line {line_number}: {error}",
-                source_path.display(),
-            ),
-        })?;
+    let mut reader = BufReader::new(file);
+    let mut line_bytes = Vec::new();
+    let mut line_number = 0_u64;
+    loop {
+        line_bytes.clear();
+        match reader.read_until(b'\n', &mut line_bytes) {
+            Ok(0) => break,
+            Ok(_) => line_number += 1,
+            Err(error) => {
+                return Err(ExecutionFailure {
+                    failure: LoadFailure {
+                        code: "source_read_failed",
+                        message: format!(
+                            "failed to read JSONL source {} after line {line_number}: {error}",
+                            source_path.display(),
+                        ),
+                    },
+                    schema_decision: None,
+                    source_rows: Some(records.len() as u64 + rejected.len() as u64),
+                    written_records: 0,
+                    rejected,
+                    destination_write: Box::new(DestinationWriteFacts::not_applicable()),
+                });
+            }
+        }
+        if line_bytes.last() == Some(&b'\n') {
+            line_bytes.pop();
+        }
+        if line_bytes.last() == Some(&b'\r') {
+            line_bytes.pop();
+        }
+        let line = match std::str::from_utf8(&line_bytes) {
+            Ok(line) => line,
+            Err(error) => {
+                rejected.push(RejectedRecord {
+                    line: line_number,
+                    code: rejection::MALFORMED_JSONL_RECORD,
+                    field: None,
+                    message: error.to_string(),
+                    record: Value::String(String::from_utf8_lossy(&line_bytes).into_owned()),
+                });
+                continue;
+            }
+        };
         if line.trim().is_empty() {
             continue;
         }
         // A line that is not a JSON object rejects that record, not the load;
         // the raw line is recovered for troubleshooting.
-        let object = match serde_json::from_str::<Value>(&line) {
+        let object = match serde_json::from_str::<Value>(line) {
             Ok(Value::Object(object)) => object,
             Ok(_) => {
                 rejected.push(RejectedRecord {
@@ -1097,7 +1134,7 @@ fn read_local_jsonl(source_path: &Path) -> Result<JsonlRecords, LoadFailure> {
                     code: rejection::MALFORMED_JSONL_RECORD,
                     field: None,
                     message: "each JSONL record must be a JSON object".to_string(),
-                    record: Value::String(line),
+                    record: Value::String(line.to_string()),
                 });
                 continue;
             }
@@ -1107,7 +1144,7 @@ fn read_local_jsonl(source_path: &Path) -> Result<JsonlRecords, LoadFailure> {
                     code: rejection::MALFORMED_JSONL_RECORD,
                     field: None,
                     message: error.to_string(),
-                    record: Value::String(line),
+                    record: Value::String(line.to_string()),
                 });
                 continue;
             }
@@ -1454,16 +1491,41 @@ mod tests {
             .expect("a source with no parseable records fails the load");
 
         // No record ever parsed, so no schema can be inferred: the load fails,
-        // but the parse rejections still travel with the failure so the
-        // orchestrator can write their artifact.
+        // but the source count and parse rejections still travel with the
+        // failure so the orchestrator can report them and write their artifact.
         assert_eq!(error.failure.code, "malformed_jsonl");
         assert!(error
             .failure
             .message
             .contains("must include at least one record with fields"));
+        assert_eq!(error.source_rows, Some(2));
         assert_eq!(error.rejected.len(), 2);
         assert_eq!(error.rejected[0].line, 1);
         assert_eq!(error.rejected[1].line, 2);
+    }
+
+    #[test]
+    fn local_file_source_counts_empty_jsonl_objects_when_no_fields_can_be_inferred() {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.jsonl");
+        fs::write(&source_path, "{}\nnot json\n").expect("write jsonl");
+
+        let source = LocalFileSource {
+            path: source_path,
+            format: Some("jsonl".to_string()),
+        };
+        let error = source
+            .read(&SchemaDirective::Inferred)
+            .err()
+            .expect("a source with no fields fails the load");
+
+        // The empty object parsed as a source record even though it declared no
+        // fields, so it must remain part of the known source count alongside the
+        // rejected line.
+        assert_eq!(error.failure.code, "malformed_jsonl");
+        assert_eq!(error.source_rows, Some(2));
+        assert_eq!(error.rejected.len(), 1);
+        assert_eq!(error.rejected[0].line, 2);
     }
 
     #[test]
