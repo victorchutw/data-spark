@@ -996,6 +996,419 @@ load_mode: full_refresh
 }
 
 #[test]
+fn all_invalid_jsonl_rejections_fail_the_default_threshold_before_destination_writing() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    fs::write(&source_path, "not json\n[1]\n").expect("write invalid source jsonl");
+
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+"#,
+            source_path.display(),
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    let assert = Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    assert!(
+        !destination_path.exists(),
+        "an unreadable JSONL source must fail before destination writing"
+    );
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let (report_path, report) = read_single_report(
+        &artifacts_dir,
+        "all-invalid jsonl load writes one artifact directory",
+    );
+
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(report["error_summary"]["code"], "reject_threshold_exceeded");
+    assert_eq!(
+        report["error_summary"]["message"],
+        "rejected 2 of 2 records, exceeding the reject threshold of 0"
+    );
+    assert_eq!(report["row_counts"]["source"], 2);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 2);
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("rejected artifact path"),
+    );
+    let rejected = read_rejected_records(&artifact_path);
+    assert_eq!(rejected.len(), 2);
+    assert_eq!(rejected[0]["line"], 1);
+    assert_eq!(rejected[0]["code"], "malformed_jsonl_record");
+    assert_eq!(rejected[1]["line"], 2);
+    assert_eq!(rejected[1]["code"], "malformed_jsonl_record");
+
+    assert!(stdout.contains("Status: failed"));
+    assert!(stdout.contains("Records read: 2"));
+    assert!(stdout.contains("Records written: 0"));
+    assert!(stdout.contains("Records rejected: 2"));
+    assert!(stdout.contains("exceeding the reject threshold of 0"));
+    assert!(stdout.contains(report_path.to_str().expect("report path")));
+    assert!(stdout.contains(artifact_path.to_str().expect("artifact path")));
+}
+
+#[test]
+fn invalid_utf8_jsonl_line_is_rejected_without_losing_prior_source_facts() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    fs::write(
+        &source_path,
+        b"{\"customer_id\":1}\nnot json\n{\"customer_id\":\"\xFF\"}\n",
+    )
+    .expect("write malformed source jsonl");
+
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "jsonl",
+        "parquet",
+        &destination_path,
+        "full_refresh",
+        None,
+    );
+
+    let artifacts_dir = work.path().join("artifacts");
+    let result = run_cli_load(work.path(), &artifacts_dir, &definition_path, false);
+    let report = &result.report;
+
+    assert!(
+        !destination_path.exists(),
+        "malformed JSONL records must fail the default threshold before writing"
+    );
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(report["error_summary"]["code"], "reject_threshold_exceeded");
+    assert_eq!(
+        report["error_summary"]["message"],
+        "rejected 2 of 3 records, exceeding the reject threshold of 0"
+    );
+    assert_eq!(report["row_counts"]["source"], 3);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 2);
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("rejected artifact path"),
+    );
+    let rejected = read_rejected_records(&artifact_path);
+    assert_eq!(rejected.len(), 2);
+    assert_eq!(rejected[0]["line"], 2);
+    assert_eq!(rejected[0]["code"], "malformed_jsonl_record");
+    assert_eq!(rejected[1]["line"], 3);
+    assert_eq!(rejected[1]["code"], "malformed_jsonl_record");
+
+    assert!(result.stdout.contains("Status: failed"));
+    assert!(result.stdout.contains("Records read: 3"));
+    assert!(result.stdout.contains("Records written: 0"));
+    assert!(result.stdout.contains("Records rejected: 2"));
+    assert!(result
+        .stdout
+        .contains(result.report_path.to_str().expect("report path")));
+    assert!(result
+        .stdout
+        .contains(artifact_path.to_str().expect("artifact path")));
+}
+
+#[test]
+fn missing_local_source_fails_before_destination_writing_with_a_report_and_summary() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("missing-customers.csv");
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+"#,
+            source_path.display(),
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    let assert = Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    assert!(
+        !destination_path.exists(),
+        "a missing source must fail before destination writing"
+    );
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let (report_path, report) = read_single_report(
+        &artifacts_dir,
+        "missing-source load writes one artifact directory",
+    );
+
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(report["error_summary"]["code"], "source_read_failed");
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("failed to read CSV source"));
+    assert_eq!(report["row_counts"]["source"], 0);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert!(report["rejected_records"]["artifact"].is_null());
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+
+    assert!(stdout.contains("Status: failed"));
+    assert!(stdout.contains("Records read: 0"));
+    assert!(stdout.contains("Records written: 0"));
+    assert!(stdout.contains("Records rejected: 0"));
+    assert!(stdout.contains("failed to read CSV source"));
+    assert!(stdout.contains(report_path.to_str().expect("report path")));
+}
+
+#[test]
+fn empty_csv_fails_explicitly_before_destination_writing() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "").expect("write empty source csv");
+
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "parquet",
+        &destination_path,
+        "full_refresh",
+        None,
+    );
+
+    let artifacts_dir = work.path().join("artifacts");
+    let result = run_cli_load(work.path(), &artifacts_dir, &definition_path, false);
+    let report = &result.report;
+
+    assert!(!destination_path.exists());
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(report["error_summary"]["code"], "malformed_csv");
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("must include at least one header field"));
+    assert_eq!(report["row_counts"]["source"], 0);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert!(report["rejected_records"]["artifact"].is_null());
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+    assert!(result.stdout.contains("Status: failed"));
+    assert!(result.stdout.contains("Records read: 0"));
+    assert!(result.stdout.contains("Records written: 0"));
+    assert!(result.stdout.contains("Records rejected: 0"));
+    assert!(result
+        .stdout
+        .contains(result.report_path.to_str().expect("report path")));
+}
+
+#[test]
+fn empty_jsonl_fails_explicitly_before_destination_writing() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    fs::write(&source_path, "\n  \n").expect("write blank source jsonl");
+
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "jsonl",
+        "parquet",
+        &destination_path,
+        "full_refresh",
+        None,
+    );
+
+    let artifacts_dir = work.path().join("artifacts");
+    let result = run_cli_load(work.path(), &artifacts_dir, &definition_path, false);
+    let report = &result.report;
+
+    assert!(!destination_path.exists());
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(report["error_summary"]["code"], "malformed_jsonl");
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("must include at least one record with fields"));
+    assert_eq!(report["row_counts"]["source"], 0);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert!(report["rejected_records"]["artifact"].is_null());
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+    assert!(result.stdout.contains("Status: failed"));
+    assert!(result.stdout.contains("Records read: 0"));
+    assert!(result.stdout.contains("Records written: 0"));
+    assert!(result.stdout.contains("Records rejected: 0"));
+    assert!(result
+        .stdout
+        .contains(result.report_path.to_str().expect("report path")));
+}
+
+#[test]
+fn header_only_csv_completes_as_an_empty_load() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "customer_id,name\n").expect("write header-only source csv");
+
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "parquet",
+        &destination_path,
+        "full_refresh",
+        None,
+    );
+
+    let artifacts_dir = work.path().join("artifacts");
+    let result = run_cli_load(work.path(), &artifacts_dir, &definition_path, true);
+    let report = &result.report;
+
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["process_exit_code"], 0);
+    assert_eq!(report["schema_decision"]["mode"], "inferred");
+    assert_eq!(report["row_counts"]["source"], 0);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert!(report["rejected_records"]["artifact"].is_null());
+    assert_eq!(report["destination_write"]["atomicity"], "best_effort");
+    assert!(report["error_summary"].is_null());
+
+    let files = parquet_files(&destination_path);
+    assert_eq!(
+        files.len(),
+        1,
+        "the empty dataset still has one Parquet file"
+    );
+    let rows = read_parquet_batches(&destination_path)
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum::<usize>();
+    assert_eq!(rows, 0, "an external Parquet reader sees no records");
+
+    assert!(result.stdout.contains("Status: succeeded"));
+    assert!(result.stdout.contains("Records read: 0"));
+    assert!(result.stdout.contains("Records written: 0"));
+    assert!(result.stdout.contains("Records rejected: 0"));
+    assert!(result
+        .stdout
+        .contains(result.report_path.to_str().expect("report path")));
+}
+
+#[test]
+fn malformed_csv_header_fails_with_a_report_and_summary_before_destination_writing() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, b"customer_id,\xFF\n1,Ada\n").expect("write malformed source csv");
+
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "parquet",
+        &destination_path,
+        "full_refresh",
+        None,
+    );
+
+    let artifacts_dir = work.path().join("artifacts");
+    let result = run_cli_load(work.path(), &artifacts_dir, &definition_path, false);
+    let report = &result.report;
+
+    assert!(
+        !destination_path.exists(),
+        "a malformed CSV header must fail before destination writing"
+    );
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(report["error_summary"]["code"], "malformed_csv");
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("malformed CSV syntax"));
+    assert_eq!(report["row_counts"]["source"], 0);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert!(report["rejected_records"]["artifact"].is_null());
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+    assert!(result.stdout.contains("Status: failed"));
+    assert!(result.stdout.contains("malformed CSV syntax"));
+    assert!(result
+        .stdout
+        .contains(result.report_path.to_str().expect("report path")));
+}
+
+#[test]
 fn malformed_local_csv_rejects_the_record_and_fails_the_default_threshold() {
     let work = TempDir::new().expect("tempdir");
     let source_path = work.path().join("customers.csv");
@@ -1442,6 +1855,152 @@ load_mode: full_refresh
     assert!(report_path.ends_with("load-report.json"));
     assert!(stdout.contains(".data-spark/runs"));
     assert!(stdout.contains("load-report.json"));
+}
+
+#[test]
+fn load_definition_artifact_dir_redirects_report_and_rejected_records() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(
+        &source_path,
+        "customer_id,name\n1,Ada\n2,Grace,extra-field\n",
+    )
+    .expect("write source csv");
+
+    let destination_path = work.path().join("customers_dataset");
+    let artifacts_dir = work.path().join("definition-artifacts");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+reject_threshold: 1
+artifacts:
+  dir: {}
+"#,
+            source_path.display(),
+            destination_path.display(),
+            artifacts_dir.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let assert = Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    assert!(
+        !work.path().join(".data-spark").join("runs").exists(),
+        "a definition artifact directory must replace the default root"
+    );
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let (report_path, report) = read_single_report(
+        &artifacts_dir,
+        "definition artifact root has one load directory",
+    );
+
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["process_exit_code"], 0);
+    assert_eq!(report["row_counts"]["source"], 2);
+    assert_eq!(report["row_counts"]["written"], 1);
+    assert_eq!(report["row_counts"]["rejected"], 1);
+    assert_eq!(
+        PathBuf::from(report["artifact_dir"].as_str().expect("artifact directory")),
+        report_path.parent().expect("report parent")
+    );
+
+    let rejected_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("rejected artifact path"),
+    );
+    assert_eq!(rejected_path.parent(), report_path.parent());
+    let rejected = read_rejected_records(&rejected_path);
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0]["code"], "malformed_csv_record");
+
+    let batch = read_single_parquet_batch(&single_parquet_file(&destination_path));
+    assert_eq!(batch.num_rows(), 1);
+    assert!(stdout.contains(report_path.to_str().expect("report path")));
+    assert!(stdout.contains(rejected_path.to_str().expect("rejected artifact path")));
+}
+
+#[test]
+fn cli_output_dir_overrides_the_load_definition_artifact_dir() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "customer_id,name\n1,Ada\n").expect("write source csv");
+
+    let destination_path = work.path().join("customers_dataset");
+    let definition_artifacts = work.path().join("definition-artifacts");
+    let cli_artifacts = work.path().join("cli-artifacts");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+artifacts:
+  dir: {}
+"#,
+            source_path.display(),
+            destination_path.display(),
+            definition_artifacts.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let assert = Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&cli_artifacts)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    assert!(
+        !definition_artifacts.exists(),
+        "the one-off CLI redirect must override the repeatable definition root"
+    );
+    assert!(!work.path().join(".data-spark").join("runs").exists());
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let (report_path, report) =
+        read_single_report(&cli_artifacts, "CLI artifact root has one load directory");
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(
+        PathBuf::from(report["artifact_dir"].as_str().expect("artifact directory")),
+        report_path.parent().expect("report parent")
+    );
+    assert!(stdout.contains(report_path.to_str().expect("report path")));
 }
 
 #[test]
@@ -2658,7 +3217,7 @@ reject_threshold: 1
         .failure();
 
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
-    let (_, report) = read_single_report(
+    let (report_path, report) = read_single_report(
         &artifacts_dir,
         "write-failed load writes one artifact directory",
     );
@@ -2667,8 +3226,14 @@ reject_threshold: 1
     // the report stays honest about what was established — the schema
     // decision, the source count, and the rejections with their artifact —
     // while claiming nothing about the write.
+    assert_eq!(report["report_version"], 1);
     assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
     assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert!(!report["error_summary"]["message"]
+        .as_str()
+        .expect("error message")
+        .is_empty());
     assert_eq!(report["schema_decision"]["mode"], "inferred");
     assert_eq!(report["row_counts"]["source"], 2);
     assert_eq!(report["row_counts"]["written"], 0);
@@ -2685,7 +3250,11 @@ reject_threshold: 1
     assert_eq!(rejected_lines.len(), 1);
     assert_eq!(rejected_lines[0]["code"], "malformed_csv_record");
 
+    assert!(stdout.contains("Status: failed"));
+    assert!(stdout.contains("Records read: 2"));
+    assert!(stdout.contains("Records written: 0"));
     assert!(stdout.contains("Records rejected: 1"));
+    assert!(stdout.contains(report_path.to_str().expect("report path")));
     assert!(stdout.contains(artifact_path.to_str().expect("artifact path")));
 }
 
