@@ -2289,34 +2289,178 @@ fn append_validation_failure_leaves_the_destination_unchanged_and_reports_no_wri
 }
 
 #[test]
-fn append_destination_write_failure_reports_best_effort_and_preserves_existing_records() {
+fn duckdb_append_rejects_lossy_type_coercion_before_writing() {
     let work = TempDir::new().expect("tempdir");
     let source_path = work.path().join("customers.csv");
     let database_path = work.path().join("customers.duckdb");
     let definition_path = work.path().join("load.yml");
 
-    fs::write(&source_path, "customer_id,name\n1,Ada\n").expect("write first csv");
+    {
+        let connection = duckdb::Connection::open(&database_path).expect("open DuckDB destination");
+        connection
+            .execute_batch("CREATE TABLE customers (id BIGINT); INSERT INTO customers VALUES (1)")
+            .expect("seed DuckDB destination");
+    }
+
+    fs::write(&source_path, "id\n2.9\n").expect("write lossy append csv");
     write_load_definition(
         &definition_path,
         &source_path,
         "csv",
         "duckdb",
         &database_path,
-        "full_refresh",
+        "append",
         None,
     );
-    run_cli_load(
+    let append = run_cli_load(
         work.path(),
-        &work.path().join("artifacts-first"),
+        &work.path().join("artifacts-append"),
         &definition_path,
-        true,
+        false,
+    );
+    let report = &append.report;
+
+    assert_eq!(report["load_mode"], "append");
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("append schema does not match DuckDB destination"));
+    assert_eq!(report["schema_decision"]["mode"], "inferred");
+    assert_eq!(report["row_counts"]["source"], 1);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert_eq!(report["rejected_records"]["count"], 0);
+    assert!(report["rejected_records"]["artifact"].is_null());
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+    assert!(report["destination_write"]["strategy"].is_null());
+    assert!(!report["load_id"].as_str().expect("load id").is_empty());
+    assert_eq!(
+        PathBuf::from(report["artifact_dir"].as_str().expect("artifact directory")),
+        append.report_path.parent().expect("report parent")
     );
 
-    // The source is valid on its own, but its extra field cannot be inserted
-    // into the existing two-column table. The failure therefore occurs at the
-    // append write boundary rather than during source validation.
-    fs::write(&source_path, "customer_id,name,unexpected\n2,Grace,value\n")
-        .expect("write incompatible append csv");
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 1);
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id is int64");
+    assert_eq!(ids.value(0), 1);
+
+    assert!(append.stdout.contains("Status: failed"));
+    assert!(append.stdout.contains("Records read: 1"));
+    assert!(append.stdout.contains("Records written: 0"));
+    assert!(append.stdout.contains("Records rejected: 0"));
+    assert!(append
+        .stdout
+        .contains(append.report_path.to_str().expect("report path")));
+}
+
+#[test]
+fn duckdb_append_rejects_missing_destination_field_before_writing() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    {
+        let connection = duckdb::Connection::open(&database_path).expect("open DuckDB destination");
+        connection
+            .execute_batch(
+                "CREATE TABLE customers (id BIGINT, name VARCHAR); \
+                 INSERT INTO customers VALUES (1, 'Ada')",
+            )
+            .expect("seed DuckDB destination");
+    }
+
+    fs::write(&source_path, "id\n2\n").expect("write missing-field append csv");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "append",
+        None,
+    );
+    let append = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-append"),
+        &definition_path,
+        false,
+    );
+    let report = &append.report;
+
+    assert_eq!(report["load_mode"], "append");
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("append schema does not match DuckDB destination"));
+    assert_eq!(report["schema_decision"]["mode"], "inferred");
+    assert_eq!(report["row_counts"]["source"], 1);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert_eq!(report["rejected_records"]["count"], 0);
+    assert!(report["rejected_records"]["artifact"].is_null());
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+    assert!(report["destination_write"]["strategy"].is_null());
+    assert!(!report["load_id"].as_str().expect("load id").is_empty());
+    assert_eq!(
+        PathBuf::from(report["artifact_dir"].as_str().expect("artifact directory")),
+        append.report_path.parent().expect("report parent")
+    );
+
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 1);
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id is int64");
+    let names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name is string");
+    assert_eq!(ids.value(0), 1);
+    assert_eq!(names.value(0), "Ada");
+
+    assert!(append.stdout.contains("Status: failed"));
+    assert!(append.stdout.contains("Records read: 1"));
+    assert!(append.stdout.contains("Records written: 0"));
+    assert!(append.stdout.contains("Records rejected: 0"));
+    assert!(append
+        .stdout
+        .contains(append.report_path.to_str().expect("report path")));
+}
+
+#[test]
+fn append_destination_write_failure_reports_best_effort_and_preserves_existing_records() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    {
+        let connection = duckdb::Connection::open(&database_path).expect("open DuckDB destination");
+        connection
+            .execute_batch(
+                "CREATE TABLE customers (customer_id BIGINT PRIMARY KEY, name VARCHAR); \
+                 INSERT INTO customers VALUES (1, 'Ada')",
+            )
+            .expect("seed constrained DuckDB destination");
+    }
+
+    // The source schema matches the destination, but the duplicate primary key
+    // makes the insert itself fail after the best-effort write boundary.
+    fs::write(&source_path, "customer_id,name\n1,Grace\n").expect("write duplicate-key append csv");
     write_load_definition(
         &definition_path,
         &source_path,

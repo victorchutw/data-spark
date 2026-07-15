@@ -681,7 +681,7 @@ fn drift_failure(
         },
         schema_decision: Some(Box::new(decision)),
         source_rows: None,
-        written_rows: 0,
+        written_records: 0,
         rejected: Vec::new(),
         destination_write: Box::new(DestinationWriteFacts::not_applicable()),
     }

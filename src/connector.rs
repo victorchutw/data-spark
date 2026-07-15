@@ -126,23 +126,23 @@ pub(crate) struct DestinationWrite {
 pub(crate) struct DestinationWriteFailure {
     pub(crate) failure: LoadFailure,
     pub(crate) facts: DestinationWriteFacts,
-    pub(crate) written_rows: u64,
+    pub(crate) written_records: u64,
 }
 
 impl DestinationWriteFailure {
-    fn atomic(failure: LoadFailure, strategy: &'static str, written_rows: u64) -> Self {
+    fn atomic(failure: LoadFailure, strategy: &'static str, written_records: u64) -> Self {
         DestinationWriteFailure {
             failure,
             facts: DestinationWriteFacts::atomic(strategy),
-            written_rows,
+            written_records,
         }
     }
 
-    fn best_effort(failure: LoadFailure, strategy: &'static str, written_rows: u64) -> Self {
+    fn best_effort(failure: LoadFailure, strategy: &'static str, written_records: u64) -> Self {
         DestinationWriteFailure {
             failure,
             facts: DestinationWriteFacts::best_effort(strategy),
-            written_rows,
+            written_records,
         }
     }
 }
@@ -152,7 +152,7 @@ impl From<LoadFailure> for DestinationWriteFailure {
         DestinationWriteFailure {
             failure,
             facts: DestinationWriteFacts::not_applicable(),
-            written_rows: 0,
+            written_records: 0,
         }
     }
 }
@@ -329,7 +329,7 @@ impl Source for LocalFileSource {
                         },
                         schema_decision: None,
                         source_rows: None,
-                        written_rows: 0,
+                        written_records: 0,
                         rejected,
                         destination_write: Box::new(DestinationWriteFacts::not_applicable()),
                     });
@@ -652,9 +652,10 @@ fn write_parquet_batch(path: &Path, batch: &RecordBatch) -> Result<u64, LoadFail
 /// the destination path, with the table named by the load definition's
 /// `dataset`. Full refresh replaces the table in one
 /// `CREATE OR REPLACE TABLE "<dataset>" AS SELECT * FROM arrow(?, ?)` statement;
-/// append inserts through the same Arrow table function without replacing
-/// existing records. Arrow-to-DuckDB type mapping stays delegated to DuckDB
-/// (ADR-0030).
+/// append reads the existing table's Arrow schema, aligns matching fields by
+/// name and exact type, then inserts through the same Arrow table function
+/// without replacing existing records. Arrow-to-DuckDB type mapping stays
+/// delegated to DuckDB (ADR-0030).
 struct DuckDbDestination {
     path: PathBuf,
     dataset: String,
@@ -733,13 +734,20 @@ impl DuckDbDestination {
         batch: &RecordBatch,
     ) -> Result<DestinationWrite, DestinationWriteFailure> {
         let connection = self.open_arrow_connection()?;
+        // Inspect and align before crossing the append write boundary: DuckDB's
+        // INSERT BY NAME would otherwise coerce lossy types or fill omissions
+        // with nulls instead of enforcing the destination dataset schema.
+        let append_batch = self.prepare_append_batch(&connection, batch)?;
 
         let statement = format!(
             "INSERT INTO {} BY NAME SELECT * FROM arrow(?, ?)",
             self.quoted_dataset()
         );
         connection
-            .execute(&statement, arrow_recordbatch_to_query_params(batch.clone()))
+            .execute(
+                &statement,
+                arrow_recordbatch_to_query_params(append_batch.clone()),
+            )
             .map_err(|error| {
                 DestinationWriteFailure::best_effort(
                     LoadFailure {
@@ -764,7 +772,7 @@ impl DuckDbDestination {
                     ),
                 },
                 "insert",
-                batch.num_rows() as u64,
+                append_batch.num_rows() as u64,
             )
         })?;
 
@@ -772,6 +780,37 @@ impl DuckDbDestination {
             bytes_written: None,
             facts: DestinationWriteFacts::best_effort("insert"),
         })
+    }
+
+    fn prepare_append_batch(
+        &self,
+        connection: &Connection,
+        batch: &RecordBatch,
+    ) -> Result<RecordBatch, LoadFailure> {
+        let statement = format!("SELECT * FROM {} LIMIT 0", self.quoted_dataset());
+        let mut statement = connection
+            .prepare(&statement)
+            .map_err(|error| LoadFailure {
+                code: "destination_write_failed",
+                message: format!(
+                    "failed to inspect DuckDB table {} in {} before append: {error}",
+                    self.dataset,
+                    self.path.display()
+                ),
+            })?;
+        let destination_schema = statement
+            .query_arrow([])
+            .map_err(|error| LoadFailure {
+                code: "destination_write_failed",
+                message: format!(
+                    "failed to inspect DuckDB table {} in {} before append: {error}",
+                    self.dataset,
+                    self.path.display()
+                ),
+            })?
+            .get_schema();
+
+        align_batch_to_duckdb_schema(self, batch, destination_schema)
     }
 
     fn open_arrow_connection(&self) -> Result<Connection, LoadFailure> {
@@ -802,6 +841,52 @@ impl DuckDbDestination {
 
     fn quoted_dataset(&self) -> String {
         format!("\"{}\"", self.dataset.replace('"', "\"\""))
+    }
+}
+
+fn align_batch_to_duckdb_schema(
+    destination: &DuckDbDestination,
+    batch: &RecordBatch,
+    destination_schema: SchemaRef,
+) -> Result<RecordBatch, LoadFailure> {
+    let source_schema = batch.schema();
+    if source_schema.fields().len() != destination_schema.fields().len() {
+        return Err(duckdb_schema_mismatch(destination));
+    }
+
+    let mut columns = Vec::with_capacity(destination_schema.fields().len());
+    for destination_field in destination_schema.fields() {
+        let source_index = source_schema
+            .index_of(destination_field.name())
+            .map_err(|_| duckdb_schema_mismatch(destination))?;
+        let source_field = source_schema.field(source_index);
+        let column = batch.column(source_index);
+        if source_field.data_type() != destination_field.data_type()
+            || (!destination_field.is_nullable() && column.null_count() > 0)
+        {
+            return Err(duckdb_schema_mismatch(destination));
+        }
+        columns.push(column.clone());
+    }
+
+    RecordBatch::try_new(destination_schema, columns).map_err(|error| LoadFailure {
+        code: "destination_write_failed",
+        message: format!(
+            "failed to align append records with DuckDB destination {} in {}: {error}",
+            destination.dataset,
+            destination.path.display()
+        ),
+    })
+}
+
+fn duckdb_schema_mismatch(destination: &DuckDbDestination) -> LoadFailure {
+    LoadFailure {
+        code: "destination_write_failed",
+        message: format!(
+            "append schema does not match DuckDB destination {} in {}",
+            destination.dataset,
+            destination.path.display()
+        ),
     }
 }
 
