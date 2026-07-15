@@ -328,7 +328,7 @@ impl Source for LocalFileSource {
                             ),
                         },
                         schema_decision: None,
-                        source_rows: Some(rejected.len() as u64),
+                        source_rows: Some(records.len() as u64 + rejected.len() as u64),
                         written_records: 0,
                         rejected,
                         destination_write: Box::new(DestinationWriteFacts::not_applicable()),
@@ -1502,6 +1502,30 @@ mod tests {
         assert_eq!(error.rejected.len(), 2);
         assert_eq!(error.rejected[0].line, 1);
         assert_eq!(error.rejected[1].line, 2);
+    }
+
+    #[test]
+    fn local_file_source_counts_empty_jsonl_objects_when_no_fields_can_be_inferred() {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.jsonl");
+        fs::write(&source_path, "{}\nnot json\n").expect("write jsonl");
+
+        let source = LocalFileSource {
+            path: source_path,
+            format: Some("jsonl".to_string()),
+        };
+        let error = source
+            .read(&SchemaDirective::Inferred)
+            .err()
+            .expect("a source with no fields fails the load");
+
+        // The empty object parsed as a source record even though it declared no
+        // fields, so it must remain part of the known source count alongside the
+        // rejected line.
+        assert_eq!(error.failure.code, "malformed_jsonl");
+        assert_eq!(error.source_rows, Some(2));
+        assert_eq!(error.rejected.len(), 1);
+        assert_eq!(error.rejected[0].line, 2);
     }
 
     #[test]
