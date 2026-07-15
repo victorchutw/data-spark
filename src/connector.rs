@@ -17,8 +17,10 @@ use crate::rejection::{self, RejectedRecord};
 use crate::schema::{self, SchemaDirective};
 use crate::{DestinationDefinition, ExecutionFailure, LoadFailure, SourceDefinition};
 use arrow_array::RecordBatch;
+use arrow_schema::SchemaRef;
 use duckdb::vtab::arrow::{arrow_recordbatch_to_query_params, ArrowVTab};
 use duckdb::Connection;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -63,25 +65,106 @@ impl SourceRead {
     }
 }
 
-/// What a [`Destination`] hands back: the bytes it wrote plus the write facts it
-/// owns. `atomicity` / `strategy` are reported by the destination itself
-/// (ADR-0021) rather than hard-coded by the orchestrator, so a future
-/// destination reports its own without an orchestrator branch. `bytes_written`
-/// is `None` when the destination has no honest byte count to report: a
-/// database table, unlike a file directory, has no measurable on-disk extent of
-/// its own (ADR-0030).
+/// The destination-owned write facts serialized into the Load Report
+/// (ADR-0021). Keeping it typed until the report boundary prevents success and
+/// failure paths from constructing subtly different JSON shapes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DestinationWriteFacts {
+    atomicity: &'static str,
+    strategy: Option<&'static str>,
+}
+
+impl DestinationWriteFacts {
+    pub(crate) fn not_applicable() -> Self {
+        DestinationWriteFacts {
+            atomicity: "not_applicable",
+            strategy: None,
+        }
+    }
+
+    pub(crate) fn atomic(strategy: &'static str) -> Self {
+        DestinationWriteFacts {
+            atomicity: "atomic",
+            strategy: Some(strategy),
+        }
+    }
+
+    pub(crate) fn best_effort(strategy: &'static str) -> Self {
+        DestinationWriteFacts {
+            atomicity: "best_effort",
+            strategy: Some(strategy),
+        }
+    }
+
+    pub(crate) fn report_value(self) -> Value {
+        match self.strategy {
+            Some(strategy) => serde_json::json!({
+                "atomicity": self.atomicity,
+                "strategy": strategy
+            }),
+            None => serde_json::json!({
+                "atomicity": self.atomicity
+            }),
+        }
+    }
+}
+
+/// What a [`Destination`] hands back: the bytes it wrote plus the write facts
+/// it owns. `bytes_written` is `None` when the destination has no honest byte
+/// count to report: a database table, unlike a file directory, has no measurable
+/// on-disk extent of its own (ADR-0030).
 pub(crate) struct DestinationWrite {
     pub(crate) bytes_written: Option<u64>,
-    pub(crate) atomicity: &'static str,
-    pub(crate) strategy: &'static str,
+    pub(crate) facts: DestinationWriteFacts,
+}
+
+/// A destination failure plus the write facts the report can state honestly.
+/// Failures before a destination write begins use `not_applicable`; a connector
+/// that crosses a best-effort write boundary attaches its strategy so operators
+/// know the failed load may have changed the destination (ADR-0021).
+#[derive(Debug)]
+pub(crate) struct DestinationWriteFailure {
+    pub(crate) failure: LoadFailure,
+    pub(crate) facts: DestinationWriteFacts,
+    pub(crate) written_records: u64,
+}
+
+impl DestinationWriteFailure {
+    fn atomic(failure: LoadFailure, strategy: &'static str, written_records: u64) -> Self {
+        DestinationWriteFailure {
+            failure,
+            facts: DestinationWriteFacts::atomic(strategy),
+            written_records,
+        }
+    }
+
+    fn best_effort(failure: LoadFailure, strategy: &'static str, written_records: u64) -> Self {
+        DestinationWriteFailure {
+            failure,
+            facts: DestinationWriteFacts::best_effort(strategy),
+            written_records,
+        }
+    }
+}
+
+impl From<LoadFailure> for DestinationWriteFailure {
+    fn from(failure: LoadFailure) -> Self {
+        DestinationWriteFailure {
+            failure,
+            facts: DestinationWriteFacts::not_applicable(),
+            written_records: 0,
+        }
+    }
 }
 
 /// The rule that decides how a load changes the destination dataset. Parsed once
 /// from the raw load-definition string at the write-dispatch boundary; the
-/// report still carries the raw string. Only `full_refresh` exists today —
-/// append / merge (ADR-0008) widen this enum.
+/// report still carries the raw string. Full refresh and append exist today;
+/// merge follows them (ADR-0008).
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoadMode {
     FullRefresh,
+    Append,
 }
 
 impl LoadMode {
@@ -89,13 +172,23 @@ impl LoadMode {
     pub(crate) fn parse(load_mode: &str) -> Result<Self, LoadFailure> {
         match load_mode {
             "full_refresh" => Ok(LoadMode::FullRefresh),
+            "append" => Ok(LoadMode::Append),
             other => Err(LoadFailure {
                 code: "unsupported_load_mode",
                 message: format!("unsupported load mode: {other}"),
             }),
         }
     }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            LoadMode::FullRefresh => "full_refresh",
+            LoadMode::Append => "append",
+        }
+    }
 }
+
+const FULL_REFRESH_AND_APPEND_LOAD_MODES: &[LoadMode] = &[LoadMode::FullRefresh, LoadMode::Append];
 
 /// A named capability for reading records from a source. Reads and materializes
 /// under the load's schema directive behind one narrow call so the orchestrator
@@ -105,10 +198,27 @@ pub(crate) trait Source {
     fn read(&self, directive: &SchemaDirective) -> Result<SourceRead, ExecutionFailure>;
 }
 
-/// A named capability for writing records to a destination. Owns how it commits
-/// the write and reports its own write facts.
+/// A named capability for writing records to a destination. Declares the load
+/// modes it supports, owns how each commits, and reports its own write facts.
 pub(crate) trait Destination {
-    fn write(&self, batch: &RecordBatch, mode: LoadMode) -> Result<DestinationWrite, LoadFailure>;
+    fn supported_load_modes(&self) -> &'static [LoadMode];
+
+    fn validate_mode(&self, mode: LoadMode) -> Result<(), LoadFailure> {
+        if self.supported_load_modes().contains(&mode) {
+            Ok(())
+        } else {
+            Err(LoadFailure {
+                code: "unsupported_load_mode",
+                message: format!("destination does not support load mode: {}", mode.as_str()),
+            })
+        }
+    }
+
+    fn write(
+        &self,
+        batch: &RecordBatch,
+        mode: LoadMode,
+    ) -> Result<DestinationWrite, DestinationWriteFailure>;
 }
 
 /// Resolves a source definition to its connector. Pure: validates the connector
@@ -219,7 +329,9 @@ impl Source for LocalFileSource {
                         },
                         schema_decision: None,
                         source_rows: None,
+                        written_records: 0,
                         rejected,
+                        destination_write: Box::new(DestinationWriteFacts::not_applicable()),
                     });
                 }
                 merge_read_result(
@@ -253,22 +365,35 @@ impl LocalFileSource {
 }
 
 /// Writes an Arrow batch to a local Parquet directory. Full refresh stages the
-/// write and replaces the destination in one rename, reporting best-effort
-/// atomicity (ADR-0021).
+/// dataset and replaces the destination; append stages one new part before
+/// adding it to the existing directory. Both report best-effort atomicity
+/// (ADR-0021).
 struct ParquetDestination {
     path: PathBuf,
 }
 
 impl Destination for ParquetDestination {
-    fn write(&self, batch: &RecordBatch, mode: LoadMode) -> Result<DestinationWrite, LoadFailure> {
+    fn supported_load_modes(&self) -> &'static [LoadMode] {
+        FULL_REFRESH_AND_APPEND_LOAD_MODES
+    }
+
+    fn write(
+        &self,
+        batch: &RecordBatch,
+        mode: LoadMode,
+    ) -> Result<DestinationWrite, DestinationWriteFailure> {
         match mode {
             LoadMode::FullRefresh => self.write_full_refresh(batch),
+            LoadMode::Append => self.write_append(batch),
         }
     }
 }
 
 impl ParquetDestination {
-    fn write_full_refresh(&self, batch: &RecordBatch) -> Result<DestinationWrite, LoadFailure> {
+    fn write_full_refresh(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<DestinationWrite, DestinationWriteFailure> {
         let destination_path = self.path.as_path();
         let parent = destination_path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent).map_err(|error| LoadFailure {
@@ -305,80 +430,390 @@ impl ParquetDestination {
         })?;
 
         let parquet_file_path = staging_path.join("part-00000.parquet");
-        let file = File::create(&parquet_file_path).map_err(|error| LoadFailure {
-            code: "destination_write_failed",
-            message: format!(
-                "failed to create Parquet file {}: {error}",
-                parquet_file_path.display()
-            ),
+        let bytes_written = write_parquet_batch(&parquet_file_path, batch)?;
+
+        remove_path_if_exists(destination_path).map_err(|error| {
+            DestinationWriteFailure::best_effort(
+                LoadFailure {
+                    code: "destination_write_failed",
+                    message: format!(
+                        "failed to replace existing destination {}: {error}",
+                        destination_path.display()
+                    ),
+                },
+                "staging_then_replace",
+                0,
+            )
         })?;
-        let mut writer =
-            ArrowWriter::try_new(file, batch.schema(), None).map_err(|error| LoadFailure {
-                code: "destination_write_failed",
-                message: format!("failed to initialize Parquet writer: {error}"),
-            })?;
-        writer.write(batch).map_err(|error| LoadFailure {
-            code: "destination_write_failed",
-            message: format!("failed to write Parquet records: {error}"),
-        })?;
-        writer.close().map_err(|error| LoadFailure {
-            code: "destination_write_failed",
-            message: format!("failed to close Parquet writer: {error}"),
+        fs::rename(&staging_path, destination_path).map_err(|error| {
+            DestinationWriteFailure::best_effort(
+                LoadFailure {
+                    code: "destination_write_failed",
+                    message: format!(
+                        "failed to commit Parquet destination {}: {error}",
+                        destination_path.display()
+                    ),
+                },
+                "staging_then_replace",
+                0,
+            )
         })?;
 
-        remove_path_if_exists(destination_path).map_err(|error| LoadFailure {
+        Ok(DestinationWrite {
+            bytes_written: Some(bytes_written),
+            facts: DestinationWriteFacts::best_effort("staging_then_replace"),
+        })
+    }
+
+    fn write_append(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<DestinationWrite, DestinationWriteFailure> {
+        let destination_path = self.path.as_path();
+        fs::create_dir_all(destination_path).map_err(|error| LoadFailure {
             code: "destination_write_failed",
             message: format!(
-                "failed to replace existing destination {}: {error}",
+                "failed to prepare Parquet destination {}: {error}",
                 destination_path.display()
             ),
         })?;
-        fs::rename(&staging_path, destination_path).map_err(|error| LoadFailure {
-            code: "destination_write_failed",
-            message: format!(
-                "failed to commit Parquet destination {}: {error}",
-                destination_path.display()
-            ),
-        })?;
+        let append_batch = prepare_parquet_append_batch(destination_path, batch)?;
 
-        let bytes_written = directory_bytes(destination_path).map_err(|error| LoadFailure {
+        // A complete Parquet file is staged under a non-data extension and then
+        // renamed into the dataset. Readers never observe a partially written
+        // part, while the dataset-level append remains best-effort (ADR-0021).
+        let part_token = Uuid::new_v4();
+        let staging_path =
+            destination_path.join(format!(".part-{part_token}.data-spark-staging.tmp"));
+        let parquet_file_path = destination_path.join(format!("part-{part_token}.parquet"));
+        let bytes_written = match write_parquet_batch(&staging_path, &append_batch) {
+            Ok(bytes_written) => bytes_written,
+            Err(failure) => {
+                let _ = remove_path_if_exists(&staging_path);
+                return Err(failure.into());
+            }
+        };
+        if let Err(error) = fs::rename(&staging_path, &parquet_file_path) {
+            let _ = remove_path_if_exists(&staging_path);
+            return Err(DestinationWriteFailure::best_effort(
+                LoadFailure {
+                    code: "destination_write_failed",
+                    message: format!(
+                        "failed to commit Parquet part {}: {error}",
+                        parquet_file_path.display()
+                    ),
+                },
+                "staged_part_append",
+                0,
+            ));
+        }
+
+        Ok(DestinationWrite {
+            bytes_written: Some(bytes_written),
+            facts: DestinationWriteFacts::best_effort("staged_part_append"),
+        })
+    }
+}
+
+fn prepare_parquet_append_batch(
+    destination_path: &Path,
+    batch: &RecordBatch,
+) -> Result<RecordBatch, LoadFailure> {
+    let Some(destination_schema) = existing_parquet_schema(destination_path)? else {
+        return Ok(batch.clone());
+    };
+    align_batch_to_destination_schema(destination_path, batch, destination_schema)
+}
+
+fn existing_parquet_schema(destination_path: &Path) -> Result<Option<SchemaRef>, LoadFailure> {
+    let entries = fs::read_dir(destination_path).map_err(|error| LoadFailure {
+        code: "destination_write_failed",
+        message: format!(
+            "failed to inspect Parquet destination {}: {error}",
+            destination_path.display()
+        ),
+    })?;
+    let mut parquet_paths = entries
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| LoadFailure {
             code: "destination_write_failed",
             message: format!(
                 "failed to inspect Parquet destination {}: {error}",
                 destination_path.display()
             ),
         })?;
-        Ok(DestinationWrite {
-            bytes_written: Some(bytes_written),
-            atomicity: "best_effort",
-            strategy: "staging_then_replace",
-        })
+    parquet_paths.retain(|path| {
+        path.extension().and_then(|extension| extension.to_str()) == Some("parquet")
+    });
+    parquet_paths.sort();
+
+    let mut destination_schema: Option<SchemaRef> = None;
+    for parquet_path in parquet_paths {
+        let file = File::open(&parquet_path).map_err(|error| LoadFailure {
+            code: "destination_write_failed",
+            message: format!(
+                "failed to open existing Parquet file {}: {error}",
+                parquet_path.display()
+            ),
+        })?;
+        let builder =
+            ParquetRecordBatchReaderBuilder::try_new(file).map_err(|error| LoadFailure {
+                code: "destination_write_failed",
+                message: format!(
+                    "failed to read existing Parquet schema {}: {error}",
+                    parquet_path.display()
+                ),
+            })?;
+        let schema = builder.schema().clone();
+        if let Some(expected) = &destination_schema {
+            if expected.as_ref() != schema.as_ref() {
+                return Err(LoadFailure {
+                    code: "destination_write_failed",
+                    message: format!(
+                        "Parquet destination {} contains inconsistent schemas",
+                        destination_path.display()
+                    ),
+                });
+            }
+        } else {
+            destination_schema = Some(schema);
+        }
     }
+    Ok(destination_schema)
+}
+
+fn align_batch_to_destination_schema(
+    destination_path: &Path,
+    batch: &RecordBatch,
+    destination_schema: SchemaRef,
+) -> Result<RecordBatch, LoadFailure> {
+    let source_schema = batch.schema();
+    if source_schema.fields().len() != destination_schema.fields().len() {
+        return Err(parquet_schema_mismatch(destination_path));
+    }
+
+    let mut columns = Vec::with_capacity(destination_schema.fields().len());
+    for destination_field in destination_schema.fields() {
+        let source_index = source_schema
+            .index_of(destination_field.name())
+            .map_err(|_| parquet_schema_mismatch(destination_path))?;
+        let source_field = source_schema.field(source_index);
+        let column = batch.column(source_index);
+        if source_field.data_type() != destination_field.data_type()
+            || (!destination_field.is_nullable() && column.null_count() > 0)
+        {
+            return Err(parquet_schema_mismatch(destination_path));
+        }
+        columns.push(column.clone());
+    }
+
+    RecordBatch::try_new(destination_schema, columns).map_err(|error| LoadFailure {
+        code: "destination_write_failed",
+        message: format!(
+            "failed to align append records with Parquet destination {}: {error}",
+            destination_path.display()
+        ),
+    })
+}
+
+fn parquet_schema_mismatch(destination_path: &Path) -> LoadFailure {
+    LoadFailure {
+        code: "destination_write_failed",
+        message: format!(
+            "append schema does not match Parquet destination {}",
+            destination_path.display()
+        ),
+    }
+}
+
+fn write_parquet_batch(path: &Path, batch: &RecordBatch) -> Result<u64, LoadFailure> {
+    let file = File::create(path).map_err(|error| LoadFailure {
+        code: "destination_write_failed",
+        message: format!("failed to create Parquet file {}: {error}", path.display()),
+    })?;
+    let mut writer =
+        ArrowWriter::try_new(file, batch.schema(), None).map_err(|error| LoadFailure {
+            code: "destination_write_failed",
+            message: format!("failed to initialize Parquet writer: {error}"),
+        })?;
+    writer.write(batch).map_err(|error| LoadFailure {
+        code: "destination_write_failed",
+        message: format!("failed to write Parquet records: {error}"),
+    })?;
+    writer.finish().map_err(|error| LoadFailure {
+        code: "destination_write_failed",
+        message: format!("failed to finish Parquet writer: {error}"),
+    })?;
+    Ok(writer.bytes_written() as u64)
 }
 
 /// Writes an Arrow batch into a table of a local DuckDB database file named by
 /// the destination path, with the table named by the load definition's
 /// `dataset`. Full refresh replaces the table in one
-/// `CREATE OR REPLACE TABLE "<dataset>" AS SELECT * FROM arrow(?, ?)` statement
-/// against the registered Arrow table function, so Arrow-to-DuckDB type mapping
-/// is delegated to DuckDB and the single statement auto-commits as an Atomic
-/// Commit: the new table becomes visible completely or the old table is left
-/// untouched (ADR-0030).
+/// `CREATE OR REPLACE TABLE "<dataset>" AS SELECT * FROM arrow(?, ?)` statement;
+/// append reads the existing table's Arrow schema, aligns matching fields by
+/// name and exact type, then inserts through the same Arrow table function
+/// without replacing existing records. Arrow-to-DuckDB type mapping stays
+/// delegated to DuckDB (ADR-0030).
 struct DuckDbDestination {
     path: PathBuf,
     dataset: String,
 }
 
 impl Destination for DuckDbDestination {
-    fn write(&self, batch: &RecordBatch, mode: LoadMode) -> Result<DestinationWrite, LoadFailure> {
+    fn supported_load_modes(&self) -> &'static [LoadMode] {
+        FULL_REFRESH_AND_APPEND_LOAD_MODES
+    }
+
+    fn write(
+        &self,
+        batch: &RecordBatch,
+        mode: LoadMode,
+    ) -> Result<DestinationWrite, DestinationWriteFailure> {
         match mode {
             LoadMode::FullRefresh => self.write_full_refresh(batch),
+            LoadMode::Append => self.write_append(batch),
         }
     }
 }
 
 impl DuckDbDestination {
-    fn write_full_refresh(&self, batch: &RecordBatch) -> Result<DestinationWrite, LoadFailure> {
+    fn write_full_refresh(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<DestinationWrite, DestinationWriteFailure> {
+        let connection = self.open_arrow_connection()?;
+
+        // The one statement auto-commits, so the replace needs no explicit
+        // BEGIN / COMMIT until a multi-statement load mode does (ADR-0030). The
+        // table identifier is always double-quote-escaped (`"` doubled) rather
+        // than restricted to a character allowlist.
+        let statement = format!(
+            "CREATE OR REPLACE TABLE {} AS SELECT * FROM arrow(?, ?)",
+            self.quoted_dataset()
+        );
+        connection
+            .execute(&statement, arrow_recordbatch_to_query_params(batch.clone()))
+            .map_err(|error| {
+                DestinationWriteFailure::atomic(
+                    LoadFailure {
+                        code: "destination_write_failed",
+                        message: format!(
+                            "failed to replace DuckDB table {} in {}: {error}",
+                            self.dataset,
+                            self.path.display()
+                        ),
+                    },
+                    "transactional_replace",
+                    0,
+                )
+            })?;
+        connection.close().map_err(|(_, error)| {
+            DestinationWriteFailure::atomic(
+                LoadFailure {
+                    code: "destination_write_failed",
+                    message: format!(
+                        "failed to close DuckDB database {}: {error}",
+                        self.path.display()
+                    ),
+                },
+                "transactional_replace",
+                batch.num_rows() as u64,
+            )
+        })?;
+
+        Ok(DestinationWrite {
+            bytes_written: None,
+            facts: DestinationWriteFacts::atomic("transactional_replace"),
+        })
+    }
+
+    fn write_append(
+        &self,
+        batch: &RecordBatch,
+    ) -> Result<DestinationWrite, DestinationWriteFailure> {
+        let connection = self.open_arrow_connection()?;
+        // Inspect and align before crossing the append write boundary: DuckDB's
+        // INSERT BY NAME would otherwise coerce lossy types or fill omissions
+        // with nulls instead of enforcing the destination dataset schema.
+        let append_batch = self.prepare_append_batch(&connection, batch)?;
+
+        let statement = format!(
+            "INSERT INTO {} BY NAME SELECT * FROM arrow(?, ?)",
+            self.quoted_dataset()
+        );
+        connection
+            .execute(
+                &statement,
+                arrow_recordbatch_to_query_params(append_batch.clone()),
+            )
+            .map_err(|error| {
+                DestinationWriteFailure::best_effort(
+                    LoadFailure {
+                        code: "destination_write_failed",
+                        message: format!(
+                            "failed to append to DuckDB table {} in {}: {error}",
+                            self.dataset,
+                            self.path.display()
+                        ),
+                    },
+                    "insert",
+                    0,
+                )
+            })?;
+        connection.close().map_err(|(_, error)| {
+            DestinationWriteFailure::best_effort(
+                LoadFailure {
+                    code: "destination_write_failed",
+                    message: format!(
+                        "failed to close DuckDB database {}: {error}",
+                        self.path.display()
+                    ),
+                },
+                "insert",
+                append_batch.num_rows() as u64,
+            )
+        })?;
+
+        Ok(DestinationWrite {
+            bytes_written: None,
+            facts: DestinationWriteFacts::best_effort("insert"),
+        })
+    }
+
+    fn prepare_append_batch(
+        &self,
+        connection: &Connection,
+        batch: &RecordBatch,
+    ) -> Result<RecordBatch, LoadFailure> {
+        let statement = format!("SELECT * FROM {} LIMIT 0", self.quoted_dataset());
+        let mut statement = connection
+            .prepare(&statement)
+            .map_err(|error| LoadFailure {
+                code: "destination_write_failed",
+                message: format!(
+                    "failed to inspect DuckDB table {} in {} before append: {error}",
+                    self.dataset,
+                    self.path.display()
+                ),
+            })?;
+        let destination_schema = statement
+            .query_arrow([])
+            .map_err(|error| LoadFailure {
+                code: "destination_write_failed",
+                message: format!(
+                    "failed to inspect DuckDB table {} in {} before append: {error}",
+                    self.dataset,
+                    self.path.display()
+                ),
+            })?
+            .get_schema();
+
+        align_batch_to_duckdb_schema(self, batch, destination_schema)
+    }
+
+    fn open_arrow_connection(&self) -> Result<Connection, LoadFailure> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent).map_err(|error| LoadFailure {
             code: "destination_write_failed",
@@ -401,38 +836,57 @@ impl DuckDbDestination {
                 code: "destination_write_failed",
                 message: format!("failed to register the DuckDB Arrow table function: {error}"),
             })?;
+        Ok(connection)
+    }
 
-        // The one statement auto-commits, so the replace needs no explicit
-        // BEGIN / COMMIT until a multi-statement load mode does (ADR-0030). The
-        // table identifier is always double-quote-escaped (`"` doubled) rather
-        // than restricted to a character allowlist.
-        let statement = format!(
-            "CREATE OR REPLACE TABLE \"{}\" AS SELECT * FROM arrow(?, ?)",
-            self.dataset.replace('"', "\"\"")
-        );
-        connection
-            .execute(&statement, arrow_recordbatch_to_query_params(batch.clone()))
-            .map_err(|error| LoadFailure {
-                code: "destination_write_failed",
-                message: format!(
-                    "failed to replace DuckDB table {} in {}: {error}",
-                    self.dataset,
-                    self.path.display()
-                ),
-            })?;
-        connection.close().map_err(|(_, error)| LoadFailure {
-            code: "destination_write_failed",
-            message: format!(
-                "failed to close DuckDB database {}: {error}",
-                self.path.display()
-            ),
-        })?;
+    fn quoted_dataset(&self) -> String {
+        format!("\"{}\"", self.dataset.replace('"', "\"\""))
+    }
+}
 
-        Ok(DestinationWrite {
-            bytes_written: None,
-            atomicity: "atomic",
-            strategy: "transactional_replace",
-        })
+fn align_batch_to_duckdb_schema(
+    destination: &DuckDbDestination,
+    batch: &RecordBatch,
+    destination_schema: SchemaRef,
+) -> Result<RecordBatch, LoadFailure> {
+    let source_schema = batch.schema();
+    if source_schema.fields().len() != destination_schema.fields().len() {
+        return Err(duckdb_schema_mismatch(destination));
+    }
+
+    let mut columns = Vec::with_capacity(destination_schema.fields().len());
+    for destination_field in destination_schema.fields() {
+        let source_index = source_schema
+            .index_of(destination_field.name())
+            .map_err(|_| duckdb_schema_mismatch(destination))?;
+        let source_field = source_schema.field(source_index);
+        let column = batch.column(source_index);
+        if source_field.data_type() != destination_field.data_type()
+            || (!destination_field.is_nullable() && column.null_count() > 0)
+        {
+            return Err(duckdb_schema_mismatch(destination));
+        }
+        columns.push(column.clone());
+    }
+
+    RecordBatch::try_new(destination_schema, columns).map_err(|error| LoadFailure {
+        code: "destination_write_failed",
+        message: format!(
+            "failed to align append records with DuckDB destination {} in {}: {error}",
+            destination.dataset,
+            destination.path.display()
+        ),
+    })
+}
+
+fn duckdb_schema_mismatch(destination: &DuckDbDestination) -> LoadFailure {
+    LoadFailure {
+        code: "destination_write_failed",
+        message: format!(
+            "append schema does not match DuckDB destination {} in {}",
+            destination.dataset,
+            destination.path.display()
+        ),
     }
 }
 
@@ -696,20 +1150,6 @@ fn remove_path_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
-fn directory_bytes(path: &Path) -> io::Result<u64> {
-    let mut total = 0;
-    for entry in fs::read_dir(path)? {
-        let path = entry?.path();
-        let metadata = fs::metadata(&path)?;
-        if metadata.is_dir() {
-            total += directory_bytes(&path)?;
-        } else {
-            total += metadata.len();
-        }
-    }
-    Ok(total)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,17 +1225,18 @@ mod tests {
     }
 
     #[test]
-    fn load_mode_parse_accepts_full_refresh_and_rejects_unknown() {
+    fn load_mode_parse_accepts_full_refresh_and_append_and_rejects_unknown() {
         assert!(matches!(
             LoadMode::parse("full_refresh"),
             Ok(LoadMode::FullRefresh)
         ));
+        assert!(matches!(LoadMode::parse("append"), Ok(LoadMode::Append)));
 
-        let error = LoadMode::parse("append")
+        let error = LoadMode::parse("merge")
             .err()
             .expect("unknown load mode rejected");
         assert_eq!(error.code, "unsupported_load_mode");
-        assert_eq!(error.message, "unsupported load mode: append");
+        assert_eq!(error.message, "unsupported load mode: merge");
     }
 
     // ---- Round-trips (temp dir): source read and destination write ----
@@ -1052,8 +1493,13 @@ mod tests {
                 .expect("parquet measures written bytes")
                 > 0
         );
-        assert_eq!(written.atomicity, "best_effort");
-        assert_eq!(written.strategy, "staging_then_replace");
+        assert_eq!(
+            written.facts.report_value(),
+            serde_json::json!({
+                "atomicity": "best_effort",
+                "strategy": "staging_then_replace"
+            })
+        );
 
         let read_back = read_single_parquet_batch(&destination_path);
         assert_eq!(read_back.num_rows(), 2);
@@ -1086,8 +1532,13 @@ mod tests {
             .expect("write duckdb");
 
         assert_eq!(written.bytes_written, None);
-        assert_eq!(written.atomicity, "atomic");
-        assert_eq!(written.strategy, "transactional_replace");
+        assert_eq!(
+            written.facts.report_value(),
+            serde_json::json!({
+                "atomicity": "atomic",
+                "strategy": "transactional_replace"
+            })
+        );
 
         let read_back = read_single_duckdb_batch(&database_path, "customers");
         assert_eq!(read_back.num_rows(), 2);

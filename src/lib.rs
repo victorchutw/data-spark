@@ -12,7 +12,10 @@ mod connector;
 mod rejection;
 mod schema;
 
-use connector::{destination_connector, source_connector, DestinationWrite, LoadMode, SourceRead};
+use connector::{
+    destination_connector, source_connector, DestinationWrite, DestinationWriteFacts, LoadMode,
+    SourceRead,
+};
 
 const LOAD_REPORT_VERSION: u8 = 1;
 const LOAD_REPORT_FILENAME: &str = "load-report.json";
@@ -81,7 +84,7 @@ impl LoadReport {
             row_counts: details.row_counts,
             byte_counts: details.byte_counts,
             rejected_records,
-            destination_write: details.destination_write,
+            destination_write: details.destination_write.report_value(),
             execution: details.execution,
             timings,
             exit_status: "succeeded",
@@ -113,7 +116,7 @@ impl LoadReport {
             schema_decision: failure.schema_decision,
             row_counts: RowCounts {
                 source: failure.source_rows,
-                written: 0,
+                written: failure.written_records,
                 rejected: rejected_count,
             },
             byte_counts: ByteCounts {
@@ -121,9 +124,7 @@ impl LoadReport {
                 destination: None,
             },
             rejected_records,
-            destination_write: json!({
-                "atomicity": "not_applicable"
-            }),
+            destination_write: failure.destination_write.report_value(),
             execution: json!({
                 "record_format": "not_started",
                 "batch_count": 0
@@ -234,7 +235,7 @@ struct ExecutionDetails {
     row_counts: RowCounts,
     byte_counts: ByteCounts,
     rejected: Vec<rejection::RejectedRecord>,
-    destination_write: Value,
+    destination_write: DestinationWriteFacts,
     execution: Value,
 }
 
@@ -251,7 +252,9 @@ struct ReportableFailure {
     load_mode: String,
     schema_decision: Value,
     source_rows: u64,
+    written_records: u64,
     rejected: Vec<rejection::RejectedRecord>,
+    destination_write: DestinationWriteFacts,
     code: &'static str,
     message: String,
 }
@@ -268,7 +271,9 @@ impl ReportableFailure {
             load_mode: "full_refresh".to_string(),
             schema_decision: not_evaluated_schema_decision(),
             source_rows: 0,
+            written_records: 0,
             rejected: Vec::new(),
+            destination_write: DestinationWriteFacts::not_applicable(),
             code,
             message,
         }
@@ -299,7 +304,9 @@ struct ExecutionFailure {
     // Boxed so the Err variant stays small enough to return by value.
     schema_decision: Option<Box<Value>>,
     source_rows: Option<u64>,
+    written_records: u64,
     rejected: Vec<rejection::RejectedRecord>,
+    destination_write: Box<DestinationWriteFacts>,
 }
 
 impl From<LoadFailure> for ExecutionFailure {
@@ -308,7 +315,9 @@ impl From<LoadFailure> for ExecutionFailure {
             failure,
             schema_decision: None,
             source_rows: None,
+            written_records: 0,
             rejected: Vec::new(),
+            destination_write: Box::new(DestinationWriteFacts::not_applicable()),
         }
     }
 }
@@ -420,7 +429,9 @@ fn execute_load_definition(definition_path: &Path) -> Result<ExecutionDetails, R
                 load_mode,
                 schema_decision: not_evaluated_schema_decision(),
                 source_rows: 0,
+                written_records: 0,
                 rejected: Vec::new(),
+                destination_write: DestinationWriteFacts::not_applicable(),
                 code: "unsupported_load_definition_version",
                 message: format!("unsupported load definition version: {version}"),
             })
@@ -433,7 +444,9 @@ fn execute_load_definition(definition_path: &Path) -> Result<ExecutionDetails, R
                 load_mode,
                 schema_decision: not_evaluated_schema_decision(),
                 source_rows: 0,
+                written_records: 0,
                 rejected: Vec::new(),
+                destination_write: DestinationWriteFacts::not_applicable(),
                 code: "missing_load_definition_version",
                 message: "load definition version is required".to_string(),
             })
@@ -450,7 +463,9 @@ fn execute_load_definition(definition_path: &Path) -> Result<ExecutionDetails, R
             .map(|decision| *decision)
             .unwrap_or_else(not_evaluated_schema_decision),
         source_rows: execution_failure.source_rows.unwrap_or(0),
+        written_records: execution_failure.written_records,
         rejected: execution_failure.rejected,
+        destination_write: *execution_failure.destination_write,
         code: execution_failure.failure.code,
         message: execution_failure.failure.message,
     })
@@ -482,6 +497,7 @@ fn execute_supported_load(
     let mode = LoadMode::parse(&load_mode)?;
     let source_port = source_connector(source)?;
     let destination_port = destination_connector(destination, definition.dataset.as_deref())?;
+    destination_port.validate_mode(mode)?;
     let directive = resolve_schema_directive(definition.schema.as_ref())?;
 
     let SourceRead {
@@ -513,7 +529,9 @@ fn execute_supported_load(
             },
             schema_decision: Some(Box::new(schema_decision)),
             source_rows: Some(source_rows),
+            written_records: 0,
             rejected,
+            destination_write: Box::new(DestinationWriteFacts::not_applicable()),
         });
     }
 
@@ -530,16 +548,17 @@ fn execute_supported_load(
     })();
     let DestinationWrite {
         bytes_written,
-        atomicity,
-        strategy,
+        facts,
     } = match write_result {
         Ok(write) => write,
-        Err(failure) => {
+        Err(write_failure) => {
             return Err(ExecutionFailure {
-                failure,
+                failure: write_failure.failure,
                 schema_decision: Some(Box::new(schema_decision)),
                 source_rows: Some(source_rows),
+                written_records: write_failure.written_records,
                 rejected,
+                destination_write: Box::new(write_failure.facts),
             })
         }
     };
@@ -560,10 +579,7 @@ fn execute_supported_load(
             destination: bytes_written,
         },
         rejected,
-        destination_write: json!({
-            "atomicity": atomicity,
-            "strategy": strategy
-        }),
+        destination_write: facts,
         execution: json!({
             "record_format": "arrow_record_batch",
             "batch_count": 1
@@ -735,10 +751,7 @@ mod tests {
                 destination: Some(128),
             },
             rejected: vec![rejected_record(3)],
-            destination_write: json!({
-                "atomicity": "best_effort",
-                "strategy": "replace_directory"
-            }),
+            destination_write: DestinationWriteFacts::best_effort("replace_directory"),
             execution: json!({ "record_format": "arrow_record_batch", "batch_count": 1 }),
         };
 
@@ -805,7 +818,7 @@ mod tests {
                 destination: Some(128),
             },
             rejected: Vec::new(),
-            destination_write: json!({}),
+            destination_write: DestinationWriteFacts::not_applicable(),
             execution: json!({}),
         };
 
@@ -829,7 +842,9 @@ mod tests {
             load_mode: "full_refresh".to_string(),
             schema_decision: not_evaluated_schema_decision(),
             source_rows: 0,
+            written_records: 0,
             rejected: Vec::new(),
+            destination_write: DestinationWriteFacts::not_applicable(),
             code: "missing_source",
             message: "load definition source is required".to_string(),
         };
@@ -891,7 +906,9 @@ mod tests {
             load_mode: "full_refresh".to_string(),
             schema_decision: json!({ "mode": "inferred" }),
             source_rows: 3,
+            written_records: 0,
             rejected: vec![rejected_record(2), rejected_record(3)],
+            destination_write: DestinationWriteFacts::not_applicable(),
             code: "reject_threshold_exceeded",
             message: "rejected 2 of 3 records, exceeding the reject threshold of 0".to_string(),
         };

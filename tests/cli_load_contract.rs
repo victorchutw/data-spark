@@ -128,6 +128,71 @@ load_mode: full_refresh
 }
 
 #[test]
+fn local_csv_append_preserves_existing_parquet_records_and_reports_the_load() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+
+    fs::write(&source_path, "customer_id,name\n1,Ada\n2,Grace\n").expect("write first csv");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "parquet",
+        &destination_path,
+        "full_refresh",
+        None,
+    );
+    let first = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-first"),
+        &definition_path,
+        true,
+    );
+
+    fs::write(&source_path, "name,customer_id\nKatherine,3\n").expect("write append csv");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "parquet",
+        &destination_path,
+        "append",
+        None,
+    );
+    let append = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-append"),
+        &definition_path,
+        true,
+    );
+
+    assert_eq!(
+        id_name_records(&read_parquet_batches(&destination_path)),
+        vec![
+            (1, "Ada".to_string()),
+            (2, "Grace".to_string()),
+            (3, "Katherine".to_string()),
+        ]
+    );
+    assert_successful_append(&append, "staged_part_append");
+    assert_ne!(first.report["load_id"], append.report["load_id"]);
+    assert!(!append.report["load_id"]
+        .as_str()
+        .expect("append load id")
+        .is_empty());
+    assert_eq!(
+        PathBuf::from(
+            append.report["artifact_dir"]
+                .as_str()
+                .expect("artifact directory")
+        ),
+        append.report_path.parent().expect("report parent")
+    );
+}
+
+#[test]
 fn local_csv_full_refresh_writes_readable_duckdb_table_report_and_summary() {
     let work = TempDir::new().expect("tempdir");
     let source_path = work.path().join("customers.csv");
@@ -242,6 +307,69 @@ load_mode: full_refresh
     assert!(stdout.contains("Records read: 2"));
     assert!(stdout.contains("Records written: 2"));
     assert!(stdout.contains(report_path.to_str().expect("report path")));
+}
+
+#[test]
+fn local_csv_append_preserves_existing_duckdb_records_and_reports_the_load() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    fs::write(&source_path, "customer_id,name\n1,Ada\n2,Grace\n").expect("write first csv");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "full_refresh",
+        None,
+    );
+    run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-first"),
+        &definition_path,
+        true,
+    );
+
+    // Reordered source fields still append by name rather than silently swapping
+    // same-typed values by position.
+    fs::write(&source_path, "name,customer_id\nKatherine,3\n").expect("write append csv");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "append",
+        None,
+    );
+    let append = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-append"),
+        &definition_path,
+        true,
+    );
+
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    let customer_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_id is int64");
+    let names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name is string");
+    assert_eq!(batch.num_rows(), 3);
+    assert_eq!(customer_ids.values(), &[1, 2, 3]);
+    assert_eq!(names.value(0), "Ada");
+    assert_eq!(names.value(1), "Grace");
+    assert_eq!(names.value(2), "Katherine");
+    assert!(append.report["byte_counts"]["destination"].is_null());
+    assert_successful_append(&append, "insert");
 }
 
 #[test]
@@ -365,6 +493,67 @@ load_mode: full_refresh
     assert!(stdout.contains("Records read: 2"));
     assert!(stdout.contains("Records written: 2"));
     assert!(stdout.contains(report_path.to_str().expect("report path")));
+}
+
+#[test]
+fn local_jsonl_append_preserves_existing_parquet_records_and_reports_the_load() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+
+    fs::write(
+        &source_path,
+        "{\"customer_id\": 1, \"name\": \"Ada\", \"active\": true}\n\
+         {\"customer_id\": 2, \"name\": \"Grace\", \"active\": false}\n",
+    )
+    .expect("write first jsonl");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "jsonl",
+        "parquet",
+        &destination_path,
+        "full_refresh",
+        None,
+    );
+    run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-first"),
+        &definition_path,
+        true,
+    );
+
+    fs::write(
+        &source_path,
+        "{\"name\": \"Katherine\", \"active\": true, \"customer_id\": 3}\n",
+    )
+    .expect("write append jsonl");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "jsonl",
+        "parquet",
+        &destination_path,
+        "append",
+        None,
+    );
+    let append = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-append"),
+        &definition_path,
+        true,
+    );
+
+    assert_eq!(
+        id_name_records(&read_parquet_batches(&destination_path)),
+        vec![
+            (1, "Ada".to_string()),
+            (2, "Grace".to_string()),
+            (3, "Katherine".to_string()),
+        ]
+    );
+    assert_successful_append(&append, "staged_part_append");
 }
 
 #[test]
@@ -492,6 +681,83 @@ load_mode: full_refresh
     assert!(stdout.contains("Records read: 2"));
     assert!(stdout.contains("Records written: 2"));
     assert!(stdout.contains(report_path.to_str().expect("report path")));
+}
+
+#[test]
+fn local_jsonl_append_preserves_existing_duckdb_records_and_reports_the_load() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    fs::write(
+        &source_path,
+        "{\"customer_id\": 1, \"name\": \"Ada\", \"active\": true}\n\
+         {\"customer_id\": 2, \"name\": \"Grace\", \"active\": false}\n",
+    )
+    .expect("write first jsonl");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "jsonl",
+        "duckdb",
+        &database_path,
+        "full_refresh",
+        None,
+    );
+    run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-first"),
+        &definition_path,
+        true,
+    );
+
+    fs::write(
+        &source_path,
+        "{\"name\": \"Katherine\", \"active\": true, \"customer_id\": 3}\n",
+    )
+    .expect("write append jsonl");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "jsonl",
+        "duckdb",
+        &database_path,
+        "append",
+        None,
+    );
+    let append = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-append"),
+        &definition_path,
+        true,
+    );
+
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    let customer_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_id is int64");
+    let names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name is string");
+    let actives = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .expect("active is boolean");
+    assert_eq!(batch.num_rows(), 3);
+    assert_eq!(customer_ids.values(), &[1, 2, 3]);
+    assert_eq!(names.value(0), "Ada");
+    assert_eq!(names.value(1), "Grace");
+    assert_eq!(names.value(2), "Katherine");
+    assert!(actives.value(0));
+    assert!(!actives.value(1));
+    assert!(actives.value(2));
+    assert_successful_append(&append, "insert");
 }
 
 #[test]
@@ -1879,6 +2145,376 @@ schema:
 }
 
 #[test]
+fn parquet_append_with_an_incompatible_schema_fails_without_changing_the_destination() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+
+    fs::write(&source_path, "customer_id,name\n1,Ada\n").expect("write first csv");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "parquet",
+        &destination_path,
+        "full_refresh",
+        None,
+    );
+    run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-first"),
+        &definition_path,
+        true,
+    );
+
+    fs::write(&source_path, "customer_id,total\n2,7\n").expect("write incompatible csv");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "parquet",
+        &destination_path,
+        "append",
+        None,
+    );
+    let append = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-append"),
+        &definition_path,
+        false,
+    );
+    let report = &append.report;
+
+    assert_eq!(report["load_mode"], "append");
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert_eq!(report["row_counts"]["source"], 1);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+    assert_eq!(
+        id_name_records(&read_parquet_batches(&destination_path)),
+        vec![(1, "Ada".to_string())]
+    );
+    assert!(append.stdout.contains("Status: failed"));
+    assert!(append.stdout.contains("Load mode: append"));
+    assert!(append
+        .stdout
+        .contains(append.report_path.to_str().expect("report path")));
+}
+
+#[test]
+fn append_validation_failure_leaves_the_destination_unchanged_and_reports_no_write() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let pinned_path = work.path().join("customers.schema.yml");
+    let definition_path = work.path().join("load.yml");
+
+    fs::write(&source_path, "customer_id,total\n1,10.5\n").expect("write first csv");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "full_refresh",
+        Some(&pinned_path),
+    );
+    run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-first"),
+        &definition_path,
+        true,
+    );
+
+    fs::write(&source_path, "customer_id,total\nabc,7\n").expect("write misfit csv");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "append",
+        Some(&pinned_path),
+    );
+    let append = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-append"),
+        &definition_path,
+        false,
+    );
+    let report = &append.report;
+
+    assert_eq!(report["load_mode"], "append");
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(report["error_summary"]["code"], "reject_threshold_exceeded");
+    assert_eq!(report["schema_decision"]["mode"], "pinned");
+    assert_eq!(report["schema_decision"]["drift_status"], "none");
+    assert_eq!(report["row_counts"]["source"], 1);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 1);
+    assert_eq!(report["rejected_records"]["count"], 1);
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("rejected-record artifact"),
+    );
+    let rejected = read_rejected_records(&artifact_path);
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0]["code"], "type_coercion_failed");
+    assert_eq!(rejected[0]["field"], "customer_id");
+
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 1);
+    let customer_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_id is int64");
+    assert_eq!(customer_ids.value(0), 1);
+
+    assert!(append.stdout.contains("Status: failed"));
+    assert!(append.stdout.contains("Load mode: append"));
+    assert!(append.stdout.contains("Records read: 1"));
+    assert!(append.stdout.contains("Records written: 0"));
+    assert!(append.stdout.contains("Records rejected: 1"));
+    assert!(append
+        .stdout
+        .contains(append.report_path.to_str().expect("report path")));
+}
+
+#[test]
+fn duckdb_append_rejects_lossy_type_coercion_before_writing() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    {
+        let connection = duckdb::Connection::open(&database_path).expect("open DuckDB destination");
+        connection
+            .execute_batch("CREATE TABLE customers (id BIGINT); INSERT INTO customers VALUES (1)")
+            .expect("seed DuckDB destination");
+    }
+
+    fs::write(&source_path, "id\n2.9\n").expect("write lossy append csv");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "append",
+        None,
+    );
+    let append = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-append"),
+        &definition_path,
+        false,
+    );
+    let report = &append.report;
+
+    assert_eq!(report["load_mode"], "append");
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("append schema does not match DuckDB destination"));
+    assert_eq!(report["schema_decision"]["mode"], "inferred");
+    assert_eq!(report["row_counts"]["source"], 1);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert_eq!(report["rejected_records"]["count"], 0);
+    assert!(report["rejected_records"]["artifact"].is_null());
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+    assert!(report["destination_write"]["strategy"].is_null());
+    assert!(!report["load_id"].as_str().expect("load id").is_empty());
+    assert_eq!(
+        PathBuf::from(report["artifact_dir"].as_str().expect("artifact directory")),
+        append.report_path.parent().expect("report parent")
+    );
+
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 1);
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id is int64");
+    assert_eq!(ids.value(0), 1);
+
+    assert!(append.stdout.contains("Status: failed"));
+    assert!(append.stdout.contains("Records read: 1"));
+    assert!(append.stdout.contains("Records written: 0"));
+    assert!(append.stdout.contains("Records rejected: 0"));
+    assert!(append
+        .stdout
+        .contains(append.report_path.to_str().expect("report path")));
+}
+
+#[test]
+fn duckdb_append_rejects_missing_destination_field_before_writing() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    {
+        let connection = duckdb::Connection::open(&database_path).expect("open DuckDB destination");
+        connection
+            .execute_batch(
+                "CREATE TABLE customers (id BIGINT, name VARCHAR); \
+                 INSERT INTO customers VALUES (1, 'Ada')",
+            )
+            .expect("seed DuckDB destination");
+    }
+
+    fs::write(&source_path, "id\n2\n").expect("write missing-field append csv");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "append",
+        None,
+    );
+    let append = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-append"),
+        &definition_path,
+        false,
+    );
+    let report = &append.report;
+
+    assert_eq!(report["load_mode"], "append");
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("append schema does not match DuckDB destination"));
+    assert_eq!(report["schema_decision"]["mode"], "inferred");
+    assert_eq!(report["row_counts"]["source"], 1);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert_eq!(report["rejected_records"]["count"], 0);
+    assert!(report["rejected_records"]["artifact"].is_null());
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+    assert!(report["destination_write"]["strategy"].is_null());
+    assert!(!report["load_id"].as_str().expect("load id").is_empty());
+    assert_eq!(
+        PathBuf::from(report["artifact_dir"].as_str().expect("artifact directory")),
+        append.report_path.parent().expect("report parent")
+    );
+
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 1);
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("id is int64");
+    let names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name is string");
+    assert_eq!(ids.value(0), 1);
+    assert_eq!(names.value(0), "Ada");
+
+    assert!(append.stdout.contains("Status: failed"));
+    assert!(append.stdout.contains("Records read: 1"));
+    assert!(append.stdout.contains("Records written: 0"));
+    assert!(append.stdout.contains("Records rejected: 0"));
+    assert!(append
+        .stdout
+        .contains(append.report_path.to_str().expect("report path")));
+}
+
+#[test]
+fn append_destination_write_failure_reports_best_effort_and_preserves_existing_records() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    {
+        let connection = duckdb::Connection::open(&database_path).expect("open DuckDB destination");
+        connection
+            .execute_batch(
+                "CREATE TABLE customers (customer_id BIGINT PRIMARY KEY, name VARCHAR); \
+                 INSERT INTO customers VALUES (1, 'Ada')",
+            )
+            .expect("seed constrained DuckDB destination");
+    }
+
+    // The source schema matches the destination, but the duplicate primary key
+    // makes the insert itself fail after the best-effort write boundary.
+    fs::write(&source_path, "customer_id,name\n1,Grace\n").expect("write duplicate-key append csv");
+    write_load_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "append",
+        None,
+    );
+    let append = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-append"),
+        &definition_path,
+        false,
+    );
+    let report = &append.report;
+
+    assert_eq!(report["load_mode"], "append");
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert_eq!(report["schema_decision"]["mode"], "inferred");
+    assert_eq!(report["row_counts"]["source"], 1);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert_eq!(report["rejected_records"]["count"], 0);
+    assert!(report["rejected_records"]["artifact"].is_null());
+    assert_eq!(report["destination_write"]["atomicity"], "best_effort");
+    assert_eq!(report["destination_write"]["strategy"], "insert");
+
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 1);
+    let customer_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_id is int64");
+    assert_eq!(customer_ids.value(0), 1);
+
+    assert!(!report["load_id"].as_str().expect("load id").is_empty());
+    assert_eq!(
+        PathBuf::from(report["artifact_dir"].as_str().expect("artifact directory")),
+        append.report_path.parent().expect("report parent")
+    );
+    assert!(append.stdout.contains("Status: failed"));
+    assert!(append.stdout.contains("Load mode: append"));
+    assert!(append.stdout.contains("Records read: 1"));
+    assert!(append.stdout.contains("Records written: 0"));
+    assert!(append
+        .stdout
+        .contains(append.report_path.to_str().expect("report path")));
+}
+
+#[test]
 fn a_configured_reject_threshold_lets_a_load_complete_with_rejected_records() {
     let work = TempDir::new().expect("tempdir");
     let source_path = work.path().join("customers.csv");
@@ -2169,6 +2805,145 @@ reject_threshold: 2
     assert_eq!(names.value(0), "Ada");
 }
 
+struct CliLoadResult {
+    stdout: String,
+    report_path: PathBuf,
+    report: Value,
+}
+
+fn write_load_definition(
+    definition_path: &Path,
+    source_path: &Path,
+    source_format: &str,
+    destination_connector: &str,
+    destination_path: &Path,
+    load_mode: &str,
+    pinned_path: Option<&Path>,
+) {
+    let schema_block = pinned_path
+        .map(|path| format!("schema:\n  pinned_path: {}\n", path.display()))
+        .unwrap_or_default();
+    fs::write(
+        definition_path,
+        format!(
+            "version: 1\n\
+             source:\n\
+             \x20 connector: local_file\n\
+             \x20 path: {}\n\
+             \x20 format: {source_format}\n\
+             destination:\n\
+             \x20 connector: {destination_connector}\n\
+             \x20 path: {}\n\
+             dataset: customers\n\
+             load_mode: {load_mode}\n\
+             {schema_block}",
+            source_path.display(),
+            destination_path.display(),
+        ),
+    )
+    .expect("write load definition");
+}
+
+fn run_cli_load(
+    work_dir: &Path,
+    artifacts_dir: &Path,
+    definition_path: &Path,
+    expect_success: bool,
+) -> CliLoadResult {
+    let assert = Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work_dir)
+        .arg("load")
+        .arg("--output-dir")
+        .arg(artifacts_dir)
+        .arg(definition_path)
+        .assert();
+    let assert = if expect_success {
+        assert.success()
+    } else {
+        assert.failure()
+    };
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let (report_path, report) =
+        read_single_report(artifacts_dir, "load writes one artifact directory");
+    CliLoadResult {
+        stdout,
+        report_path,
+        report,
+    }
+}
+
+fn assert_successful_append(result: &CliLoadResult, expected_strategy: &str) {
+    let report = &result.report;
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["load_mode"], "append");
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["process_exit_code"], 0);
+    assert_eq!(report["row_counts"]["source"], 1);
+    assert_eq!(report["row_counts"]["written"], 1);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert_eq!(report["rejected_records"]["count"], 0);
+    assert!(report["rejected_records"]["artifact"].is_null());
+    assert_eq!(report["destination_write"]["atomicity"], "best_effort");
+    assert_eq!(report["destination_write"]["strategy"], expected_strategy);
+    assert!(report["error_summary"].is_null());
+    assert!(result.stdout.contains("Status: succeeded"));
+    assert!(result.stdout.contains("Records read: 1"));
+    assert!(result.stdout.contains("Records written: 1"));
+    assert!(result.stdout.contains("Records rejected: 0"));
+    assert!(result
+        .stdout
+        .contains(result.report_path.to_str().expect("report path")));
+}
+
+fn parquet_files(destination_path: &Path) -> Vec<PathBuf> {
+    let mut files = fs::read_dir(destination_path)
+        .expect("parquet destination directory")
+        .map(|entry| entry.expect("destination entry").path())
+        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("parquet"))
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+fn read_parquet_file_batches(parquet_path: &Path) -> Vec<arrow_array::RecordBatch> {
+    let file = File::open(parquet_path).expect("open parquet file");
+    ParquetRecordBatchReaderBuilder::try_new(file)
+        .expect("parquet reader")
+        .build()
+        .expect("build parquet reader")
+        .map(|batch| batch.expect("read parquet batch"))
+        .collect()
+}
+
+fn read_parquet_batches(destination_path: &Path) -> Vec<arrow_array::RecordBatch> {
+    parquet_files(destination_path)
+        .into_iter()
+        .flat_map(|path| read_parquet_file_batches(&path))
+        .collect()
+}
+
+fn id_name_records(batches: &[arrow_array::RecordBatch]) -> Vec<(i64, String)> {
+    let mut records = Vec::new();
+    for batch in batches {
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("customer_id is int64");
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name is string");
+        for index in 0..batch.num_rows() {
+            records.push((ids.value(index), names.value(index).to_string()));
+        }
+    }
+    records.sort_by_key(|(id, _)| *id);
+    records
+}
+
 fn read_single_report(artifacts_dir: &Path, artifact_count_message: &str) -> (PathBuf, Value) {
     let run_dirs = fs::read_dir(artifacts_dir)
         .expect("artifact root")
@@ -2191,13 +2966,9 @@ fn read_rejected_records(artifact_path: &Path) -> Vec<Value> {
 }
 
 fn single_parquet_file(destination_path: &Path) -> PathBuf {
-    let parquet_files = fs::read_dir(destination_path)
-        .expect("parquet destination directory")
-        .map(|entry| entry.expect("destination entry").path())
-        .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("parquet"))
-        .collect::<Vec<_>>();
-    assert_eq!(parquet_files.len(), 1, "one parquet data file");
-    parquet_files[0].clone()
+    let files = parquet_files(destination_path);
+    assert_eq!(files.len(), 1, "one parquet data file");
+    files[0].clone()
 }
 
 fn read_single_duckdb_batch(database_path: &Path, dataset: &str) -> arrow_array::RecordBatch {
@@ -2217,15 +2988,7 @@ fn read_single_duckdb_batch(database_path: &Path, dataset: &str) -> arrow_array:
 }
 
 fn read_single_parquet_batch(parquet_path: &Path) -> arrow_array::RecordBatch {
-    let file = File::open(parquet_path).expect("open parquet file");
-    let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .expect("parquet reader")
-        .build()
-        .expect("build parquet reader");
-    let batch = reader
-        .next()
-        .expect("one parquet batch")
-        .expect("read parquet batch");
-    assert!(reader.next().is_none(), "one parquet batch expected");
-    batch
+    let mut batches = read_parquet_file_batches(parquet_path);
+    assert_eq!(batches.len(), 1, "one parquet batch expected");
+    batches.pop().expect("one parquet batch")
 }
