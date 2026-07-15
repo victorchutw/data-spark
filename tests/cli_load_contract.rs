@@ -176,7 +176,7 @@ fn local_csv_append_preserves_existing_parquet_records_and_reports_the_load() {
             (3, "Katherine".to_string()),
         ]
     );
-    assert_successful_append(&append);
+    assert_successful_append(&append, "staged_part_append");
     assert_ne!(first.report["load_id"], append.report["load_id"]);
     assert!(!append.report["load_id"]
         .as_str()
@@ -369,7 +369,7 @@ fn local_csv_append_preserves_existing_duckdb_records_and_reports_the_load() {
     assert_eq!(names.value(1), "Grace");
     assert_eq!(names.value(2), "Katherine");
     assert!(append.report["byte_counts"]["destination"].is_null());
-    assert_successful_append(&append);
+    assert_successful_append(&append, "insert");
 }
 
 #[test]
@@ -553,7 +553,7 @@ fn local_jsonl_append_preserves_existing_parquet_records_and_reports_the_load() 
             (3, "Katherine".to_string()),
         ]
     );
-    assert_successful_append(&append);
+    assert_successful_append(&append, "staged_part_append");
 }
 
 #[test]
@@ -757,7 +757,7 @@ fn local_jsonl_append_preserves_existing_duckdb_records_and_reports_the_load() {
     assert!(actives.value(0));
     assert!(!actives.value(1));
     assert!(actives.value(2));
-    assert_successful_append(&append);
+    assert_successful_append(&append, "insert");
 }
 
 #[test]
@@ -2873,7 +2873,7 @@ fn run_cli_load(
     }
 }
 
-fn assert_successful_append(result: &CliLoadResult) {
+fn assert_successful_append(result: &CliLoadResult, expected_strategy: &str) {
     let report = &result.report;
     assert_eq!(report["report_version"], 1);
     assert_eq!(report["load_mode"], "append");
@@ -2885,6 +2885,7 @@ fn assert_successful_append(result: &CliLoadResult) {
     assert_eq!(report["rejected_records"]["count"], 0);
     assert!(report["rejected_records"]["artifact"].is_null());
     assert_eq!(report["destination_write"]["atomicity"], "best_effort");
+    assert_eq!(report["destination_write"]["strategy"], expected_strategy);
     assert!(report["error_summary"].is_null());
     assert!(result.stdout.contains("Status: succeeded"));
     assert!(result.stdout.contains("Records read: 1"));
