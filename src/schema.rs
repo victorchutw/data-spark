@@ -122,13 +122,18 @@ struct PinnedField {
 
 /// The raw serde shape of a pinned schema file, kept separate from
 /// [`PinnedSchema`] so contract validation happens in one place after parsing.
+/// Parsing rejects unknown keys at the top level and in each field entry
+/// (ADR-0037), so a hand edit that misspells a key fails instead of silently
+/// relaxing the pin.
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct PinnedSchemaFile {
     version: Option<u64>,
     fields: Option<Vec<PinnedFieldFile>>,
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct PinnedFieldFile {
     name: String,
     #[serde(rename = "type")]
@@ -1565,6 +1570,34 @@ mod tests {
             assert!(
                 error.message.contains(expected_message_part),
                 "message {:?} misses {expected_message_part:?}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_schema_rejects_unknown_fields_at_top_level_and_in_field_entries() {
+        // Strict contract (ADR-0037): a key the pin contract does not declare
+        // is a parse failure naming the key, never a silently ignored no-op.
+        for (yaml, unknown_field) in [
+            (
+                "version: 1\nowner: bi-team\nfields:\n- name: id\n  type: int64\n",
+                "owner",
+            ),
+            (
+                "version: 1\nfields:\n- name: id\n  type: int64\n  description: primary key\n",
+                "description",
+            ),
+        ] {
+            let error = PinnedSchema::from_yaml(yaml)
+                .err()
+                .unwrap_or_else(|| panic!("pinned schema {yaml:?} accepted"));
+            assert_eq!(error.code, "invalid_pinned_schema", "code for {yaml:?}");
+            assert!(
+                error
+                    .message
+                    .contains(&format!("unknown field `{unknown_field}`")),
+                "message {:?} misses the rejected field {unknown_field:?}",
                 error.message
             );
         }

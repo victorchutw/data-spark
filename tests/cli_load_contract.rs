@@ -1806,6 +1806,268 @@ fn malformed_load_definition_fails_with_report_and_summary() {
 }
 
 #[test]
+fn unknown_load_definition_key_fails_with_report_before_source_or_destination_work() {
+    // Strict contract (ADR-0037): the source file is deliberately missing and
+    // the destination must never appear, so the unknown-key failure provably
+    // happens before source reading and destination writing.
+    let work = TempDir::new().expect("tempdir");
+    let destination_path = work.path().join("should-not-exist.parquet");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+parallelism: 4
+source:
+  connector: local_file
+  path: missing-source.csv
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+"#,
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    let assert = Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    assert!(
+        !destination_path.exists(),
+        "unknown definition keys must fail before destination writing"
+    );
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let (report_path, report) = read_single_report(
+        &artifacts_dir,
+        "failed strict parse still has one artifact directory",
+    );
+
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(
+        report["error_summary"]["code"],
+        "invalid_load_definition_yaml"
+    );
+    let message = report["error_summary"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(message.contains("failed to parse load definition"));
+    assert!(
+        message.contains("unknown field `parallelism`"),
+        "error text must identify the rejected field: {message}"
+    );
+
+    assert!(stdout.contains("Data Spark load"));
+    assert!(stdout.contains("failed"));
+    assert!(stdout.contains("unknown field `parallelism`"));
+    assert!(stdout.contains(report_path.to_str().expect("report path")));
+}
+
+#[test]
+fn unknown_keys_in_nested_load_definition_blocks_fail_before_side_effects() {
+    // Strict contract (ADR-0037) inside each nested block: source,
+    // destination, schema, and artifacts. The missing source file and the
+    // never-created destination prove the failure boundary for each case.
+    let work = TempDir::new().expect("tempdir");
+    let destination_path = work.path().join("should-not-exist.parquet");
+    let cases = [
+        (
+            "select",
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: missing-source.csv
+  format: csv
+  select: [customer_id]
+destination:
+  connector: parquet
+  path: {destination}
+"#,
+        ),
+        (
+            "rename",
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: missing-source.csv
+  format: csv
+destination:
+  connector: parquet
+  path: {destination}
+  rename: customers
+"#,
+        ),
+        (
+            "overrides",
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: missing-source.csv
+  format: csv
+destination:
+  connector: parquet
+  path: {destination}
+schema:
+  pinned_path: customers.schema.yml
+  overrides: {}
+"#,
+        ),
+        (
+            "retention_days",
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: missing-source.csv
+  format: csv
+destination:
+  connector: parquet
+  path: {destination}
+artifacts:
+  dir: definition-artifacts
+  retention_days: 7
+"#,
+        ),
+    ];
+
+    for (unknown_field, template) in cases {
+        let definition_text =
+            template.replace("{destination}", &destination_path.display().to_string());
+        let definition_path = work.path().join(format!("load-{unknown_field}.yml"));
+        fs::write(&definition_path, definition_text).expect("write load definition");
+        let artifacts_dir = work.path().join(format!("artifacts-{unknown_field}"));
+
+        Command::cargo_bin("data-spark")
+            .expect("binary")
+            .current_dir(work.path())
+            .arg("load")
+            .arg("--output-dir")
+            .arg(&artifacts_dir)
+            .arg(&definition_path)
+            .assert()
+            .failure();
+
+        assert!(
+            !destination_path.exists(),
+            "unknown {unknown_field} key must fail before destination writing"
+        );
+        let (_, report) = read_single_report(
+            &artifacts_dir,
+            "failed strict parse still has one artifact directory",
+        );
+        assert_eq!(report["report_version"], 1);
+        assert_eq!(report["exit_status"], "failed");
+        assert_eq!(report["process_exit_code"], 1);
+        assert_eq!(
+            report["error_summary"]["code"], "invalid_load_definition_yaml",
+            "code for unknown {unknown_field}"
+        );
+        let message = report["error_summary"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            message.contains(&format!("unknown field `{unknown_field}`")),
+            "error text must identify {unknown_field}: {message}"
+        );
+    }
+}
+
+#[test]
+fn unknown_pinned_schema_key_fails_before_source_or_destination_work() {
+    // Strict pin contract (ADR-0037): the pin parse failure fires while the
+    // source file is missing and before the destination exists, proving the
+    // load stopped at the schema directive (ADR-0019 ordering).
+    let work = TempDir::new().expect("tempdir");
+    let destination_path = work.path().join("should-not-exist.parquet");
+    let pinned_path = work.path().join("customers.schema.yml");
+    fs::write(
+        &pinned_path,
+        "version: 1\nowner: bi-team\nfields:\n- name: customer_id\n  type: int64\n",
+    )
+    .expect("write pinned schema");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: missing-source.csv
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+"#,
+            destination_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    let assert = Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    assert!(
+        !destination_path.exists(),
+        "an invalid pinned schema must fail before destination writing"
+    );
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let (report_path, report) = read_single_report(
+        &artifacts_dir,
+        "failed pin parse still has one artifact directory",
+    );
+
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(report["error_summary"]["code"], "invalid_pinned_schema");
+    let message = report["error_summary"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(message.contains("failed to parse pinned schema"));
+    assert!(
+        message.contains("unknown field `owner`"),
+        "error text must identify the rejected field: {message}"
+    );
+
+    assert!(stdout.contains("failed"));
+    assert!(stdout.contains("unknown field `owner`"));
+    assert!(stdout.contains(report_path.to_str().expect("report path")));
+}
+
+#[test]
 fn load_without_output_dir_uses_default_data_spark_runs_directory() {
     let work = TempDir::new().expect("tempdir");
     fs::write(

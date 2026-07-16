@@ -186,7 +186,12 @@ struct ErrorSummary {
     message: String,
 }
 
+/// The versioned YAML load definition contract (ADR-0010, ADR-0026). The
+/// contract is exactly the keys declared here and in the nested blocks:
+/// parsing rejects unknown keys recursively (ADR-0037), so a misspelled or
+/// deferred capability key fails the load instead of being silently ignored.
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct LoadDefinition {
     version: Option<u64>,
     source: Option<SourceDefinition>,
@@ -204,6 +209,7 @@ struct LoadDefinition {
 /// The `artifacts` block of a load definition: the root under which this load's
 /// unique artifact directory is created (ADR-0015).
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct ArtifactsConfig {
     dir: Option<PathBuf>,
 }
@@ -212,12 +218,14 @@ struct ArtifactsConfig {
 /// the load reuses (ADR-0033) and the drift policy that decides whether a load
 /// may continue when schema drift is detected (ADR-0007).
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct SchemaConfig {
     pinned_path: Option<PathBuf>,
     drift_policy: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct SourceDefinition {
     connector: String,
     path: PathBuf,
@@ -225,6 +233,7 @@ struct SourceDefinition {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct DestinationDefinition {
     connector: String,
     path: PathBuf,
@@ -1092,6 +1101,40 @@ mod tests {
         assert!(
             serde_yaml::from_str::<LoadDefinition>("version: 1\nreject_threshold: -1\n").is_err()
         );
+    }
+
+    #[test]
+    fn load_definition_rejects_unknown_keys_in_every_block() {
+        // Strict contract (ADR-0037): a key the contract does not declare is a
+        // parse failure naming the key, never a silently ignored no-op.
+        for (yaml, unknown_field) in [
+            ("version: 1\nparallelism: 4\n", "parallelism"),
+            (
+                "version: 1\nsource:\n  connector: local_file\n  path: a.csv\n  select: [id]\n",
+                "select",
+            ),
+            (
+                "version: 1\ndestination:\n  connector: parquet\n  path: out\n  rename: y\n",
+                "rename",
+            ),
+            (
+                "version: 1\nschema:\n  pinned_path: p.yml\n  overrides: {}\n",
+                "overrides",
+            ),
+            (
+                "version: 1\nartifacts:\n  dir: runs\n  retention_days: 7\n",
+                "retention_days",
+            ),
+        ] {
+            let error = serde_yaml::from_str::<LoadDefinition>(yaml)
+                .err()
+                .unwrap_or_else(|| panic!("definition {yaml:?} accepted"));
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("unknown field `{unknown_field}`")),
+                "message {message:?} misses the rejected field {unknown_field:?}"
+            );
+        }
     }
 
     // ---- Schema directive resolution ----
