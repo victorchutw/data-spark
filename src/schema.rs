@@ -1576,7 +1576,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_schema_rejects_unknown_fields_at_top_level_and_in_field_entries() {
+    fn pinned_schema_rejects_unknown_keys_at_top_level_and_in_field_entries() {
         // Strict contract (ADR-0037): a key the pin contract does not declare
         // is a parse failure naming the key, never a silently ignored no-op.
         for (yaml, unknown_field) in [
