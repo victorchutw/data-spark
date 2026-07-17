@@ -668,7 +668,7 @@ dependencies = [
 
 [[package]]
 name = "data-spark"
-version = "0.1.0"
+version = "0.1.1-alpha.1"
 dependencies = [
  "arrow-array",
  "arrow-schema",
