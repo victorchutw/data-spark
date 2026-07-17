@@ -198,6 +198,10 @@ struct LoadDefinition {
     destination: Option<DestinationDefinition>,
     dataset: Option<String>,
     load_mode: Option<String>,
+    /// The structural transform applied before schema pinning, validation,
+    /// and destination writing: field selection, then rename mapping
+    /// (ADR-0039, ADR-0040).
+    transform: Option<schema::TransformConfig>,
     schema: Option<SchemaConfig>,
     artifacts: Option<ArtifactsConfig>,
     /// The number of rejected records this load tolerates before failing.
@@ -566,7 +570,8 @@ fn execute_supported_load(
     let source_port = source_connector(source)?;
     let destination_port = destination_connector(destination, definition.dataset.as_deref())?;
     destination_port.validate_mode(mode)?;
-    let directive = resolve_schema_directive(definition.schema.as_ref())?;
+    let directive =
+        resolve_schema_directive(definition.schema.as_ref(), definition.transform.as_ref())?;
 
     let reject_threshold = definition.reject_threshold.unwrap_or(0);
     let SourceRead {
@@ -651,18 +656,31 @@ fn execute_supported_load(
     })
 }
 
-/// Resolves the definition's `schema` block into the schema directive the
-/// source materializes under: no block means inference, a named pinned schema
-/// file that does not exist yet means this load persists the inferred schema as
-/// the new pin (ADR-0033), an existing file is parsed and validated against
-/// (ADR-0034), and `overrides` travel on every directive to rewrite whatever
-/// the load infers (ADR-0038). A block with `overrides` but no `pinned_path`
-/// is a plain inference directive with overrides.
+/// Resolves the definition's `transform` and `schema` blocks into the schema
+/// directive the source materializes under: no `schema` block means
+/// inference, a named pinned schema file that does not exist yet means this
+/// load persists the inferred schema as the new pin (ADR-0033), an existing
+/// file is parsed and validated against (ADR-0034), and the validated
+/// `transform` (ADR-0039) and `overrides` (ADR-0038) travel on every
+/// directive to reshape and rewrite whatever the load infers. A block with
+/// `overrides` but no `pinned_path` is a plain inference directive with
+/// overrides. The transform validates first — it precedes overrides and
+/// pinning in the meaning order — and, like override validation, before any
+/// pinned schema file is read, so a broken definition never silently
+/// bootstraps a pin (ADR-0040).
 fn resolve_schema_directive(
     schema_config: Option<&SchemaConfig>,
+    transform_config: Option<&schema::TransformConfig>,
 ) -> Result<schema::SchemaDirective, LoadFailure> {
+    let transform = match transform_config {
+        None => schema::SchemaTransform::none(),
+        Some(transform_config) => schema::SchemaTransform::from_config(transform_config)?,
+    };
     let Some(schema_config) = schema_config else {
-        return Ok(schema::SchemaDirective::inferred());
+        return Ok(schema::SchemaDirective::Inferred {
+            transform,
+            overrides: schema::SchemaOverrides::none(),
+        });
     };
     let invalid_schema_config = |message: String| LoadFailure {
         code: "invalid_schema_config",
@@ -717,18 +735,23 @@ fn resolve_schema_directive(
     };
 
     let Some(pinned_path) = schema_config.pinned_path.as_ref() else {
-        return Ok(schema::SchemaDirective::Inferred { overrides });
+        return Ok(schema::SchemaDirective::Inferred {
+            transform,
+            overrides,
+        });
     };
     match fs::read_to_string(pinned_path) {
         Ok(pin_text) => Ok(schema::SchemaDirective::Pinned {
             pinned_path: path_string(pinned_path),
             pin: schema::PinnedSchema::from_yaml(&pin_text)?,
             drift_policy,
+            transform,
             overrides,
         }),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             Ok(schema::SchemaDirective::PinInferred {
                 pinned_path: path_string(pinned_path),
+                transform,
                 overrides,
             })
         }
@@ -831,6 +854,7 @@ mod tests {
             line,
             code: rejection::MALFORMED_CSV_RECORD,
             field: None,
+            source_field: None,
             message: "expected 2 fields, found 3".to_string(),
             record: Value::Null,
         }
@@ -1056,6 +1080,7 @@ mod tests {
             }),
             dataset: Some("customers".to_string()),
             load_mode: None,
+            transform: None,
             schema: None,
             artifacts: None,
             reject_threshold,
@@ -1162,6 +1187,10 @@ mod tests {
                 "rename",
             ),
             (
+                "version: 1\ntransform:\n  select: [id]\n  drop: [note]\n",
+                "drop",
+            ),
+            (
                 "version: 1\nschema:\n  pinned_path: p.yml\n  checksum: abc123\n",
                 "checksum",
             ),
@@ -1202,7 +1231,7 @@ mod tests {
     #[test]
     fn resolve_schema_directive_defaults_to_inference_without_a_schema_block() {
         assert!(matches!(
-            resolve_schema_directive(None),
+            resolve_schema_directive(None, None),
             Ok(schema::SchemaDirective::Inferred { .. })
         ));
     }
@@ -1232,7 +1261,7 @@ mod tests {
                 "schema.overrides must declare at least one override",
             ),
         ] {
-            let error = resolve_schema_directive(Some(&config))
+            let error = resolve_schema_directive(Some(&config), None)
                 .err()
                 .expect("underspecified schema block rejected");
             assert_eq!(error.code, "invalid_schema_config");
@@ -1251,8 +1280,8 @@ mod tests {
         let mut config = schema_config(None, None);
         config.overrides = overrides_yaml("- name: id\n  type: int64\n");
 
-        match resolve_schema_directive(Some(&config)).expect("standalone overrides resolve") {
-            schema::SchemaDirective::Inferred { overrides } => assert!(!overrides.is_empty()),
+        match resolve_schema_directive(Some(&config), None).expect("standalone overrides resolve") {
+            schema::SchemaDirective::Inferred { overrides, .. } => assert!(!overrides.is_empty()),
             _ => panic!("expected the Inferred directive"),
         }
     }
@@ -1265,7 +1294,7 @@ mod tests {
         config.overrides = overrides_yaml("- name: id\n  nullable: false\n");
 
         // Absent pin file: the bootstrap directive carries the overrides.
-        match resolve_schema_directive(Some(&config)).expect("absent pin bootstraps") {
+        match resolve_schema_directive(Some(&config), None).expect("absent pin bootstraps") {
             schema::SchemaDirective::PinInferred { overrides, .. } => {
                 assert!(!overrides.is_empty())
             }
@@ -1278,7 +1307,7 @@ mod tests {
             "version: 1\nfields:\n- name: id\n  type: int64\n",
         )
         .expect("write pin");
-        match resolve_schema_directive(Some(&config)).expect("existing pin loads") {
+        match resolve_schema_directive(Some(&config), None).expect("existing pin loads") {
             schema::SchemaDirective::Pinned { overrides, .. } => assert!(!overrides.is_empty()),
             _ => panic!("expected the Pinned directive"),
         }
@@ -1309,7 +1338,7 @@ mod tests {
         ] {
             let mut config = schema_config(Some("/does/not/exist.schema.yml"), None);
             config.overrides = overrides_yaml(overrides);
-            let error = resolve_schema_directive(Some(&config))
+            let error = resolve_schema_directive(Some(&config), None)
                 .err()
                 .expect("invalid overrides rejected");
             assert_eq!(error.code, expected_code, "code for {overrides:?}");
@@ -1321,12 +1350,159 @@ mod tests {
         }
     }
 
+    fn transform_yaml(transform: &str) -> schema::TransformConfig {
+        serde_yaml::from_str(transform).expect("test transform parses")
+    }
+
+    #[test]
+    fn load_definition_parses_the_transform_block() {
+        // The block parses with select, rename, or both; the strict contract
+        // rejects nothing here — an empty or inconsistent block is directive
+        // resolution's job, surfacing as invalid_transform_config.
+        for yaml in [
+            "version: 1\ntransform:\n  select: [id, total]\n",
+            "version: 1\ntransform:\n  rename:\n    id: customer_id\n",
+            "version: 1\ntransform:\n  select: [id]\n  rename:\n    id: customer_id\n",
+            "version: 1\ntransform: {}\n",
+        ] {
+            let definition = serde_yaml::from_str::<LoadDefinition>(yaml)
+                .unwrap_or_else(|error| panic!("definition {yaml:?} failed to parse: {error}"));
+            assert!(definition.transform.is_some(), "transform for {yaml:?}");
+        }
+    }
+
+    #[test]
+    fn load_definition_rejects_duplicate_rename_keys_at_parse_time() {
+        // A duplicate rename key is a YAML parse failure — surfacing as
+        // invalid_load_definition_yaml at the load boundary — never a silent
+        // last-entry-wins.
+        let error = serde_yaml::from_str::<LoadDefinition>(
+            "version: 1\ntransform:\n  rename:\n    id: customer_id\n    id: account_id\n",
+        )
+        .expect_err("duplicate rename keys rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate transform.rename key \"id\""),
+            "message {error:?} misses the duplicate key"
+        );
+    }
+
+    #[test]
+    fn resolve_schema_directive_rejects_invalid_transform_configs_before_reading_the_pin() {
+        // The transform config failure matrix (ADR-0039), one case each. The
+        // pin path does not exist: transform validation must fail instead of
+        // silently bootstrapping, matching overrides.
+        for (transform, expected_message_part) in [
+            (
+                "{}",
+                "a transform block must set transform.select or transform.rename",
+            ),
+            (
+                "select: []",
+                "transform.select must name at least one field",
+            ),
+            (
+                "select: [id, id]",
+                "transform.select names field \"id\" more than once",
+            ),
+            ("rename: {}", "transform.rename must map at least one field"),
+            (
+                "select: [a, b]\nrename: {a: x, b: x}",
+                "transform.rename maps more than one field to \"x\"",
+            ),
+            (
+                "select: [a]\nrename: {b: c}",
+                "transform.rename key \"b\" is not in transform.select",
+            ),
+            (
+                "select: [a, b]\nrename: {a: b}",
+                "transform.select and transform.rename map more than one field \
+                 to the dataset name \"b\"",
+            ),
+            (
+                "rename: {id: id}",
+                "transform.rename maps field \"id\" to itself",
+            ),
+            (
+                "rename: {id: \"\"}",
+                "transform.rename target for field \"id\" must not be empty",
+            ),
+            (
+                "rename: {id: \"   \"}",
+                "transform.rename target for field \"id\" must not be empty",
+            ),
+        ] {
+            let config = schema_config(Some("/does/not/exist.schema.yml"), None);
+            let error = resolve_schema_directive(Some(&config), Some(&transform_yaml(transform)))
+                .err()
+                .expect("invalid transform rejected");
+            assert_eq!(
+                error.code, "invalid_transform_config",
+                "code for {transform:?}"
+            );
+            assert!(
+                error.message.contains(expected_message_part),
+                "message {:?} misses {expected_message_part:?}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_schema_directive_validates_the_transform_before_the_schema_block() {
+        // Both blocks are broken: the transform precedes overrides and
+        // pinning in the meaning order, so its config failure wins.
+        let mut config = schema_config(None, None);
+        config.overrides = Some(Vec::new());
+        let error = resolve_schema_directive(Some(&config), Some(&transform_yaml("select: []")))
+            .err()
+            .expect("invalid transform rejected");
+        assert_eq!(error.code, "invalid_transform_config");
+    }
+
+    #[test]
+    fn resolve_schema_directive_carries_the_transform_onto_every_directive() {
+        let work = tempfile::TempDir::new().expect("tempdir");
+        let pinned_path = work.path().join("customers.schema.yml");
+        let transform = transform_yaml("select: [id]");
+
+        // No schema block: a plain inference directive with the transform.
+        match resolve_schema_directive(None, Some(&transform)).expect("transform-only resolves") {
+            schema::SchemaDirective::Inferred { transform, .. } => assert!(!transform.is_empty()),
+            _ => panic!("expected the Inferred directive"),
+        }
+
+        // Absent pin file: the bootstrap directive carries the transform.
+        let config = schema_config(Some(pinned_path.to_str().expect("utf8 path")), None);
+        match resolve_schema_directive(Some(&config), Some(&transform))
+            .expect("absent pin bootstraps")
+        {
+            schema::SchemaDirective::PinInferred { transform, .. } => {
+                assert!(!transform.is_empty())
+            }
+            _ => panic!("expected the PinInferred directive"),
+        }
+
+        // Existing pin file: the pinned directive carries the transform.
+        fs::write(
+            &pinned_path,
+            "version: 1\nfields:\n- name: id\n  type: int64\n",
+        )
+        .expect("write pin");
+        match resolve_schema_directive(Some(&config), Some(&transform)).expect("existing pin loads")
+        {
+            schema::SchemaDirective::Pinned { transform, .. } => assert!(!transform.is_empty()),
+            _ => panic!("expected the Pinned directive"),
+        }
+    }
+
     #[test]
     fn resolve_schema_directive_rejects_unknown_drift_policies_before_reading_the_pin() {
         // The pin path does not exist: an unknown policy must fail instead of
         // silently bootstrapping.
         let config = schema_config(Some("/does/not/exist.schema.yml"), Some("relaxed"));
-        let error = resolve_schema_directive(Some(&config))
+        let error = resolve_schema_directive(Some(&config), None)
             .err()
             .expect("unknown drift policy rejected");
         assert_eq!(error.code, "unsupported_drift_policy");
@@ -1336,7 +1512,7 @@ mod tests {
     #[test]
     fn resolve_schema_directive_bootstraps_when_the_pin_file_is_absent() {
         let config = schema_config(Some("/does/not/exist/customers.schema.yml"), Some("fail"));
-        match resolve_schema_directive(Some(&config)).expect("absent pin bootstraps") {
+        match resolve_schema_directive(Some(&config), None).expect("absent pin bootstraps") {
             schema::SchemaDirective::PinInferred { pinned_path, .. } => {
                 assert_eq!(pinned_path, "/does/not/exist/customers.schema.yml");
             }
@@ -1385,7 +1561,7 @@ mod tests {
         .expect("write pin");
         let config = schema_config(Some(pinned_path.to_str().expect("utf8 path")), None);
 
-        let error = resolve_schema_directive(Some(&config))
+        let error = resolve_schema_directive(Some(&config), None)
             .err()
             .expect("invalid pin rejected");
         assert_eq!(error.code, "invalid_pinned_schema");
@@ -1408,7 +1584,7 @@ mod tests {
             Some("allow_additive_nullable"),
         );
 
-        match resolve_schema_directive(Some(&config)).expect("existing pin loads") {
+        match resolve_schema_directive(Some(&config), None).expect("existing pin loads") {
             schema::SchemaDirective::Pinned {
                 pinned_path: reported_path,
                 drift_policy: schema::DriftPolicy::AllowAdditiveNullable,

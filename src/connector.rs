@@ -995,6 +995,7 @@ fn read_local_csv(source_path: &Path) -> Result<CsvRecords, LoadFailure> {
                     line,
                     code: rejection::MALFORMED_CSV_RECORD,
                     field: None,
+                    source_field: None,
                     message: error.to_string(),
                     record: Value::Null,
                 });
@@ -1011,6 +1012,7 @@ fn read_local_csv(source_path: &Path) -> Result<CsvRecords, LoadFailure> {
                         line,
                         code: rejection::MALFORMED_CSV_RECORD,
                         field: None,
+                        source_field: None,
                         message: format!(
                             "expected {} fields, found {}",
                             field_names.len(),
@@ -1115,6 +1117,7 @@ fn read_local_jsonl(source_path: &Path) -> Result<JsonlRecords, ExecutionFailure
                     line: line_number,
                     code: rejection::MALFORMED_JSONL_RECORD,
                     field: None,
+                    source_field: None,
                     message: error.to_string(),
                     record: Value::String(String::from_utf8_lossy(&line_bytes).into_owned()),
                 });
@@ -1133,6 +1136,7 @@ fn read_local_jsonl(source_path: &Path) -> Result<JsonlRecords, ExecutionFailure
                     line: line_number,
                     code: rejection::MALFORMED_JSONL_RECORD,
                     field: None,
+                    source_field: None,
                     message: "each JSONL record must be a JSON object".to_string(),
                     record: Value::String(line.to_string()),
                 });
@@ -1143,6 +1147,7 @@ fn read_local_jsonl(source_path: &Path) -> Result<JsonlRecords, ExecutionFailure
                     line: line_number,
                     code: rejection::MALFORMED_JSONL_RECORD,
                     field: None,
+                    source_field: None,
                     message: error.to_string(),
                     record: Value::String(line.to_string()),
                 });
@@ -1460,6 +1465,7 @@ mod tests {
             )
             .expect("test pin parses"),
             drift_policy: schema::DriftPolicy::Fail,
+            transform: schema::SchemaTransform::none(),
             overrides: schema::SchemaOverrides::none(),
         };
         let read = source

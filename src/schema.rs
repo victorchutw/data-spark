@@ -21,6 +21,16 @@
 //! an existing pinned field fails it as `schema_override_conflict` before
 //! drift comparison. Overridden fields validate per record exactly like
 //! pinned fields.
+//! A load definition may also declare a structural transform
+//! ([`SchemaTransform`], ADR-0039): field selection evaluates first against
+//! the observed source names and fixes the dataset field order, then the
+//! rename mapping applies simultaneously over the selected fields. The
+//! transform runs before everything above (ADR-0040), so overrides, pins,
+//! drift, and per-record validation all speak the transformed dataset names
+//! while rejections keep the original source content — a transform naming an
+//! unobserved field fails the load as `unknown_transform_field`, and a rename
+//! target colliding with another dataset field fails it as
+//! `transform_name_collision`, both before any override or pin comparison.
 //! Everything type-related — the lattice, observation rules, the pinned schema
 //! file contract ([`PinnedSchema`], ADR-0033), drift comparison, per-record
 //! validation, materialization, and the `schema_decision` shape — is private
@@ -78,43 +88,67 @@ pub(crate) struct JsonRecord {
 /// How a load decides its dataset schema: infer it from observed records,
 /// infer it and persist it as the new pinned schema (the first pin-requesting
 /// load, ADR-0033), or validate observed records against an existing pinned
-/// schema (ADR-0034). Every variant carries the definition's per-field
-/// overrides (ADR-0038), which rewrite the inference-decided parts of the
-/// schema — everything on an inference-driven load, the bootstrapped pin, and
-/// the added fields an additive drift policy admits — and must agree with any
-/// field the pin already governs. `pinned_path` is the display path the
-/// schema decision reports; file I/O stays with the caller.
+/// schema (ADR-0034). Every variant carries the definition's structural
+/// transform (ADR-0039), which reshapes the observed source fields into the
+/// dataset fields everything downstream speaks, and the definition's
+/// per-field overrides (ADR-0038), which rewrite the inference-decided parts
+/// of the schema — everything on an inference-driven load, the bootstrapped
+/// pin, and the added fields an additive drift policy admits — and must agree
+/// with any field the pin already governs. `pinned_path` is the display path
+/// the schema decision reports; file I/O stays with the caller.
 pub(crate) enum SchemaDirective {
     Inferred {
+        transform: SchemaTransform,
         overrides: SchemaOverrides,
     },
     PinInferred {
         pinned_path: String,
+        transform: SchemaTransform,
         overrides: SchemaOverrides,
     },
     Pinned {
         pinned_path: String,
         pin: PinnedSchema,
         drift_policy: DriftPolicy,
+        transform: SchemaTransform,
         overrides: SchemaOverrides,
     },
 }
 
 impl SchemaDirective {
-    /// The inference directive with no overrides configured — the posture of
-    /// a load definition without a `schema` block.
+    /// The inference directive with no transform and no overrides configured
+    /// — the posture of a load definition without `transform` and `schema`
+    /// blocks.
+    #[cfg(test)]
     pub(crate) fn inferred() -> Self {
         SchemaDirective::Inferred {
+            transform: SchemaTransform::none(),
             overrides: SchemaOverrides::none(),
+        }
+    }
+
+    fn transform(&self) -> &SchemaTransform {
+        match self {
+            SchemaDirective::Inferred { transform, .. }
+            | SchemaDirective::PinInferred { transform, .. }
+            | SchemaDirective::Pinned { transform, .. } => transform,
         }
     }
 
     fn overrides(&self) -> &SchemaOverrides {
         match self {
-            SchemaDirective::Inferred { overrides }
+            SchemaDirective::Inferred { overrides, .. }
             | SchemaDirective::PinInferred { overrides, .. }
             | SchemaDirective::Pinned { overrides, .. } => overrides,
         }
+    }
+
+    /// Adds the directive echoes to a schema decision: every decision this
+    /// module reports — success and failure paths alike — carries the
+    /// transform and the overrides the definition configured, and neither
+    /// when it configured neither.
+    fn stamp(&self, decision: Value) -> Value {
+        self.transform().stamp(self.overrides().stamp(decision))
     }
 }
 
@@ -221,17 +255,13 @@ impl SchemaOverrides {
             .find(|override_| override_.name == name)
     }
 
-    /// The override-named fields absent from the observed source shape, in
-    /// declaration order.
-    fn unknown_names(&self, observed_names: &[String]) -> Vec<&str> {
-        let observed = observed_names
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<_>>();
+    /// The override-named fields absent from the dataset shape — the observed
+    /// source shape after the structural transform — in declaration order.
+    fn unknown_names(&self, dataset_names: &HashSet<&str>) -> Vec<&str> {
         self.overrides
             .iter()
             .map(|override_| override_.name.as_str())
-            .filter(|name| !observed.contains(name))
+            .filter(|name| !dataset_names.contains(name))
             .collect()
     }
 
@@ -262,6 +292,229 @@ impl SchemaOverrides {
     fn stamp(&self, mut decision: Value) -> Value {
         if !self.is_empty() {
             decision["overrides"] = self.echo();
+        }
+        decision
+    }
+}
+
+/// The `transform` block of a load definition as written (ADR-0039): the
+/// source fields to keep, in dataset order, and the source-to-dataset rename
+/// mapping. Part of the versioned load-definition contract, so unknown keys
+/// inside the block are rejected at parse time (ADR-0037).
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TransformConfig {
+    select: Option<Vec<String>>,
+    rename: Option<RenameMap>,
+}
+
+/// The `transform.rename` mapping as written: source field name to dataset
+/// field name, in declaration order. Deserialized through its own visitor so
+/// a duplicate source key fails YAML parsing — serde's default map handling
+/// would silently keep the last entry — and so the echo preserves the
+/// declaration order.
+#[derive(Debug)]
+struct RenameMap(Vec<(String, String)>);
+
+impl<'de> Deserialize<'de> for RenameMap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RenameMapVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for RenameMapVisitor {
+            type Value = RenameMap;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a map of source field name to dataset field name")
+            }
+
+            fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut entries: Vec<(String, String)> =
+                    Vec::with_capacity(access.size_hint().unwrap_or(0));
+                while let Some((source, target)) = access.next_entry::<String, String>()? {
+                    if entries.iter().any(|(seen, _)| *seen == source) {
+                        return Err(serde::de::Error::custom(format!(
+                            "duplicate transform.rename key {source:?}"
+                        )));
+                    }
+                    entries.push((source, target));
+                }
+                Ok(RenameMap(entries))
+            }
+        }
+
+        deserializer.deserialize_map(RenameMapVisitor)
+    }
+}
+
+impl Serialize for RenameMap {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_map(self.0.iter().map(|(source, target)| (source, target)))
+    }
+}
+
+/// The validated structural transform of a load definition (ADR-0039): field
+/// selection evaluates first, against observed source names, with the select
+/// list order fixing the dataset field order; the rename mapping evaluates
+/// second, applied simultaneously over the selected (or, without `select`,
+/// full observed) field set, so swaps are legal and unmapped fields pass
+/// through under their source names. Empty when the definition configures
+/// none, so every [`SchemaDirective`] can carry one without an optional
+/// wrapper.
+pub(crate) struct SchemaTransform {
+    select: Option<Vec<String>>,
+    rename: Vec<(String, String)>,
+}
+
+impl SchemaTransform {
+    /// No transform configured.
+    pub(crate) fn none() -> Self {
+        SchemaTransform {
+            select: None,
+            rename: Vec::new(),
+        }
+    }
+
+    /// Validates the `transform` block of a load definition before any data
+    /// is read (`invalid_transform_config`): the block must transform
+    /// something, select entries must be unique, and every rename must map an
+    /// actual name change onto a usable, unique target drawn from the select
+    /// list when one is declared — no implicit selection and no lenient
+    /// no-ops (ADR-0039). With `select`, the dataset shape is fully
+    /// config-determined, so a rename target colliding with another selected
+    /// field's dataset name is also rejected here; without `select`, the
+    /// pass-through field set is only known at read time and collisions
+    /// surface there as `transform_name_collision`.
+    pub(crate) fn from_config(config: &TransformConfig) -> Result<Self, LoadFailure> {
+        let invalid = |message: String| LoadFailure {
+            code: "invalid_transform_config",
+            message,
+        };
+        if config.select.is_none() && config.rename.is_none() {
+            return Err(invalid(
+                "a transform block must set transform.select or transform.rename".to_string(),
+            ));
+        }
+        if let Some(select) = &config.select {
+            if select.is_empty() {
+                return Err(invalid(
+                    "transform.select must name at least one field".to_string(),
+                ));
+            }
+            let mut seen_entries = HashSet::new();
+            for name in select {
+                if !seen_entries.insert(name.as_str()) {
+                    return Err(invalid(format!(
+                        "transform.select names field {name:?} more than once"
+                    )));
+                }
+            }
+        }
+        let rename = match &config.rename {
+            None => Vec::new(),
+            Some(rename) if rename.0.is_empty() => {
+                return Err(invalid(
+                    "transform.rename must map at least one field".to_string(),
+                ))
+            }
+            Some(rename) => rename.0.clone(),
+        };
+        let mut seen_targets = HashSet::new();
+        for (source, target) in &rename {
+            if target.trim().is_empty() {
+                return Err(invalid(format!(
+                    "transform.rename target for field {source:?} must not be empty"
+                )));
+            }
+            if source == target {
+                return Err(invalid(format!(
+                    "transform.rename maps field {source:?} to itself"
+                )));
+            }
+            if !seen_targets.insert(target.as_str()) {
+                return Err(invalid(format!(
+                    "transform.rename maps more than one field to {target:?}"
+                )));
+            }
+            if let Some(select) = &config.select {
+                if !select.contains(source) {
+                    return Err(invalid(format!(
+                        "transform.rename key {source:?} is not in transform.select"
+                    )));
+                }
+            }
+        }
+        if let Some(select) = &config.select {
+            let mut seen_dataset_names = HashSet::new();
+            for source in select {
+                let dataset_name = rename
+                    .iter()
+                    .find(|(key, _)| key == source)
+                    .map(|(_, target)| target.as_str())
+                    .unwrap_or(source.as_str());
+                if !seen_dataset_names.insert(dataset_name) {
+                    return Err(invalid(format!(
+                        "transform.select and transform.rename map more than one field \
+                         to the dataset name {dataset_name:?}"
+                    )));
+                }
+            }
+        }
+        Ok(SchemaTransform {
+            select: config.select.clone(),
+            rename,
+        })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.select.is_none() && self.rename.is_empty()
+    }
+
+    /// The dataset field name a selected source field materializes under: its
+    /// rename target, or the source name passed through.
+    fn dataset_name(&self, source_name: &str) -> String {
+        self.rename
+            .iter()
+            .find(|(source, _)| source == source_name)
+            .map(|(_, target)| target.clone())
+            .unwrap_or_else(|| source_name.to_string())
+    }
+
+    /// Renders the transform as the `schema_decision.transform` echo: the
+    /// block as written, with unset keys omitted.
+    fn echo(&self) -> Value {
+        let mut entry = serde_json::Map::new();
+        if let Some(select) = &self.select {
+            entry.insert("select".to_string(), json!(select));
+        }
+        if !self.rename.is_empty() {
+            entry.insert(
+                "rename".to_string(),
+                Value::Object(
+                    self.rename
+                        .iter()
+                        .map(|(source, target)| (source.clone(), json!(target)))
+                        .collect(),
+                ),
+            );
+        }
+        Value::Object(entry)
+    }
+
+    /// Adds the echo to a schema decision. Every decision the schema module
+    /// reports — success and failure paths alike — carries the transform the
+    /// definition configured, and none when it configured none.
+    fn stamp(&self, mut decision: Value) -> Value {
+        if !self.is_empty() {
+            decision["transform"] = self.echo();
         }
         decision
     }
@@ -415,142 +668,252 @@ pub(crate) fn from_text_columns(
     field_names: Vec<String>,
     records: Vec<TextRecord>,
 ) -> Result<Materialized, ExecutionFailure> {
-    check_override_names(directive, &field_names)?;
-    match directive {
-        SchemaDirective::Inferred { overrides } => {
-            inferred_text(&field_names, records, None, overrides)
-        }
-        SchemaDirective::PinInferred {
-            pinned_path,
-            overrides,
-        } => inferred_text(&field_names, records, Some(pinned_path), overrides),
-        SchemaDirective::Pinned {
-            pinned_path,
-            pin,
-            drift_policy,
-            overrides,
-        } => {
-            check_override_conflicts(pinned_path, pin, overrides)?;
-            let ShapeMatch { matched, added } =
-                match_shape(pinned_path, pin, drift_policy, &field_names, overrides)?;
-            let mut checks = pinned_checks(&matched);
-            checks.extend(override_checks(
-                overrides,
-                added.iter().map(|(name, index)| (name, *index)),
-            ));
-            let (survivors, rejected) = partition_text(records, &checks, &field_names);
-            // Added fields take their types from the surviving records only,
-            // so a rejected record's values never shape the destination.
-            let survivor_types = observe_text_types(field_names.len(), &survivors);
-            let added = planned_added_fields(added, &survivor_types, overrides);
-            let plan = assemble_pinned_plan(pinned_path, matched, added, overrides);
-            build_text(plan, &survivors, rejected)
-        }
-    }
+    stamped(
+        directive,
+        text_materialization(directive, field_names, records),
+    )
 }
 
-/// Materializes JSONL columns from their parsed [`Value`]s directly, owning the
-/// field projection (`None` / [`Value::Null`] → null) so a JSON string like
-/// `"01234"` stays text instead of being round-tripped through a re-parse.
+/// Materializes JSONL columns from their parsed [`Value`]s directly, owning
+/// how absent and [`Value::Null`] values become Arrow nulls, so a JSON string
+/// like `"01234"` stays text instead of being round-tripped through a
+/// re-parse.
 pub(crate) fn from_json_columns(
     directive: &SchemaDirective,
     field_names: Vec<String>,
     records: Vec<JsonRecord>,
 ) -> Result<Materialized, ExecutionFailure> {
-    check_override_names(directive, &field_names)?;
+    stamped(
+        directive,
+        json_materialization(directive, field_names, records),
+    )
+}
+
+/// Adds the directive echoes to whichever schema decision a materialization
+/// produced — the one place every decision passes through, so success and
+/// failure decisions alike carry the configured transform and overrides.
+fn stamped(
+    directive: &SchemaDirective,
+    result: Result<Materialized, ExecutionFailure>,
+) -> Result<Materialized, ExecutionFailure> {
+    match result {
+        Ok(mut materialized) => {
+            materialized.schema_decision = directive.stamp(materialized.schema_decision);
+            Ok(materialized)
+        }
+        Err(mut failure) => {
+            if let Some(decision) = failure.schema_decision.take() {
+                failure.schema_decision = Some(Box::new(directive.stamp(*decision)));
+            }
+            Err(failure)
+        }
+    }
+}
+
+fn text_materialization(
+    directive: &SchemaDirective,
+    field_names: Vec<String>,
+    records: Vec<TextRecord>,
+) -> Result<Materialized, ExecutionFailure> {
+    let columns = resolve_transform(directive, &field_names)?;
+    check_override_names(directive, &columns)?;
     match directive {
-        SchemaDirective::Inferred { overrides } => {
-            inferred_json(&field_names, records, None, overrides)
+        SchemaDirective::Inferred { overrides, .. } => {
+            inferred_text(&columns, &field_names, records, None, overrides)
         }
         SchemaDirective::PinInferred {
             pinned_path,
             overrides,
-        } => inferred_json(&field_names, records, Some(pinned_path), overrides),
+            ..
+        } => inferred_text(
+            &columns,
+            &field_names,
+            records,
+            Some(pinned_path),
+            overrides,
+        ),
         SchemaDirective::Pinned {
             pinned_path,
             pin,
             drift_policy,
             overrides,
+            ..
         } => {
             check_override_conflicts(pinned_path, pin, overrides)?;
             let ShapeMatch { matched, added } =
-                match_shape(pinned_path, pin, drift_policy, &field_names, overrides)?;
+                match_shape(pinned_path, pin, drift_policy, &columns)?;
             let mut checks = pinned_checks(&matched);
-            checks.extend(override_checks(
-                overrides,
-                added.iter().map(|(name, index)| (name, *index)),
-            ));
+            checks.extend(override_checks(overrides, added.iter()));
+            let (survivors, rejected) = partition_text(records, &checks, &field_names);
+            // Added fields take their types from the surviving records only,
+            // so a rejected record's values never shape the destination.
+            let survivor_types = observe_text_types(field_names.len(), &survivors);
+            let added = planned_added_fields(added, &survivor_types, overrides);
+            let plan = assemble_pinned_plan(pinned_path, matched, added);
+            build_text(plan, &survivors, rejected)
+        }
+    }
+}
+
+fn json_materialization(
+    directive: &SchemaDirective,
+    field_names: Vec<String>,
+    records: Vec<JsonRecord>,
+) -> Result<Materialized, ExecutionFailure> {
+    let columns = resolve_transform(directive, &field_names)?;
+    check_override_names(directive, &columns)?;
+    match directive {
+        SchemaDirective::Inferred { overrides, .. } => {
+            inferred_json(&columns, &field_names, records, None, overrides)
+        }
+        SchemaDirective::PinInferred {
+            pinned_path,
+            overrides,
+            ..
+        } => inferred_json(
+            &columns,
+            &field_names,
+            records,
+            Some(pinned_path),
+            overrides,
+        ),
+        SchemaDirective::Pinned {
+            pinned_path,
+            pin,
+            drift_policy,
+            overrides,
+            ..
+        } => {
+            check_override_conflicts(pinned_path, pin, overrides)?;
+            let ShapeMatch { matched, added } =
+                match_shape(pinned_path, pin, drift_policy, &columns)?;
+            let mut checks = pinned_checks(&matched);
+            checks.extend(override_checks(overrides, added.iter()));
             let (survivors, rejected) = partition_json(records, &checks);
             let survivor_types = observe_json_types(&field_names, &survivors);
             let added = planned_added_fields(added, &survivor_types, overrides);
-            let plan = assemble_pinned_plan(pinned_path, matched, added, overrides);
+            let plan = assemble_pinned_plan(pinned_path, matched, added);
             build_json(plan, &survivors, rejected)
         }
     }
 }
 
-/// Materializes an inference-driven or pin-bootstrapping CSV load: overridden
-/// fields validate per record like pinned fields (ADR-0038), and the
-/// surviving records alone shape every property no override sets, so a
-/// rejected record's values never shape the destination.
-fn inferred_text(
-    field_names: &[String],
-    records: Vec<TextRecord>,
-    pinned_path: Option<&str>,
-    overrides: &SchemaOverrides,
-) -> Result<Materialized, ExecutionFailure> {
-    let checks = override_checks(
-        overrides,
-        field_names
-            .iter()
-            .enumerate()
-            .map(|(index, name)| (name, index)),
-    );
-    let (survivors, rejected) = partition_text(records, &checks, field_names);
-    let survivor_types = observe_text_types(field_names.len(), &survivors);
-    let plan = inferred_plan(field_names, &survivor_types, pinned_path, overrides);
-    build_text(plan, &survivors, rejected)
+/// One field of the dataset a load materializes, produced by resolving the
+/// structural transform against the observed source shape: the dataset name
+/// the field writes under, the source field it reads from, and that source
+/// field's observed column index. Without a transform the dataset view is the
+/// observed source shape itself.
+#[derive(Clone)]
+struct DatasetColumn {
+    dataset_name: String,
+    source_name: String,
+    observed_index: usize,
 }
 
-/// Materializes an inference-driven or pin-bootstrapping JSONL load; see
-/// [`inferred_text`].
-fn inferred_json(
-    field_names: &[String],
-    records: Vec<JsonRecord>,
-    pinned_path: Option<&str>,
-    overrides: &SchemaOverrides,
-) -> Result<Materialized, ExecutionFailure> {
-    let checks = override_checks(
-        overrides,
-        field_names
-            .iter()
-            .enumerate()
-            .map(|(index, name)| (name, index)),
-    );
-    let (survivors, rejected) = partition_json(records, &checks);
-    let survivor_types = observe_json_types(field_names, &survivors);
-    let plan = inferred_plan(field_names, &survivor_types, pinned_path, overrides);
-    build_json(plan, &survivors, rejected)
-}
-
-/// Fails the load with `unknown_override_field` when an override names a
-/// field absent from the observed source shape — the CSV header, or the union
-/// of the JSONL batch's record keys, where a batch-wide-absent field is
-/// absent (ADR-0038). Checked as soon as the observed names are known and
-/// before any pin comparison, so a misspelled override never reads as drift.
-fn check_override_names(
+/// Resolves the directive's structural transform against the observed source
+/// names into the dataset columns everything downstream operates on
+/// (ADR-0040). Fails with `unknown_transform_field` when a select entry or
+/// rename key names no observed field — reported as the user wrote them —
+/// and with `transform_name_collision` when a rename target collides with a
+/// pass-through field name, which is reachable only without `select`: with
+/// one, the dataset shape is config-determined and collisions were already
+/// rejected at directive resolution. Duplicate observed names resolve to
+/// their first occurrence; purely pass-through duplicates keep their
+/// pre-transform meaning (drift under a pin) rather than becoming a
+/// transform failure.
+fn resolve_transform(
     directive: &SchemaDirective,
     observed_names: &[String],
-) -> Result<(), ExecutionFailure> {
-    let overrides = directive.overrides();
-    let unknown = overrides.unknown_names(observed_names);
-    if unknown.is_empty() {
-        return Ok(());
+) -> Result<Vec<DatasetColumn>, ExecutionFailure> {
+    let transform = directive.transform();
+    let mut observed_indexes: HashMap<&str, usize> = HashMap::with_capacity(observed_names.len());
+    for (index, name) in observed_names.iter().enumerate() {
+        observed_indexes.entry(name.as_str()).or_insert(index);
     }
 
-    // The load failed before any schema decision could be completed, so the
-    // decision echoes the configured posture — and no drift comparison ran.
-    let decision = match directive {
+    let mut unknown: Vec<&str> = Vec::new();
+    for name in transform
+        .select
+        .iter()
+        .flatten()
+        .chain(transform.rename.iter().map(|(source, _)| source))
+    {
+        if !observed_indexes.contains_key(name.as_str()) && !unknown.contains(&name.as_str()) {
+            unknown.push(name);
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(pre_materialization_failure(
+            LoadFailure {
+                code: "unknown_transform_field",
+                message: format!(
+                    "transform selects or renames fields absent from the observed source shape: {}",
+                    unknown.join(", ")
+                ),
+            },
+            configured_posture_decision(directive),
+        ));
+    }
+
+    let columns = match &transform.select {
+        Some(select) => select
+            .iter()
+            .map(|source_name| DatasetColumn {
+                dataset_name: transform.dataset_name(source_name),
+                source_name: source_name.clone(),
+                observed_index: observed_indexes[source_name.as_str()],
+            })
+            .collect::<Vec<_>>(),
+        None => observed_names
+            .iter()
+            .enumerate()
+            .map(|(observed_index, source_name)| DatasetColumn {
+                dataset_name: transform.dataset_name(source_name),
+                source_name: source_name.clone(),
+                observed_index,
+            })
+            .collect(),
+    };
+
+    // A dataset name produced by more than one column is a collision only
+    // when a rename put it there; identity renames are config-invalid, so a
+    // renamed column is exactly one whose names differ.
+    for column in &columns {
+        let colliding = columns
+            .iter()
+            .filter(|other| other.dataset_name == column.dataset_name)
+            .collect::<Vec<_>>();
+        if colliding.len() > 1
+            && colliding
+                .iter()
+                .any(|other| other.dataset_name != other.source_name)
+        {
+            let sources = colliding
+                .iter()
+                .map(|other| other.source_name.as_str())
+                .collect::<Vec<_>>();
+            return Err(pre_materialization_failure(
+                LoadFailure {
+                    code: "transform_name_collision",
+                    message: format!(
+                        "transform rename collides on dataset field {:?}: source fields {} map to the same name",
+                        column.dataset_name,
+                        sources.join(", ")
+                    ),
+                },
+                configured_posture_decision(directive),
+            ));
+        }
+    }
+
+    Ok(columns)
+}
+
+/// The schema decision a failure echoes when the load failed before any
+/// schema decision could be completed: the configured posture, with no drift
+/// comparison run.
+fn configured_posture_decision(directive: &SchemaDirective) -> Value {
+    match directive {
         SchemaDirective::Inferred { .. } => json!({
             "mode": "inferred",
             "drift_status": "not_applicable",
@@ -568,7 +931,67 @@ fn check_override_names(
             "drift_status": "not_applicable",
             "pinned_schema_path": pinned_path,
         }),
-    };
+    }
+}
+
+/// Materializes an inference-driven or pin-bootstrapping CSV load: overridden
+/// fields validate per record like pinned fields (ADR-0038), and the
+/// surviving records alone shape every property no override sets, so a
+/// rejected record's values never shape the destination. `field_names` stays
+/// the observed source shape — record width and rejection content — while
+/// `columns` is the dataset view the load materializes.
+fn inferred_text(
+    columns: &[DatasetColumn],
+    field_names: &[String],
+    records: Vec<TextRecord>,
+    pinned_path: Option<&str>,
+    overrides: &SchemaOverrides,
+) -> Result<Materialized, ExecutionFailure> {
+    let checks = override_checks(overrides, columns.iter());
+    let (survivors, rejected) = partition_text(records, &checks, field_names);
+    let survivor_types = observe_text_types(field_names.len(), &survivors);
+    let plan = inferred_plan(columns, &survivor_types, pinned_path, overrides);
+    build_text(plan, &survivors, rejected)
+}
+
+/// Materializes an inference-driven or pin-bootstrapping JSONL load; see
+/// [`inferred_text`].
+fn inferred_json(
+    columns: &[DatasetColumn],
+    field_names: &[String],
+    records: Vec<JsonRecord>,
+    pinned_path: Option<&str>,
+    overrides: &SchemaOverrides,
+) -> Result<Materialized, ExecutionFailure> {
+    let checks = override_checks(overrides, columns.iter());
+    let (survivors, rejected) = partition_json(records, &checks);
+    let survivor_types = observe_json_types(field_names, &survivors);
+    let plan = inferred_plan(columns, &survivor_types, pinned_path, overrides);
+    build_json(plan, &survivors, rejected)
+}
+
+/// Fails the load with `unknown_override_field` when an override names a
+/// field absent from the dataset shape — the CSV header, or the union of the
+/// JSONL batch's record keys, where a batch-wide-absent field is absent
+/// (ADR-0038), after the structural transform, so overrides speak dataset
+/// names and one naming a dropped source field is unknown (ADR-0040).
+/// Checked as soon as the dataset names are known and before any pin
+/// comparison, so a misspelled override never reads as drift.
+fn check_override_names(
+    directive: &SchemaDirective,
+    columns: &[DatasetColumn],
+) -> Result<(), ExecutionFailure> {
+    let dataset_names = columns
+        .iter()
+        .map(|column| column.dataset_name.as_str())
+        .collect::<HashSet<_>>();
+    let unknown = directive.overrides().unknown_names(&dataset_names);
+    if unknown.is_empty() {
+        return Ok(());
+    }
+
+    // The load failed before any schema decision could be completed, so the
+    // decision echoes the configured posture — and no drift comparison ran.
     Err(pre_materialization_failure(
         LoadFailure {
             code: "unknown_override_field",
@@ -577,7 +1000,7 @@ fn check_override_names(
                 unknown.join(", ")
             ),
         },
-        overrides.stamp(decision),
+        configured_posture_decision(directive),
     ))
 }
 
@@ -643,7 +1066,7 @@ fn check_override_conflicts(
                     segments.join("; ")
                 ),
             },
-            overrides.stamp(decision),
+            decision,
         ));
     }
     Ok(())
@@ -663,11 +1086,14 @@ fn pre_materialization_failure(failure: LoadFailure, decision: Value) -> Executi
     }
 }
 
-/// One field the load will materialize: its output name, the type its column is
-/// built as (never `Null`), whether its values may be null, and the index of
-/// the observed source column it reads from.
+/// One field the load will materialize: its dataset name, the source field it
+/// reads from — by observed column index for CSV cells and by source name for
+/// JSONL objects — the type its column is built as (never `Null`), and
+/// whether its values may be null. The two names differ exactly when a rename
+/// mapping changed the field's name (ADR-0039).
 struct PlannedField {
     name: String,
+    source_name: String,
     materialized_type: InferredType,
     nullable: bool,
     observed_index: usize,
@@ -682,32 +1108,33 @@ struct FieldPlan {
     pinned_schema_write: Option<PinnedSchemaWrite>,
 }
 
-/// Plans an inference-driven load: every observed column keeps its observed
+/// Plans an inference-driven load: every dataset column keeps its observed
 /// type (all-null columns default to text) and stays nullable, unless a
-/// schema override replaces either property (ADR-0038). With a `pinned_path`,
-/// the resulting — overridden — schema is also rendered for persistence as
-/// the new pin (ADR-0033).
+/// schema override — named in the dataset namespace — replaces either
+/// property (ADR-0038, ADR-0040). With a `pinned_path`, the resulting —
+/// overridden — schema is also rendered for persistence as the new pin
+/// (ADR-0033). `observed_types` spans the full observed source shape and is
+/// read through each column's observed index.
 fn inferred_plan(
-    observed_names: &[String],
+    columns: &[DatasetColumn],
     observed_types: &[InferredType],
     pinned_path: Option<&str>,
     overrides: &SchemaOverrides,
 ) -> FieldPlan {
-    let fields = observed_names
+    let fields = columns
         .iter()
-        .zip(observed_types)
-        .enumerate()
-        .map(|(observed_index, (name, observed_type))| {
-            let override_ = overrides.get(name);
+        .map(|column| {
+            let override_ = overrides.get(&column.dataset_name);
             PlannedField {
-                name: name.clone(),
+                name: column.dataset_name.clone(),
+                source_name: column.source_name.clone(),
                 materialized_type: override_
                     .and_then(|override_| override_.field_type)
-                    .unwrap_or_else(|| default_null_to_text(*observed_type)),
+                    .unwrap_or_else(|| default_null_to_text(observed_types[column.observed_index])),
                 nullable: override_
                     .and_then(|override_| override_.nullable)
                     .unwrap_or(true),
-                observed_index,
+                observed_index: column.observed_index,
             }
         })
         .collect::<Vec<_>>();
@@ -728,21 +1155,22 @@ fn inferred_plan(
 
     FieldPlan {
         fields,
-        decision: overrides.stamp(decision),
+        decision,
         pinned_schema_write,
     }
 }
 
-/// The outcome of matching observed source fields against the pin by name:
-/// the pin's fields planned in pin order, and the added fields (name and
-/// observed column index) awaiting their survivor-observed types.
+/// The outcome of matching the dataset columns against the pin by name: the
+/// pin's fields planned in pin order, and the added dataset columns awaiting
+/// their survivor-observed types.
 struct ShapeMatch {
     matched: Vec<PlannedField>,
-    added: Vec<(String, usize)>,
+    added: Vec<DatasetColumn>,
 }
 
-/// Matches the observed source fields against the pinned schema by name and
-/// fails with `schema_drift` on shape drift: duplicate source field names, a
+/// Matches the dataset columns — the observed source fields after the
+/// structural transform (ADR-0040) — against the pinned schema by name and
+/// fails with `schema_drift` on shape drift: duplicate dataset field names, a
 /// pinned field absent from every record, or an added field the drift policy
 /// does not allow (ADR-0034). Value fit is not judged here — that is
 /// per-record work (ADR-0035).
@@ -750,20 +1178,22 @@ fn match_shape(
     pinned_path: &str,
     pin: &PinnedSchema,
     drift_policy: &DriftPolicy,
-    observed_names: &[String],
-    overrides: &SchemaOverrides,
+    columns: &[DatasetColumn],
 ) -> Result<ShapeMatch, ExecutionFailure> {
-    // Observed columns match pin fields by name, so duplicate observed names
-    // are unmatchable shape drift.
-    let mut observed_indexes = HashMap::with_capacity(observed_names.len());
-    for (index, name) in observed_names.iter().enumerate() {
-        if observed_indexes.insert(name.as_str(), index).is_some() {
+    // Dataset columns match pin fields by name, so duplicate names — only
+    // pass-through source duplicates survive the transform's collision check,
+    // where dataset and source names coincide — are unmatchable shape drift.
+    let mut columns_by_name: HashMap<&str, &DatasetColumn> = HashMap::with_capacity(columns.len());
+    for column in columns {
+        if columns_by_name
+            .insert(column.dataset_name.as_str(), column)
+            .is_some()
+        {
             return Err(drift_failure(
                 pinned_path,
                 pin,
-                overrides,
-                format!("source field {name:?} appears more than once, so records cannot be validated against the pinned schema"),
-                json!({ "duplicate_fields": [name] }),
+                format!("source field {:?} appears more than once, so records cannot be validated against the pinned schema", column.dataset_name),
+                json!({ "duplicate_fields": [column.dataset_name] }),
             ));
         }
     }
@@ -771,13 +1201,14 @@ fn match_shape(
     let mut missing_fields = Vec::new();
     let mut matched = Vec::new();
     for pin_field in &pin.fields {
-        match observed_indexes.get(pin_field.name.as_str()) {
+        match columns_by_name.get(pin_field.name.as_str()) {
             None => missing_fields.push(pin_field.name.clone()),
-            Some(&observed_index) => matched.push(PlannedField {
+            Some(column) => matched.push(PlannedField {
                 name: pin_field.name.clone(),
+                source_name: column.source_name.clone(),
                 materialized_type: pin_field.field_type,
                 nullable: pin_field.nullable,
-                observed_index,
+                observed_index: column.observed_index,
             }),
         }
     }
@@ -786,18 +1217,17 @@ fn match_shape(
         .iter()
         .map(|field| field.name.as_str())
         .collect::<HashSet<_>>();
-    let added = observed_names
+    let added = columns
         .iter()
-        .enumerate()
-        .filter(|(_, name)| !pinned_names.contains(name.as_str()))
-        .map(|(observed_index, name)| (name.clone(), observed_index))
+        .filter(|column| !pinned_names.contains(column.dataset_name.as_str()))
+        .cloned()
         .collect::<Vec<_>>();
 
     let additive_allowed = matches!(drift_policy, DriftPolicy::AllowAdditiveNullable);
     if !missing_fields.is_empty() || (!added.is_empty() && !additive_allowed) {
         let added_names = added
             .iter()
-            .map(|(name, _)| name.as_str())
+            .map(|column| column.dataset_name.as_str())
             .collect::<Vec<_>>();
         let mut segments = Vec::new();
         if !missing_fields.is_empty() {
@@ -809,7 +1239,6 @@ fn match_shape(
         return Err(drift_failure(
             pinned_path,
             pin,
-            overrides,
             segments.join("; "),
             json!({
                 "missing_fields": missing_fields,
@@ -821,16 +1250,27 @@ fn match_shape(
     Ok(ShapeMatch { matched, added })
 }
 
-/// One per-record value check (ADR-0035, ADR-0038): the field it guards, the
-/// observed column it reads from, the type its values must widen to — if any
-/// — with the wording its rejections carry, and whether a null value rejects
+/// One per-record value check (ADR-0035, ADR-0038): the dataset field it
+/// guards, the source field it reads — by observed column index for CSV and
+/// by source name for JSONL — the type its values must widen to — if any —
+/// with the wording its rejections carry, and whether a null value rejects
 /// the record. Pinned fields check everything the pin declares; overridden
 /// fields check exactly the properties their override sets.
 struct FieldCheck {
     name: String,
+    source_name: String,
     observed_index: usize,
     expected_type: Option<(InferredType, TypeOrigin)>,
     required: bool,
+}
+
+impl FieldCheck {
+    /// The source field a rejection names alongside the dataset field — set
+    /// only when a rename mapping changed the rejected field's name
+    /// (ADR-0039).
+    fn renamed_source(&self) -> Option<String> {
+        (self.name != self.source_name).then(|| self.source_name.clone())
+    }
 }
 
 /// Where a field's expected type came from, for rejection messages: the
@@ -857,6 +1297,7 @@ fn pinned_checks(matched: &[PlannedField]) -> Vec<FieldCheck> {
         .iter()
         .map(|planned| FieldCheck {
             name: planned.name.clone(),
+            source_name: planned.source_name.clone(),
             observed_index: planned.observed_index,
             expected_type: Some((planned.materialized_type, TypeOrigin::Pinned)),
             required: !planned.nullable,
@@ -864,24 +1305,27 @@ fn pinned_checks(matched: &[PlannedField]) -> Vec<FieldCheck> {
         .collect()
 }
 
-/// The checks the overrides impose on the given observed columns, in column
+/// The checks the overrides impose on the given dataset columns, in column
 /// order: the overridden type must hold per value, and an override to
 /// `nullable: false` makes the field required (ADR-0038). Columns without an
 /// override — and properties an override leaves unset — check nothing.
 fn override_checks<'a>(
     overrides: &SchemaOverrides,
-    columns: impl Iterator<Item = (&'a String, usize)>,
+    columns: impl Iterator<Item = &'a DatasetColumn>,
 ) -> Vec<FieldCheck> {
     columns
-        .filter_map(|(name, observed_index)| {
-            overrides.get(name).map(|override_| FieldCheck {
-                name: name.clone(),
-                observed_index,
-                expected_type: override_
-                    .field_type
-                    .map(|field_type| (field_type, TypeOrigin::Overridden)),
-                required: override_.nullable == Some(false),
-            })
+        .filter_map(|column| {
+            overrides
+                .get(&column.dataset_name)
+                .map(|override_| FieldCheck {
+                    name: column.dataset_name.clone(),
+                    source_name: column.source_name.clone(),
+                    observed_index: column.observed_index,
+                    expected_type: override_
+                        .field_type
+                        .map(|field_type| (field_type, TypeOrigin::Overridden)),
+                    required: override_.nullable == Some(false),
+                })
         })
         .collect()
 }
@@ -923,7 +1367,9 @@ fn partition_json(
 
 /// Validates one CSV record against the field checks, in check order: the
 /// first null cell in a required field or the first cell whose observed type
-/// does not widen to its expected type rejects the record (ADR-0035).
+/// does not widen to its expected type rejects the record (ADR-0035). The
+/// rejection names the dataset field while `record` keeps the original
+/// source content under source names (ADR-0039).
 fn validate_text_record(
     record: &TextRecord,
     checks: &[FieldCheck],
@@ -935,7 +1381,7 @@ fn validate_text_record(
                 if check.required {
                     return Some(required_field_rejection(
                         record.line,
-                        &check.name,
+                        check,
                         text_record_json(field_names, &record.cells),
                     ));
                 }
@@ -960,15 +1406,16 @@ fn validate_text_record(
 }
 
 /// Validates one JSONL record against the field checks; see
-/// [`validate_text_record`]. A field absent from the record reads as null.
+/// [`validate_text_record`]. Values are read under their source names; a
+/// field absent from the record reads as null.
 fn validate_json_record(record: &JsonRecord, checks: &[FieldCheck]) -> Option<RejectedRecord> {
     for check in checks {
-        match record.object.get(&check.name) {
+        match record.object.get(&check.source_name) {
             None | Some(Value::Null) => {
                 if check.required {
                     return Some(required_field_rejection(
                         record.line,
-                        &check.name,
+                        check,
                         Value::Object(record.object.clone()),
                     ));
                 }
@@ -1000,12 +1447,13 @@ fn fits_expected_type(observed: InferredType, expected: InferredType) -> bool {
     observed.merge(expected) == expected
 }
 
-fn required_field_rejection(line: u64, field_name: &str, record: Value) -> RejectedRecord {
+fn required_field_rejection(line: u64, check: &FieldCheck, record: Value) -> RejectedRecord {
     RejectedRecord {
         line,
         code: rejection::MISSING_REQUIRED_FIELD,
-        field: Some(field_name.to_string()),
-        message: format!("required field {field_name:?} is null"),
+        field: Some(check.name.clone()),
+        source_field: check.renamed_source(),
+        message: format!("required field {:?} is null", check.name),
         record,
     }
 }
@@ -1022,6 +1470,7 @@ fn type_rejection(
         line,
         code: rejection::TYPE_COERCION_FAILED,
         field: Some(check.name.clone()),
+        source_field: check.renamed_source(),
         message: format!(
             "value {value} does not fit {} type {} for field {:?}",
             origin.wording(),
@@ -1057,23 +1506,24 @@ fn text_record_json(field_names: &[String], cells: &[Option<String>]) -> Value {
 /// both defaults, including `nullable: false` (ADR-0038); the rewritten pin
 /// then records the overridden properties.
 fn planned_added_fields(
-    added: Vec<(String, usize)>,
+    added: Vec<DatasetColumn>,
     survivor_types: &[InferredType],
     overrides: &SchemaOverrides,
 ) -> Vec<PlannedField> {
     added
         .into_iter()
-        .map(|(name, observed_index)| {
-            let override_ = overrides.get(&name);
+        .map(|column| {
+            let override_ = overrides.get(&column.dataset_name);
             PlannedField {
                 materialized_type: override_
                     .and_then(|override_| override_.field_type)
-                    .unwrap_or_else(|| default_null_to_text(survivor_types[observed_index])),
+                    .unwrap_or_else(|| default_null_to_text(survivor_types[column.observed_index])),
                 nullable: override_
                     .and_then(|override_| override_.nullable)
                     .unwrap_or(true),
-                name,
-                observed_index,
+                name: column.dataset_name,
+                source_name: column.source_name,
+                observed_index: column.observed_index,
             }
         })
         .collect()
@@ -1087,7 +1537,6 @@ fn assemble_pinned_plan(
     pinned_path: &str,
     matched: Vec<PlannedField>,
     added: Vec<PlannedField>,
-    overrides: &SchemaOverrides,
 ) -> FieldPlan {
     if added.is_empty() {
         let decision = json!({
@@ -1098,7 +1547,7 @@ fn assemble_pinned_plan(
         });
         return FieldPlan {
             fields: matched,
-            decision: overrides.stamp(decision),
+            decision,
             pinned_schema_write: None,
         };
     }
@@ -1106,14 +1555,14 @@ fn assemble_pinned_plan(
     let added_json = fields_json(&added);
     let mut fields = matched;
     fields.extend(added);
-    let decision = overrides.stamp(json!({
+    let decision = json!({
         "mode": "pinned",
         "fields": fields_json(&fields),
         "drift_status": "additive_fields_added",
         "added_fields": added_json,
         "pinned_schema_path": pinned_path,
         "pinned_schema_persisted": true,
-    }));
+    });
     let pinned_schema_write = Some(PinnedSchemaWrite {
         pinned_path: pinned_path.to_string(),
         yaml: pin_yaml(&fields),
@@ -1131,17 +1580,16 @@ fn assemble_pinned_plan(
 fn drift_failure(
     pinned_path: &str,
     pin: &PinnedSchema,
-    overrides: &SchemaOverrides,
     detail: String,
     drift: Value,
 ) -> ExecutionFailure {
-    let decision = overrides.stamp(json!({
+    let decision = json!({
         "mode": "pinned",
         "fields": pinned_fields_json(pin),
         "drift_status": "failed_on_drift",
         "drift": drift,
         "pinned_schema_path": pinned_path,
-    }));
+    });
     pre_materialization_failure(
         LoadFailure {
             code: "schema_drift",
@@ -1213,8 +1661,8 @@ fn build_text(
     materialize(plan, columns, rejected)
 }
 
-/// Builds the planned columns over the surviving JSONL records and assembles
-/// the batch.
+/// Builds the planned columns over the surviving JSONL records — read under
+/// their source names — and assembles the batch.
 fn build_json(
     plan: FieldPlan,
     records: &[JsonRecord],
@@ -1228,7 +1676,7 @@ fn build_json(
             build_json_array(
                 planned.materialized_type,
                 records,
-                &planned.name,
+                &planned.source_name,
                 column_index,
             )
         })
@@ -2074,10 +2522,20 @@ mod tests {
         drift_policy: DriftPolicy,
         overrides: SchemaOverrides,
     ) -> SchemaDirective {
+        transformed_pinned_directive(pin_yaml, drift_policy, SchemaTransform::none(), overrides)
+    }
+
+    fn transformed_pinned_directive(
+        pin_yaml: &str,
+        drift_policy: DriftPolicy,
+        transform: SchemaTransform,
+        overrides: SchemaOverrides,
+    ) -> SchemaDirective {
         SchemaDirective::Pinned {
             pinned_path: "customers.schema.yml".to_string(),
             pin: PinnedSchema::from_yaml(pin_yaml).expect("test pin parses"),
             drift_policy,
+            transform,
             overrides,
         }
     }
@@ -2101,7 +2559,23 @@ mod tests {
         entries: &[(&str, Option<&str>, Option<bool>)],
     ) -> SchemaDirective {
         SchemaDirective::Inferred {
+            transform: SchemaTransform::none(),
             overrides: overrides(entries),
+        }
+    }
+
+    /// Builds a validated transform from the `transform` block's YAML text.
+    fn transform(yaml: &str) -> SchemaTransform {
+        SchemaTransform::from_config(
+            &serde_yaml::from_str::<TransformConfig>(yaml).expect("test transform parses"),
+        )
+        .expect("test transform validates")
+    }
+
+    fn transformed_inferred_directive(yaml: &str) -> SchemaDirective {
+        SchemaDirective::Inferred {
+            transform: transform(yaml),
+            overrides: SchemaOverrides::none(),
         }
     }
 
@@ -2490,6 +2964,7 @@ mod tests {
         let materialized = from_text_columns(
             &SchemaDirective::PinInferred {
                 pinned_path: "customers.schema.yml".to_string(),
+                transform: SchemaTransform::none(),
                 overrides: SchemaOverrides::none(),
             },
             names(&["id", "total"]),
@@ -2849,6 +3324,7 @@ mod tests {
         // non-nullable.
         let materialized = from_json_columns(
             &SchemaDirective::Inferred {
+                transform: SchemaTransform::none(),
                 overrides: overrides(&[("email", None, Some(false))]),
             },
             names(&["id", "email"]),
@@ -2927,6 +3403,7 @@ mod tests {
         let materialized = from_text_columns(
             &SchemaDirective::PinInferred {
                 pinned_path: "customers.schema.yml".to_string(),
+                transform: SchemaTransform::none(),
                 overrides: overrides(&[("customer_id", Some("utf8"), Some(false))]),
             },
             names(&["customer_id", "total"]),
@@ -3236,6 +3713,527 @@ mod tests {
         assert_eq!(
             error.schema_decision.expect("decision")["overrides"],
             json!([{"name": "extra", "type": "utf8"}])
+        );
+    }
+
+    // ---- Structural transforms (ADR-0039, ADR-0040) ----
+
+    fn batch_field_names(batch: &RecordBatch) -> Vec<String> {
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn from_text_columns_selects_fields_in_select_order_and_renames_them() {
+        // The select list fixes the dataset order (total before id), the
+        // rename maps id → customer_id, and the unselected `note` column
+        // vanishes. The decision echoes the transform as written.
+        let materialized = from_text_columns(
+            &transformed_inferred_directive("select: [total, id]\nrename: {id: customer_id}"),
+            names(&["id", "note", "total"]),
+            vec![
+                record(2, &[Some("1"), Some("a"), Some("42.5")]),
+                record(3, &[Some("2"), Some("b"), Some("7.25")]),
+            ],
+        )
+        .expect("materialize");
+        let batch = &materialized.batch;
+
+        assert_eq!(batch_field_names(batch), ["total", "customer_id"]);
+        assert_eq!(
+            schema_types(batch),
+            vec![DataType::Float64, DataType::Int64]
+        );
+        assert_eq!(floats(batch, 0).value(0), 42.5);
+        assert_eq!(ints(batch, 1).value(1), 2);
+        assert!(materialized.rejected.is_empty());
+        assert_eq!(
+            materialized.schema_decision,
+            json!({
+                "mode": "inferred",
+                "fields": [
+                    {"name": "total", "type": "float64", "nullable": true},
+                    {"name": "customer_id", "type": "int64", "nullable": true}
+                ],
+                "drift_status": "not_applicable",
+                "transform": {
+                    "select": ["total", "id"],
+                    "rename": {"id": "customer_id"}
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn from_json_columns_applies_rename_swaps_simultaneously() {
+        // {a: b, b: a} is a legal swap: rename keys are source names
+        // evaluated at once, values are still read under their source names,
+        // and the unmapped `c` passes through.
+        let materialized = from_json_columns(
+            &transformed_inferred_directive("rename: {a: b, b: a}"),
+            names(&["a", "b", "c"]),
+            vec![json_record(1, r#"{"a": 1, "b": "x", "c": true}"#)],
+        )
+        .expect("materialize");
+        let batch = &materialized.batch;
+
+        assert_eq!(batch_field_names(batch), ["b", "a", "c"]);
+        assert_eq!(
+            schema_types(batch),
+            vec![DataType::Int64, DataType::Utf8, DataType::Boolean]
+        );
+        // Dataset b reads source a and dataset a reads source b.
+        assert_eq!(ints(batch, 0).value(0), 1);
+        assert_eq!(strings(batch, 1).value(0), "x");
+        assert!(bools(batch, 2).value(0));
+        assert_eq!(
+            materialized.schema_decision["transform"],
+            json!({ "rename": {"a": "b", "b": "a"} })
+        );
+    }
+
+    #[test]
+    fn from_text_columns_fails_on_a_transform_naming_an_unobserved_field() {
+        // A select entry the source does not carry fails the load before
+        // anything is materialized, named as the user wrote it, with the
+        // decision echoing the configured posture.
+        let error = from_text_columns(
+            &transformed_inferred_directive("select: [id, vip]\nrename: {id: customer_id}"),
+            names(&["id", "name"]),
+            vec![record(2, &[Some("1"), Some("Ada")])],
+        )
+        .err()
+        .expect("unknown transform field rejected");
+
+        assert_eq!(error.failure.code, "unknown_transform_field");
+        assert_eq!(
+            error.failure.message,
+            "transform selects or renames fields absent from the observed source shape: vip"
+        );
+        assert!(error.rejected.is_empty());
+        assert_eq!(
+            *error.schema_decision.expect("decision echoes the posture"),
+            json!({
+                "mode": "inferred",
+                "drift_status": "not_applicable",
+                "transform": {
+                    "select": ["id", "vip"],
+                    "rename": {"id": "customer_id"}
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn from_json_columns_treats_a_batch_wide_absent_transform_field_as_unknown() {
+        // JSONL's observed shape is the union of the batch's record keys, so
+        // a rename key absent from every record is unknown, mirroring the
+        // override and missing-field-drift batch-wide rules (ADR-0034).
+        let error = from_json_columns(
+            &transformed_inferred_directive("rename: {email: contact_email}"),
+            names(&["id"]),
+            vec![json_record(1, r#"{"id": 1}"#)],
+        )
+        .err()
+        .expect("batch-wide absent transform field rejected");
+
+        assert_eq!(error.failure.code, "unknown_transform_field");
+        assert_eq!(
+            error.failure.message,
+            "transform selects or renames fields absent from the observed source shape: email"
+        );
+    }
+
+    #[test]
+    fn from_text_columns_fails_when_a_rename_target_collides_with_a_pass_through_field() {
+        // Without select, every unmapped field passes through: renaming
+        // legacy_id onto the still-present id collides on the final name.
+        let error = from_text_columns(
+            &transformed_inferred_directive("rename: {legacy_id: id}"),
+            names(&["id", "legacy_id"]),
+            vec![record(2, &[Some("1"), Some("2")])],
+        )
+        .err()
+        .expect("collision rejected");
+
+        assert_eq!(error.failure.code, "transform_name_collision");
+        assert_eq!(
+            error.failure.message,
+            "transform rename collides on dataset field \"id\": \
+             source fields id, legacy_id map to the same name"
+        );
+        assert_eq!(
+            *error.schema_decision.expect("decision echoes the posture"),
+            json!({
+                "mode": "inferred",
+                "drift_status": "not_applicable",
+                "transform": {
+                    "rename": {"legacy_id": "id"}
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn unknown_transform_fields_fail_before_unknown_override_fields() {
+        // Both the transform and the overrides name unobserved fields: the
+        // transform resolves first — overrides speak the dataset namespace it
+        // produces — so its code wins.
+        let directive = SchemaDirective::Inferred {
+            transform: transform("select: [ghost]"),
+            overrides: overrides(&[("phantom", Some("int64"), None)]),
+        };
+        let error = from_text_columns(&directive, names(&["id"]), vec![record(2, &[Some("1")])])
+            .err()
+            .expect("unknown transform field rejected");
+
+        assert_eq!(error.failure.code, "unknown_transform_field");
+    }
+
+    #[test]
+    fn unknown_transform_fields_fail_before_missing_field_drift() {
+        // The pin misses a field and the transform names a ghost: the
+        // transform resolves before any pin comparison, and the posture
+        // decision echoes the pin without a drift comparison.
+        let directive = transformed_pinned_directive(
+            "version: 1\n\
+             fields:\n\
+             - name: id\n\
+             \x20 type: int64\n\
+             - name: name\n\
+             \x20 type: utf8\n",
+            DriftPolicy::Fail,
+            transform("select: [ghost]"),
+            SchemaOverrides::none(),
+        );
+        let error = from_text_columns(&directive, names(&["id"]), vec![record(2, &[Some("1")])])
+            .err()
+            .expect("unknown transform field rejected");
+
+        assert_eq!(error.failure.code, "unknown_transform_field");
+        assert_eq!(
+            *error.schema_decision.expect("decision echoes the pin"),
+            json!({
+                "mode": "pinned",
+                "fields": [
+                    {"name": "id", "type": "int64", "nullable": true},
+                    {"name": "name", "type": "utf8", "nullable": true}
+                ],
+                "drift_status": "not_applicable",
+                "pinned_schema_path": "customers.schema.yml",
+                "transform": {
+                    "select": ["ghost"]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn overrides_name_dataset_fields_after_the_transform() {
+        // The override names the renamed dataset field and rewrites it; the
+        // decision carries both echoes.
+        let directive = SchemaDirective::Inferred {
+            transform: transform("select: [id]\nrename: {id: customer_id}"),
+            overrides: overrides(&[("customer_id", Some("utf8"), None)]),
+        };
+        let materialized = from_text_columns(
+            &directive,
+            names(&["id", "note"]),
+            vec![record(2, &[Some("1"), Some("x")])],
+        )
+        .expect("materialize");
+
+        assert_eq!(batch_field_names(&materialized.batch), ["customer_id"]);
+        assert_eq!(schema_types(&materialized.batch), vec![DataType::Utf8]);
+        assert_eq!(strings(&materialized.batch, 0).value(0), "1");
+        assert_eq!(
+            materialized.schema_decision["overrides"],
+            json!([{"name": "customer_id", "type": "utf8"}])
+        );
+        assert_eq!(
+            materialized.schema_decision["transform"],
+            json!({
+                "select": ["id"],
+                "rename": {"id": "customer_id"}
+            })
+        );
+    }
+
+    #[test]
+    fn overrides_naming_a_dropped_or_pre_rename_source_field_are_unknown() {
+        // Overrides speak dataset names (ADR-0040): the dropped `note` and
+        // the pre-rename `id` are both absent from the dataset shape.
+        for override_name in ["note", "id"] {
+            let directive = SchemaDirective::Inferred {
+                transform: transform("select: [id]\nrename: {id: customer_id}"),
+                overrides: overrides(&[(override_name, Some("utf8"), None)]),
+            };
+            let error = from_text_columns(
+                &directive,
+                names(&["id", "note"]),
+                vec![record(2, &[Some("1"), Some("x")])],
+            )
+            .err()
+            .expect("override outside the dataset namespace rejected");
+
+            assert_eq!(
+                error.failure.code, "unknown_override_field",
+                "code for override {override_name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_text_columns_persists_the_transformed_schema_as_the_new_pin() {
+        // The bootstrap pin records the dataset shape: dataset names, in
+        // select order (ADR-0040).
+        let materialized = from_text_columns(
+            &SchemaDirective::PinInferred {
+                pinned_path: "customers.schema.yml".to_string(),
+                transform: transform("select: [total, id]\nrename: {id: customer_id}"),
+                overrides: SchemaOverrides::none(),
+            },
+            names(&["id", "note", "total"]),
+            vec![record(2, &[Some("1"), Some("x"), Some("42.5")])],
+        )
+        .expect("materialize");
+
+        assert_eq!(
+            materialized.schema_decision,
+            json!({
+                "mode": "inferred",
+                "fields": [
+                    {"name": "total", "type": "float64", "nullable": true},
+                    {"name": "customer_id", "type": "int64", "nullable": true}
+                ],
+                "drift_status": "not_applicable",
+                "pinned_schema_path": "customers.schema.yml",
+                "pinned_schema_persisted": true,
+                "transform": {
+                    "select": ["total", "id"],
+                    "rename": {"id": "customer_id"}
+                }
+            })
+        );
+        assert_eq!(
+            materialized
+                .pinned_schema_write
+                .expect("bootstrap pin")
+                .yaml,
+            "version: 1\n\
+             fields:\n\
+             - name: total\n\
+             \x20 type: float64\n\
+             \x20 nullable: true\n\
+             - name: customer_id\n\
+             \x20 type: int64\n\
+             \x20 nullable: true\n"
+        );
+    }
+
+    #[test]
+    fn unselected_source_fields_are_invisible_to_drift() {
+        // The pin governs the selected dataset shape: a new unselected source
+        // field yields no drift even under the fail policy (ADR-0040).
+        let directive = transformed_pinned_directive(
+            "version: 1\nfields:\n- name: customer_id\n  type: int64\n",
+            DriftPolicy::Fail,
+            transform("select: [id]\nrename: {id: customer_id}"),
+            SchemaOverrides::none(),
+        );
+        let materialized = from_text_columns(
+            &directive,
+            names(&["id", "surprise"]),
+            vec![record(2, &[Some("1"), Some("x")])],
+        )
+        .expect("unselected fields are shielded from drift");
+
+        assert_eq!(batch_field_names(&materialized.batch), ["customer_id"]);
+        assert_eq!(materialized.schema_decision["drift_status"], "none");
+        assert!(materialized.pinned_schema_write.is_none());
+    }
+
+    #[test]
+    fn rename_only_transforms_leave_additive_drift_behaving_as_today() {
+        // Without select, a new source field passes through and additive
+        // drift extends the pin exactly as before the transform existed.
+        let directive = transformed_pinned_directive(
+            "version: 1\nfields:\n- name: customer_id\n  type: int64\n",
+            DriftPolicy::AllowAdditiveNullable,
+            transform("rename: {id: customer_id}"),
+            SchemaOverrides::none(),
+        );
+        let materialized = from_text_columns(
+            &directive,
+            names(&["id", "vip"]),
+            vec![record(2, &[Some("1"), Some("true")])],
+        )
+        .expect("additive drift allowed");
+
+        assert_eq!(
+            materialized.schema_decision["drift_status"],
+            "additive_fields_added"
+        );
+        assert_eq!(
+            materialized.schema_decision["added_fields"],
+            json!([{"name": "vip", "type": "boolean", "nullable": true}])
+        );
+        assert_eq!(
+            materialized.pinned_schema_write.expect("extended pin").yaml,
+            "version: 1\n\
+             fields:\n\
+             - name: customer_id\n\
+             \x20 type: int64\n\
+             \x20 nullable: true\n\
+             - name: vip\n\
+             \x20 type: boolean\n\
+             \x20 nullable: true\n"
+        );
+    }
+
+    #[test]
+    fn a_pin_recorded_before_the_transform_fails_as_schema_drift() {
+        // The old pin records source names; the transform now renames them,
+        // so the dataset shape misses the pinned name and adds the new one —
+        // drift under the fail policy, with no pin migration (ADR-0040).
+        let directive = transformed_pinned_directive(
+            "version: 1\nfields:\n- name: id\n  type: int64\n",
+            DriftPolicy::Fail,
+            transform("rename: {id: customer_id}"),
+            SchemaOverrides::none(),
+        );
+        let error = from_text_columns(&directive, names(&["id"]), vec![record(2, &[Some("1")])])
+            .err()
+            .expect("pre-transform pin drifts");
+
+        assert_eq!(error.failure.code, "schema_drift");
+        assert_eq!(
+            error.failure.message,
+            "schema drift against pinned schema customers.schema.yml: \
+             missing fields: id; added fields: customer_id"
+        );
+        assert_eq!(
+            error.schema_decision.expect("decision")["transform"],
+            json!({ "rename": {"id": "customer_id"} })
+        );
+    }
+
+    #[test]
+    fn rejections_on_renamed_fields_carry_the_dataset_and_source_names() {
+        // A rejection on a renamed field names the dataset field, points back
+        // at the source field, and keeps the record under source names.
+        let directive = SchemaDirective::Inferred {
+            transform: transform("rename: {id: customer_id}"),
+            overrides: overrides(&[("customer_id", Some("int64"), None)]),
+        };
+        let materialized = from_text_columns(
+            &directive,
+            names(&["id", "note"]),
+            vec![
+                record(2, &[Some("1"), Some("a")]),
+                record(3, &[Some("n/a"), Some("b")]),
+            ],
+        )
+        .expect("override misfits reject records, not the load");
+
+        assert_eq!(materialized.rejected.len(), 1);
+        let rejected = &materialized.rejected[0];
+        assert_eq!(rejected.line, 3);
+        assert_eq!(rejected.code, "type_coercion_failed");
+        assert_eq!(rejected.field.as_deref(), Some("customer_id"));
+        assert_eq!(rejected.source_field.as_deref(), Some("id"));
+        assert_eq!(
+            rejected.message,
+            "value \"n/a\" does not fit overridden type int64 for field \"customer_id\""
+        );
+        assert_eq!(rejected.record, json!({ "id": "n/a", "note": "b" }));
+    }
+
+    #[test]
+    fn rejections_on_unrenamed_fields_carry_no_source_field() {
+        // Selection alone changes no names: a rejection on a selected but
+        // unrenamed field leaves source_field unset.
+        let directive = SchemaDirective::Inferred {
+            transform: transform("select: [id, email]"),
+            overrides: overrides(&[("email", None, Some(false))]),
+        };
+        let materialized = from_json_columns(
+            &directive,
+            names(&["id", "email"]),
+            vec![
+                json_record(1, r#"{"id": 1, "email": "a@example.com"}"#),
+                json_record(2, r#"{"id": 2}"#),
+            ],
+        )
+        .expect("required-field violations reject records, not the load");
+
+        assert_eq!(materialized.rejected.len(), 1);
+        let rejected = &materialized.rejected[0];
+        assert_eq!(rejected.field.as_deref(), Some("email"));
+        assert_eq!(rejected.source_field, None);
+    }
+
+    #[test]
+    fn json_checks_and_columns_read_values_under_source_names() {
+        // JSONL records only know source names: a required check on a renamed
+        // field reads the source key, and the surviving column materializes
+        // from it.
+        let directive = SchemaDirective::Inferred {
+            transform: transform("rename: {email: contact_email}"),
+            overrides: overrides(&[("contact_email", None, Some(false))]),
+        };
+        let materialized = from_json_columns(
+            &directive,
+            names(&["email"]),
+            vec![
+                json_record(1, r#"{"email": "a@example.com"}"#),
+                json_record(2, r#"{"email": null}"#),
+            ],
+        )
+        .expect("required-field violations reject records, not the load");
+        let batch = &materialized.batch;
+
+        assert_eq!(batch_field_names(batch), ["contact_email"]);
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(strings(batch, 0).value(0), "a@example.com");
+        assert!(!batch.schema().field(0).is_nullable());
+
+        assert_eq!(materialized.rejected.len(), 1);
+        let rejected = &materialized.rejected[0];
+        assert_eq!(rejected.code, "missing_required_field");
+        assert_eq!(rejected.field.as_deref(), Some("contact_email"));
+        assert_eq!(rejected.source_field.as_deref(), Some("email"));
+        assert_eq!(rejected.message, "required field \"contact_email\" is null");
+    }
+
+    #[test]
+    fn pinned_rejections_on_renamed_fields_carry_the_dataset_and_source_names() {
+        // The pin speaks dataset names; a pinned misfit on a renamed field
+        // still points back at the source field it was read from.
+        let directive = transformed_pinned_directive(
+            "version: 1\nfields:\n- name: customer_id\n  type: int64\n",
+            DriftPolicy::Fail,
+            transform("rename: {id: customer_id}"),
+            SchemaOverrides::none(),
+        );
+        let materialized = from_text_columns(
+            &directive,
+            names(&["id"]),
+            vec![record(2, &[Some("1")]), record(3, &[Some("abc")])],
+        )
+        .expect("pinned misfits reject records, not the load");
+
+        assert_eq!(materialized.rejected.len(), 1);
+        let rejected = &materialized.rejected[0];
+        assert_eq!(rejected.field.as_deref(), Some("customer_id"));
+        assert_eq!(rejected.source_field.as_deref(), Some("id"));
+        assert_eq!(
+            rejected.message,
+            "value \"abc\" does not fit pinned type int64 for field \"customer_id\""
         );
     }
 

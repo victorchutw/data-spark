@@ -3687,6 +3687,599 @@ reject_threshold: 1
 }
 
 #[test]
+fn csv_transform_selects_and_renames_columns_for_duckdb() {
+    // The happy transform path (ADR-0039): select fixes the dataset order
+    // (total before id), rename maps id → customer_id, the unselected
+    // `region` column never reaches the destination, and the report echoes
+    // the transform as written.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(
+        &source_path,
+        "id,region,total\n1,north,42.5\n2,south,7.25\n",
+    )
+    .expect("write source csv");
+
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: duckdb
+  path: {}
+dataset: customers
+load_mode: full_refresh
+transform:
+  select: [total, id]
+  rename:
+    id: customer_id
+"#,
+            source_path.display(),
+            database_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "transform load writes one artifact directory",
+    );
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["row_counts"]["source"], 2);
+    assert_eq!(report["row_counts"]["written"], 2);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert_eq!(
+        report["schema_decision"],
+        serde_json::json!({
+            "mode": "inferred",
+            "fields": [
+                {"name": "total", "type": "float64", "nullable": true},
+                {"name": "customer_id", "type": "int64", "nullable": true}
+            ],
+            "drift_status": "not_applicable",
+            "transform": {
+                "select": ["total", "id"],
+                "rename": {"id": "customer_id"}
+            }
+        })
+    );
+
+    // The DuckDB table carries the dataset names in select order.
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>(),
+        vec!["total", "customer_id"]
+    );
+    assert_eq!(batch.num_rows(), 2);
+    let totals = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("total is float64");
+    let customer_ids = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_id is int64");
+    assert_eq!(totals.value(0), 7.25);
+    assert_eq!(customer_ids.value(0), 2);
+    assert_eq!(totals.value(1), 42.5);
+    assert_eq!(customer_ids.value(1), 1);
+}
+
+#[test]
+fn jsonl_transform_selects_and_renames_columns_for_parquet() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.jsonl");
+    fs::write(
+        &source_path,
+        "{\"id\": 1, \"note\": \"a\", \"total\": 10}\n\
+         {\"id\": 2, \"note\": \"b\", \"total\": 42.5}\n",
+    )
+    .expect("write source jsonl");
+
+    let destination_path = work.path().join("orders_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: parquet
+  path: {}
+dataset: orders
+load_mode: full_refresh
+transform:
+  select: [id, total]
+  rename:
+    total: amount
+"#,
+            source_path.display(),
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "transform load writes one artifact directory",
+    );
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(
+        report["schema_decision"],
+        serde_json::json!({
+            "mode": "inferred",
+            "fields": [
+                {"name": "id", "type": "int64", "nullable": true},
+                {"name": "amount", "type": "float64", "nullable": true}
+            ],
+            "drift_status": "not_applicable",
+            "transform": {
+                "select": ["id", "total"],
+                "rename": {"total": "amount"}
+            }
+        })
+    );
+
+    // The Parquet schema carries the dataset names in select order, and the
+    // renamed column reads its values from the source field.
+    let batch = read_single_parquet_batch(&single_parquet_file(&destination_path));
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>(),
+        vec!["id", "amount"]
+    );
+    assert_eq!(batch.num_rows(), 2);
+    let amounts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .expect("amount is float64");
+    assert_eq!(amounts.value(0), 10.0);
+    assert_eq!(amounts.value(1), 42.5);
+}
+
+#[test]
+fn invalid_transform_configs_fail_before_source_or_destination_work() {
+    // A rename key outside the select list is a config-time failure
+    // (ADR-0039): no I/O has happened, so the schema decision stays
+    // not-evaluated, the missing source file is never read, and the
+    // destination is never created.
+    let work = TempDir::new().expect("tempdir");
+    let database_path = work.path().join("should-not-exist.duckdb");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: missing-source.csv
+  format: csv
+destination:
+  connector: duckdb
+  path: {}
+dataset: customers
+load_mode: full_refresh
+transform:
+  select: [id]
+  rename:
+    total: amount
+"#,
+            database_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    assert!(
+        !database_path.exists(),
+        "an invalid transform config must fail before destination writing"
+    );
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "failed transform config still has one artifact directory",
+    );
+    assert_eq!(report["error_summary"]["code"], "invalid_transform_config");
+    assert_eq!(
+        report["error_summary"]["message"],
+        "transform.rename key \"total\" is not in transform.select"
+    );
+    assert_eq!(
+        report["schema_decision"],
+        serde_json::json!({ "mode": "not_evaluated" })
+    );
+}
+
+#[test]
+fn unknown_transform_fields_fail_before_destination_writing() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "id,name\n1,Ada\n").expect("write source csv");
+
+    let database_path = work.path().join("should-not-exist.duckdb");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: duckdb
+  path: {}
+dataset: customers
+load_mode: full_refresh
+transform:
+  select: [id, vip]
+"#,
+            source_path.display(),
+            database_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    assert!(
+        !database_path.exists(),
+        "an unknown transform field must fail before destination writing"
+    );
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "transform-failed load writes one artifact directory",
+    );
+    assert_eq!(report["error_summary"]["code"], "unknown_transform_field");
+    assert_eq!(
+        report["error_summary"]["message"],
+        "transform selects or renames fields absent from the observed source shape: vip"
+    );
+    assert_eq!(
+        report["schema_decision"],
+        serde_json::json!({
+            "mode": "inferred",
+            "drift_status": "not_applicable",
+            "transform": {
+                "select": ["id", "vip"]
+            }
+        })
+    );
+}
+
+#[test]
+fn transform_name_collisions_fail_before_destination_writing() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "id,legacy_id\n1,2\n").expect("write source csv");
+
+    let database_path = work.path().join("should-not-exist.duckdb");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: duckdb
+  path: {}
+dataset: customers
+load_mode: full_refresh
+transform:
+  rename:
+    legacy_id: id
+"#,
+            source_path.display(),
+            database_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    assert!(
+        !database_path.exists(),
+        "a transform name collision must fail before destination writing"
+    );
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "transform-failed load writes one artifact directory",
+    );
+    assert_eq!(report["error_summary"]["code"], "transform_name_collision");
+    assert_eq!(
+        report["error_summary"]["message"],
+        "transform rename collides on dataset field \"id\": \
+         source fields id, legacy_id map to the same name"
+    );
+    assert_eq!(
+        report["schema_decision"],
+        serde_json::json!({
+            "mode": "inferred",
+            "drift_status": "not_applicable",
+            "transform": {
+                "rename": {"legacy_id": "id"}
+            }
+        })
+    );
+}
+
+#[test]
+fn transform_pin_bootstrap_records_dataset_names_and_shields_unselected_drift() {
+    // The bootstrap pin records the transformed dataset shape — dataset
+    // names, in select order (ADR-0040) — and a later load whose source
+    // gains an unselected field reports no drift even under the default
+    // fail policy.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "id,note,total\n1,a,42.5\n").expect("write source csv");
+
+    let destination_path = work.path().join("customers_dataset");
+    let pinned_path = work.path().join("customers.schema.yml");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+transform:
+  select: [total, id]
+  rename:
+    id: customer_id
+schema:
+  pinned_path: {}
+"#,
+            source_path.display(),
+            destination_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let bootstrap_artifacts = work.path().join("artifacts-bootstrap");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&bootstrap_artifacts)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(
+        &bootstrap_artifacts,
+        "bootstrap load writes one artifact directory",
+    );
+    assert_eq!(report["schema_decision"]["mode"], "inferred");
+    assert_eq!(report["schema_decision"]["pinned_schema_persisted"], true);
+    assert_eq!(
+        fs::read_to_string(&pinned_path).expect("bootstrapped pin"),
+        "version: 1\n\
+         fields:\n\
+         - name: total\n\
+         \x20 type: float64\n\
+         \x20 nullable: true\n\
+         - name: customer_id\n\
+         \x20 type: int64\n\
+         \x20 nullable: true\n"
+    );
+
+    // The source gains an unselected `extra` field: invisible to drift.
+    fs::write(&source_path, "id,note,total,extra\n2,b,7.25,x\n").expect("rewrite source csv");
+    let reuse_artifacts = work.path().join("artifacts-reuse");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&reuse_artifacts)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(
+        &reuse_artifacts,
+        "pin-reusing load writes one artifact directory",
+    );
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["schema_decision"]["mode"], "pinned");
+    assert_eq!(report["schema_decision"]["drift_status"], "none");
+    assert_eq!(
+        report["schema_decision"]["transform"],
+        serde_json::json!({
+            "select": ["total", "id"],
+            "rename": {"id": "customer_id"}
+        })
+    );
+}
+
+#[test]
+fn rejected_records_on_renamed_fields_carry_dataset_and_source_names() {
+    // A coercion failure on a renamed field names the dataset field while
+    // pointing back at the source field, and the recovered record keeps the
+    // source names (ADR-0039). The override speaks the dataset namespace.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "id,note\n1,a\nn/a,b\n2,c\n").expect("write source csv");
+
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+transform:
+  rename:
+    id: customer_id
+schema:
+  overrides:
+  - name: customer_id
+    type: int64
+reject_threshold: 1
+"#,
+            source_path.display(),
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "transform load writes one artifact directory",
+    );
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["row_counts"]["written"], 2);
+    assert_eq!(report["row_counts"]["rejected"], 1);
+
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let rejected_lines = read_rejected_records(&artifact_path);
+    assert_eq!(rejected_lines.len(), 1);
+    assert_eq!(rejected_lines[0]["line"], 3);
+    assert_eq!(rejected_lines[0]["code"], "type_coercion_failed");
+    assert_eq!(rejected_lines[0]["field"], "customer_id");
+    assert_eq!(rejected_lines[0]["source_field"], "id");
+    assert_eq!(
+        rejected_lines[0]["message"],
+        "value \"n/a\" does not fit overridden type int64 for field \"customer_id\""
+    );
+    assert_eq!(
+        rejected_lines[0]["record"],
+        serde_json::json!({"id": "n/a", "note": "b"})
+    );
+
+    // The destination sees the renamed columns and only the surviving records.
+    let batch = read_single_parquet_batch(&single_parquet_file(&destination_path));
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>(),
+        vec!["customer_id", "note"]
+    );
+    let customer_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_id is int64");
+    assert_eq!(customer_ids.value(0), 1);
+    assert_eq!(customer_ids.value(1), 2);
+}
+
+#[test]
 fn parquet_append_with_an_incompatible_schema_fails_without_changing_the_destination() {
     let work = TempDir::new().expect("tempdir");
     let source_path = work.path().join("customers.csv");
