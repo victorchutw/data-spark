@@ -21,6 +21,14 @@ jobs:
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
           rustup default stable
 
+      - name: Cache Rust build artifacts
+        # Restore-only consumer of the caches ci.yml saves on pushes to main;
+        # shared-key must equal the ci.yml job id (rust) to address those caches.
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rust"
+          save-if: "false"
+
       - name: Validate tag and Cargo version
         run: |
           set -euo pipefail
