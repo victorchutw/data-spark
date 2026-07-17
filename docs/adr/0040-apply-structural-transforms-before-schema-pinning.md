@@ -1,0 +1,7 @@
+---
+status: accepted
+---
+
+# Apply Structural Transforms Before Schema Pinning
+
+Data Spark will apply the structural transform between schema inference and everything that consumes a schema: the meaning order of a load is infer, select, rename, overrides, pin compare or bootstrap, then validate and reject. The transform therefore reshapes the observed source fields into the dataset shape, and pinned schemas, schema overrides, drift comparison, and per-record validation all speak the transformed dataset names — a bootstrapped pin records dataset names in select order through an unchanged pin file syntax, overrides name post-transform fields (an override naming a dropped source field is an unknown override field), and rejected records carry the dataset field name with the source name alongside when a rename changed it. Selection shields unselected source fields from drift: a new source field outside the select list is invisible, yielding no drift under any policy, while without `select` a new field passes through and additive drift behaves exactly as before transforms existed. A pin recorded before a transform was configured compares against the transformed shape and fails as schema drift under the fail policy; there is no pin migration or rewriting, because silently translating a pin would amount to changing the dataset contract without the drift signal that exists to announce exactly that.

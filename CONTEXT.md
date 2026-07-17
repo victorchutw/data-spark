@@ -52,6 +52,14 @@ _Avoid_: Schema, table definition
 A transformation that changes record shape or representation so a load can produce a BI-ready dataset.
 _Avoid_: Data cleaning, mapping, light transform
 
+**Field Selection**:
+A structural transform that keeps only named source fields of each record, in the declared order.
+_Avoid_: Projection, column pruning, field filter
+
+**Rename Mapping**:
+A structural transform that maps source field names to dataset field names after field selection, leaving unmapped fields under their source names.
+_Avoid_: Alias, column mapping, field mapping
+
 **Analytical Transform**:
 A transformation that derives analytical meaning through joins, aggregations, calculations, or business logic.
 _Avoid_: SQL transform, modeling, enrichment

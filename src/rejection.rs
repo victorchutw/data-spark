@@ -12,8 +12,9 @@
 //! write, mirroring how pinned schema writes stay with the caller. The
 //! artifact contract (ADR-0036): one JSON object per rejected record, in
 //! source-line order, carrying the line, a rejection code, the offending
-//! field when one is known, a human-readable message, and the record content
-//! the load could recover.
+//! field when one is known — its dataset name, with the source field named
+//! alongside when a rename mapping changed it (ADR-0039) — a human-readable
+//! message, and the record content the load could recover.
 
 use serde_json::{json, Value};
 
@@ -31,15 +32,19 @@ pub(crate) const TYPE_COERCION_FAILED: &str = "type_coercion_failed";
 pub(crate) const MISSING_REQUIRED_FIELD: &str = "missing_required_field";
 
 /// One rejected record: the source context and error information a
-/// troubleshooter needs to find and fix the record (issue #8). `record` is
-/// the record content the load could recover — the parsed record as a JSON
-/// object, the raw line text for an unparseable JSONL line, or JSON null when
-/// nothing could be recovered.
+/// troubleshooter needs to find and fix the record (issue #8). `field` names
+/// the offending dataset field; `source_field` is set only when a rename
+/// mapping changed that field's name, pointing back at the name the source
+/// carries (ADR-0039). `record` is the record content the load could recover
+/// — the parsed record as a JSON object under its source names, the raw line
+/// text for an unparseable JSONL line, or JSON null when nothing could be
+/// recovered.
 #[derive(Debug)]
 pub(crate) struct RejectedRecord {
     pub(crate) line: u64,
     pub(crate) code: &'static str,
     pub(crate) field: Option<String>,
+    pub(crate) source_field: Option<String>,
     pub(crate) message: String,
     pub(crate) record: Value,
 }
@@ -56,6 +61,7 @@ pub(crate) fn artifact_jsonl(rejected: &[RejectedRecord]) -> String {
             "line": rejected_record.line,
             "code": rejected_record.code,
             "field": rejected_record.field,
+            "source_field": rejected_record.source_field,
             "message": rejected_record.message,
             "record": rejected_record.record,
         });
@@ -71,19 +77,24 @@ mod tests {
 
     #[test]
     fn artifact_jsonl_renders_one_json_object_per_record_in_source_line_order() {
+        // The first rejection's field was renamed (source `id`, dataset
+        // `customer_id`), so its artifact line carries the source field; the
+        // parse rejection has no field at all, so both keys render null.
         let rejected = [
             RejectedRecord {
                 line: 4,
                 code: TYPE_COERCION_FAILED,
                 field: Some("customer_id".to_string()),
+                source_field: Some("id".to_string()),
                 message: "value \"abc\" does not fit pinned type int64 for field \"customer_id\""
                     .to_string(),
-                record: json!({ "customer_id": "abc", "name": "Ada" }),
+                record: json!({ "id": "abc", "name": "Ada" }),
             },
             RejectedRecord {
                 line: 2,
                 code: MALFORMED_JSONL_RECORD,
                 field: None,
+                source_field: None,
                 message: "expected value at line 1 column 28".to_string(),
                 record: json!("{\"customer_id\": 2, \"name\": "),
             },
@@ -101,6 +112,7 @@ mod tests {
                 "line": 2,
                 "code": "malformed_jsonl_record",
                 "field": null,
+                "source_field": null,
                 "message": "expected value at line 1 column 28",
                 "record": "{\"customer_id\": 2, \"name\": "
             })
@@ -111,8 +123,9 @@ mod tests {
                 "line": 4,
                 "code": "type_coercion_failed",
                 "field": "customer_id",
+                "source_field": "id",
                 "message": "value \"abc\" does not fit pinned type int64 for field \"customer_id\"",
-                "record": { "customer_id": "abc", "name": "Ada" }
+                "record": { "id": "abc", "name": "Ada" }
             })
         );
         assert!(artifact.ends_with('\n'), "artifact ends with a newline");
