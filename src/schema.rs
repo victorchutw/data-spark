@@ -13,6 +13,14 @@
 //! as `schema_drift`, while value fit is judged per record: a record whose
 //! cell misfits its pinned type or leaves a `nullable: false` field null
 //! becomes a rejected record instead of failing the load (ADR-0035).
+//! A load definition may override selected inferred fields
+//! ([`SchemaOverrides`], ADR-0038): an override rewrites inference wherever
+//! it decides a field's shape and never rewrites a pin — an override naming a
+//! field absent from the observed source shape fails the load as
+//! `unknown_override_field` before any pin comparison, and one contradicting
+//! an existing pinned field fails it as `schema_override_conflict` before
+//! drift comparison. Overridden fields validate per record exactly like
+//! pinned fields.
 //! Everything type-related — the lattice, observation rules, the pinned schema
 //! file contract ([`PinnedSchema`], ADR-0033), drift comparison, per-record
 //! validation, materialization, and the `schema_decision` shape — is private
@@ -70,18 +78,44 @@ pub(crate) struct JsonRecord {
 /// How a load decides its dataset schema: infer it from observed records,
 /// infer it and persist it as the new pinned schema (the first pin-requesting
 /// load, ADR-0033), or validate observed records against an existing pinned
-/// schema (ADR-0034). `pinned_path` is the display path the schema decision
-/// reports; file I/O stays with the caller.
+/// schema (ADR-0034). Every variant carries the definition's per-field
+/// overrides (ADR-0038), which rewrite the inference-decided parts of the
+/// schema — everything on an inference-driven load, the bootstrapped pin, and
+/// the added fields an additive drift policy admits — and must agree with any
+/// field the pin already governs. `pinned_path` is the display path the
+/// schema decision reports; file I/O stays with the caller.
 pub(crate) enum SchemaDirective {
-    Inferred,
+    Inferred {
+        overrides: SchemaOverrides,
+    },
     PinInferred {
         pinned_path: String,
+        overrides: SchemaOverrides,
     },
     Pinned {
         pinned_path: String,
         pin: PinnedSchema,
         drift_policy: DriftPolicy,
+        overrides: SchemaOverrides,
     },
+}
+
+impl SchemaDirective {
+    /// The inference directive with no overrides configured — the posture of
+    /// a load definition without a `schema` block.
+    pub(crate) fn inferred() -> Self {
+        SchemaDirective::Inferred {
+            overrides: SchemaOverrides::none(),
+        }
+    }
+
+    fn overrides(&self) -> &SchemaOverrides {
+        match self {
+            SchemaDirective::Inferred { overrides }
+            | SchemaDirective::PinInferred { overrides, .. }
+            | SchemaDirective::Pinned { overrides, .. } => overrides,
+        }
+    }
 }
 
 /// The rule that decides whether a load may continue when schema drift is
@@ -90,6 +124,133 @@ pub(crate) enum SchemaDirective {
 pub(crate) enum DriftPolicy {
     Fail,
     AllowAdditiveNullable,
+}
+
+/// One `schema.overrides` entry as written in a load definition (ADR-0038):
+/// the field it names and the inferred properties it replaces. Part of the
+/// versioned load-definition contract, so unknown keys inside an entry are
+/// rejected at parse time (ADR-0037).
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OverrideEntry {
+    name: String,
+    #[serde(rename = "type")]
+    field_type: Option<String>,
+    nullable: Option<bool>,
+}
+
+/// The validated per-field overrides of a load definition, in declaration
+/// order (ADR-0038). Empty when the definition configures none, so every
+/// [`SchemaDirective`] can carry one without an optional wrapper.
+pub(crate) struct SchemaOverrides {
+    overrides: Vec<FieldOverride>,
+}
+
+/// One validated override: the field it names and the properties it
+/// replaces — at least one of them is set.
+struct FieldOverride {
+    name: String,
+    field_type: Option<InferredType>,
+    nullable: Option<bool>,
+}
+
+impl SchemaOverrides {
+    /// No overrides configured.
+    pub(crate) fn none() -> Self {
+        SchemaOverrides {
+            overrides: Vec::new(),
+        }
+    }
+
+    /// Validates the `schema.overrides` entries of a load definition before
+    /// any data is read: field names must be unique and every entry must
+    /// override at least one property (`invalid_schema_config`), with `type`
+    /// drawn from the pinned-schema type vocabulary
+    /// (`unsupported_override_type`, mirroring `unsupported_drift_policy`).
+    pub(crate) fn from_entries(entries: &[OverrideEntry]) -> Result<Self, LoadFailure> {
+        let mut seen_names = HashSet::new();
+        let mut overrides = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if !seen_names.insert(entry.name.as_str()) {
+                return Err(LoadFailure {
+                    code: "invalid_schema_config",
+                    message: format!(
+                        "schema override for field {:?} is declared more than once",
+                        entry.name
+                    ),
+                });
+            }
+            if entry.field_type.is_none() && entry.nullable.is_none() {
+                return Err(LoadFailure {
+                    code: "invalid_schema_config",
+                    message: format!(
+                        "schema override for field {:?} must set at least one of type or nullable",
+                        entry.name
+                    ),
+                });
+            }
+            let field_type = entry
+                .field_type
+                .as_deref()
+                .map(|type_name| {
+                    parse_type_name(type_name).ok_or_else(|| LoadFailure {
+                        code: "unsupported_override_type",
+                        message: format!(
+                            "unsupported schema override type for field {:?}: {type_name}",
+                            entry.name
+                        ),
+                    })
+                })
+                .transpose()?;
+            overrides.push(FieldOverride {
+                name: entry.name.clone(),
+                field_type,
+                nullable: entry.nullable,
+            });
+        }
+        Ok(SchemaOverrides { overrides })
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.overrides.is_empty()
+    }
+
+    fn get(&self, name: &str) -> Option<&FieldOverride> {
+        self.overrides
+            .iter()
+            .find(|override_| override_.name == name)
+    }
+
+    /// Renders the overrides as the `schema_decision.overrides` echo: the
+    /// directive as written, with unspecified properties omitted.
+    fn echo(&self) -> Value {
+        Value::Array(
+            self.overrides
+                .iter()
+                .map(|override_| {
+                    let mut entry = serde_json::Map::new();
+                    entry.insert("name".to_string(), json!(override_.name));
+                    if let Some(field_type) = override_.field_type {
+                        entry.insert("type".to_string(), json!(field_type.name()));
+                    }
+                    if let Some(nullable) = override_.nullable {
+                        entry.insert("nullable".to_string(), json!(nullable));
+                    }
+                    Value::Object(entry)
+                })
+                .collect(),
+        )
+    }
+
+    /// Adds the echo to a schema decision. Every decision the schema module
+    /// reports — success and failure paths alike — carries the overrides the
+    /// definition configured, and none when it configured none.
+    fn stamp(&self, mut decision: Value) -> Value {
+        if !self.is_empty() {
+            decision["overrides"] = self.echo();
+        }
+        decision
+    }
 }
 
 /// The narrowest type observed across a column's values, before it is widened
@@ -240,35 +401,35 @@ pub(crate) fn from_text_columns(
     field_names: Vec<String>,
     records: Vec<TextRecord>,
 ) -> Result<Materialized, ExecutionFailure> {
+    check_override_names(directive, &field_names)?;
     match directive {
-        SchemaDirective::Inferred => {
-            let plan = inferred_text_plan(&field_names, &records, None);
-            build_text(plan, &records, Vec::new())
+        SchemaDirective::Inferred { overrides } => {
+            inferred_text(&field_names, records, None, overrides)
         }
-        SchemaDirective::PinInferred { pinned_path } => {
-            let plan = inferred_text_plan(&field_names, &records, Some(pinned_path));
-            build_text(plan, &records, Vec::new())
-        }
+        SchemaDirective::PinInferred {
+            pinned_path,
+            overrides,
+        } => inferred_text(&field_names, records, Some(pinned_path), overrides),
         SchemaDirective::Pinned {
             pinned_path,
             pin,
             drift_policy,
+            overrides,
         } => {
+            check_override_conflicts(pinned_path, pin, overrides)?;
             let ShapeMatch { matched, added } =
-                match_shape(pinned_path, pin, drift_policy, &field_names)?;
-            let mut survivors = Vec::with_capacity(records.len());
-            let mut rejected = Vec::new();
-            for record in records {
-                match validate_text_record(&record, &matched, &field_names) {
-                    Some(rejection) => rejected.push(rejection),
-                    None => survivors.push(record),
-                }
-            }
+                match_shape(pinned_path, pin, drift_policy, &field_names, overrides)?;
+            let mut checks = pinned_checks(&matched);
+            checks.extend(override_checks(
+                overrides,
+                added.iter().map(|(name, index)| (name, *index)),
+            ));
+            let (survivors, rejected) = partition_text(records, &checks, &field_names);
             // Added fields take their types from the surviving records only,
             // so a rejected record's values never shape the destination.
             let survivor_types = observe_text_types(field_names.len(), &survivors);
-            let added = planned_added_fields(added, &survivor_types);
-            let plan = assemble_pinned_plan(pinned_path, matched, added);
+            let added = planned_added_fields(added, &survivor_types, overrides);
+            let plan = assemble_pinned_plan(pinned_path, matched, added, overrides);
             build_text(plan, &survivors, rejected)
         }
     }
@@ -282,36 +443,213 @@ pub(crate) fn from_json_columns(
     field_names: Vec<String>,
     records: Vec<JsonRecord>,
 ) -> Result<Materialized, ExecutionFailure> {
+    check_override_names(directive, &field_names)?;
     match directive {
-        SchemaDirective::Inferred => {
-            let plan = inferred_json_plan(&field_names, &records, None);
-            build_json(plan, &records, Vec::new())
+        SchemaDirective::Inferred { overrides } => {
+            inferred_json(&field_names, records, None, overrides)
         }
-        SchemaDirective::PinInferred { pinned_path } => {
-            let plan = inferred_json_plan(&field_names, &records, Some(pinned_path));
-            build_json(plan, &records, Vec::new())
-        }
+        SchemaDirective::PinInferred {
+            pinned_path,
+            overrides,
+        } => inferred_json(&field_names, records, Some(pinned_path), overrides),
         SchemaDirective::Pinned {
             pinned_path,
             pin,
             drift_policy,
+            overrides,
         } => {
+            check_override_conflicts(pinned_path, pin, overrides)?;
             let ShapeMatch { matched, added } =
-                match_shape(pinned_path, pin, drift_policy, &field_names)?;
-            let mut survivors = Vec::with_capacity(records.len());
-            let mut rejected = Vec::new();
-            for record in records {
-                match validate_json_record(&record, &matched) {
-                    Some(rejection) => rejected.push(rejection),
-                    None => survivors.push(record),
-                }
-            }
+                match_shape(pinned_path, pin, drift_policy, &field_names, overrides)?;
+            let mut checks = pinned_checks(&matched);
+            checks.extend(override_checks(
+                overrides,
+                added.iter().map(|(name, index)| (name, *index)),
+            ));
+            let (survivors, rejected) = partition_json(records, &checks);
             let survivor_types = observe_json_types(&field_names, &survivors);
-            let added = planned_added_fields(added, &survivor_types);
-            let plan = assemble_pinned_plan(pinned_path, matched, added);
+            let added = planned_added_fields(added, &survivor_types, overrides);
+            let plan = assemble_pinned_plan(pinned_path, matched, added, overrides);
             build_json(plan, &survivors, rejected)
         }
     }
+}
+
+/// Materializes an inference-driven or pin-bootstrapping CSV load: overridden
+/// fields validate per record like pinned fields (ADR-0038), and the
+/// surviving records alone shape every property no override sets, so a
+/// rejected record's values never shape the destination.
+fn inferred_text(
+    field_names: &[String],
+    records: Vec<TextRecord>,
+    pinned_path: Option<&str>,
+    overrides: &SchemaOverrides,
+) -> Result<Materialized, ExecutionFailure> {
+    let checks = override_checks(
+        overrides,
+        field_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name, index)),
+    );
+    let (survivors, rejected) = partition_text(records, &checks, field_names);
+    let survivor_types = observe_text_types(field_names.len(), &survivors);
+    let plan = inferred_plan(field_names, &survivor_types, pinned_path, overrides);
+    build_text(plan, &survivors, rejected)
+}
+
+/// Materializes an inference-driven or pin-bootstrapping JSONL load; see
+/// [`inferred_text`].
+fn inferred_json(
+    field_names: &[String],
+    records: Vec<JsonRecord>,
+    pinned_path: Option<&str>,
+    overrides: &SchemaOverrides,
+) -> Result<Materialized, ExecutionFailure> {
+    let checks = override_checks(
+        overrides,
+        field_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name, index)),
+    );
+    let (survivors, rejected) = partition_json(records, &checks);
+    let survivor_types = observe_json_types(field_names, &survivors);
+    let plan = inferred_plan(field_names, &survivor_types, pinned_path, overrides);
+    build_json(plan, &survivors, rejected)
+}
+
+/// Fails the load with `unknown_override_field` when an override names a
+/// field absent from the observed source shape — the CSV header, or the union
+/// of the JSONL batch's record keys, where a batch-wide-absent field is
+/// absent (ADR-0038). Checked as soon as the observed names are known and
+/// before any pin comparison, so a misspelled override never reads as drift.
+fn check_override_names(
+    directive: &SchemaDirective,
+    observed_names: &[String],
+) -> Result<(), ExecutionFailure> {
+    let overrides = directive.overrides();
+    let observed = observed_names
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let unknown = overrides
+        .overrides
+        .iter()
+        .map(|override_| override_.name.as_str())
+        .filter(|name| !observed.contains(name))
+        .collect::<Vec<_>>();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+
+    // The load failed before any schema decision could be completed, so the
+    // decision echoes the configured posture — and no drift comparison ran.
+    let decision = match directive {
+        SchemaDirective::Inferred { .. } => json!({
+            "mode": "inferred",
+            "drift_status": "not_applicable",
+        }),
+        SchemaDirective::PinInferred { pinned_path, .. } => json!({
+            "mode": "inferred",
+            "drift_status": "not_applicable",
+            "pinned_schema_path": pinned_path,
+        }),
+        SchemaDirective::Pinned {
+            pinned_path, pin, ..
+        } => json!({
+            "mode": "pinned",
+            "fields": pinned_fields_json(pin),
+            "drift_status": "not_applicable",
+            "pinned_schema_path": pinned_path,
+        }),
+    };
+    Err(ExecutionFailure {
+        failure: LoadFailure {
+            code: "unknown_override_field",
+            message: format!(
+                "schema overrides name fields absent from the observed source shape: {}",
+                unknown.join(", ")
+            ),
+        },
+        schema_decision: Some(Box::new(overrides.stamp(decision))),
+        source_rows: None,
+        written_records: 0,
+        rejected: Vec::new(),
+        destination_write: Box::new(DestinationWriteFacts::not_applicable()),
+    })
+}
+
+/// Fails the load with `schema_override_conflict` when an override
+/// contradicts the pinned field it names on a property it sets (ADR-0038). A
+/// field the pin already governs takes nothing from an override, so a
+/// contradiction is a broken definition regardless of what this batch looks
+/// like — which is why it is checked before drift comparison.
+fn check_override_conflicts(
+    pinned_path: &str,
+    pin: &PinnedSchema,
+    overrides: &SchemaOverrides,
+) -> Result<(), ExecutionFailure> {
+    for override_ in &overrides.overrides {
+        let Some(pin_field) = pin.fields.iter().find(|field| field.name == override_.name) else {
+            continue;
+        };
+        let mut segments = Vec::new();
+        let mut override_json = serde_json::Map::new();
+        if let Some(field_type) = override_.field_type {
+            override_json.insert("type".to_string(), json!(field_type.name()));
+            if field_type != pin_field.field_type {
+                segments.push(format!(
+                    "pinned type {}, override type {}",
+                    pin_field.field_type.name(),
+                    field_type.name()
+                ));
+            }
+        }
+        if let Some(nullable) = override_.nullable {
+            override_json.insert("nullable".to_string(), json!(nullable));
+            if nullable != pin_field.nullable {
+                segments.push(format!(
+                    "pinned nullable {}, override nullable {nullable}",
+                    pin_field.nullable
+                ));
+            }
+        }
+        if segments.is_empty() {
+            continue;
+        }
+
+        let decision = json!({
+            "mode": "pinned",
+            "fields": pinned_fields_json(pin),
+            "drift_status": "not_applicable",
+            "conflict": {
+                "field": override_.name,
+                "pinned": {
+                    "type": pin_field.field_type.name(),
+                    "nullable": pin_field.nullable,
+                },
+                "override": Value::Object(override_json),
+            },
+            "pinned_schema_path": pinned_path,
+        });
+        return Err(ExecutionFailure {
+            failure: LoadFailure {
+                code: "schema_override_conflict",
+                message: format!(
+                    "schema override for field {:?} contradicts pinned schema {pinned_path}: {}",
+                    override_.name,
+                    segments.join("; ")
+                ),
+            },
+            schema_decision: Some(Box::new(overrides.stamp(decision))),
+            source_rows: None,
+            written_records: 0,
+            rejected: Vec::new(),
+            destination_write: Box::new(DestinationWriteFacts::not_applicable()),
+        });
+    }
+    Ok(())
 }
 
 /// One field the load will materialize: its output name, the type its column is
@@ -333,45 +671,33 @@ struct FieldPlan {
     pinned_schema_write: Option<PinnedSchemaWrite>,
 }
 
-/// Plans an inference-driven CSV load: every observed column keeps its
-/// observed type. Inference derives types from the records themselves, so an
-/// inference-driven load never rejects a record.
-fn inferred_text_plan(
-    field_names: &[String],
-    records: &[TextRecord],
-    pinned_path: Option<&str>,
-) -> FieldPlan {
-    let observed_types = observe_text_types(field_names.len(), records);
-    inferred_plan(field_names, &observed_types, pinned_path)
-}
-
-/// Plans an inference-driven JSONL load; see [`inferred_text_plan`].
-fn inferred_json_plan(
-    field_names: &[String],
-    records: &[JsonRecord],
-    pinned_path: Option<&str>,
-) -> FieldPlan {
-    let observed_types = observe_json_types(field_names, records);
-    inferred_plan(field_names, &observed_types, pinned_path)
-}
-
 /// Plans an inference-driven load: every observed column keeps its observed
-/// type (all-null columns default to text). With a `pinned_path`, the inferred
-/// schema is also rendered for persistence as the new pin (ADR-0033).
+/// type (all-null columns default to text) and stays nullable, unless a
+/// schema override replaces either property (ADR-0038). With a `pinned_path`,
+/// the resulting — overridden — schema is also rendered for persistence as
+/// the new pin (ADR-0033).
 fn inferred_plan(
     observed_names: &[String],
     observed_types: &[InferredType],
     pinned_path: Option<&str>,
+    overrides: &SchemaOverrides,
 ) -> FieldPlan {
     let fields = observed_names
         .iter()
         .zip(observed_types)
         .enumerate()
-        .map(|(observed_index, (name, observed_type))| PlannedField {
-            name: name.clone(),
-            materialized_type: default_null_to_text(*observed_type),
-            nullable: true,
-            observed_index,
+        .map(|(observed_index, (name, observed_type))| {
+            let override_ = overrides.get(name);
+            PlannedField {
+                name: name.clone(),
+                materialized_type: override_
+                    .and_then(|override_| override_.field_type)
+                    .unwrap_or_else(|| default_null_to_text(*observed_type)),
+                nullable: override_
+                    .and_then(|override_| override_.nullable)
+                    .unwrap_or(true),
+                observed_index,
+            }
         })
         .collect::<Vec<_>>();
 
@@ -391,7 +717,7 @@ fn inferred_plan(
 
     FieldPlan {
         fields,
-        decision,
+        decision: overrides.stamp(decision),
         pinned_schema_write,
     }
 }
@@ -414,6 +740,7 @@ fn match_shape(
     pin: &PinnedSchema,
     drift_policy: &DriftPolicy,
     observed_names: &[String],
+    overrides: &SchemaOverrides,
 ) -> Result<ShapeMatch, ExecutionFailure> {
     // Observed columns match pin fields by name, so duplicate observed names
     // are unmatchable shape drift.
@@ -423,6 +750,7 @@ fn match_shape(
             return Err(drift_failure(
                 pinned_path,
                 pin,
+                overrides,
                 format!("source field {name:?} appears more than once, so records cannot be validated against the pinned schema"),
                 json!({ "duplicate_fields": [name] }),
             ));
@@ -470,6 +798,7 @@ fn match_shape(
         return Err(drift_failure(
             pinned_path,
             pin,
+            overrides,
             segments.join("; "),
             json!({
                 "missing_fields": missing_fields,
@@ -481,34 +810,137 @@ fn match_shape(
     Ok(ShapeMatch { matched, added })
 }
 
-/// Validates one CSV record against the matched pinned fields, in pin order:
-/// the first null cell in a non-nullable field or the first cell whose
-/// observed type does not widen to its pinned type rejects the record
+/// One per-record value check (ADR-0035, ADR-0038): the field it guards, the
+/// observed column it reads from, the type its values must widen to — if any
+/// — with the wording its rejections carry, and whether a null value rejects
+/// the record. Pinned fields check everything the pin declares; overridden
+/// fields check exactly the properties their override sets.
+struct FieldCheck {
+    name: String,
+    observed_index: usize,
+    expected_type: Option<(InferredType, TypeOrigin)>,
+    required: bool,
+}
+
+/// Where a field's expected type came from, for rejection messages: the
+/// pinned schema (ADR-0035) or a schema override (ADR-0038).
+#[derive(Clone, Copy)]
+enum TypeOrigin {
+    Pinned,
+    Overridden,
+}
+
+impl TypeOrigin {
+    fn wording(self) -> &'static str {
+        match self {
+            TypeOrigin::Pinned => "pinned",
+            TypeOrigin::Overridden => "overridden",
+        }
+    }
+}
+
+/// The checks the matched pinned fields impose on every record, in pin order
 /// (ADR-0035).
+fn pinned_checks(matched: &[PlannedField]) -> Vec<FieldCheck> {
+    matched
+        .iter()
+        .map(|planned| FieldCheck {
+            name: planned.name.clone(),
+            observed_index: planned.observed_index,
+            expected_type: Some((planned.materialized_type, TypeOrigin::Pinned)),
+            required: !planned.nullable,
+        })
+        .collect()
+}
+
+/// The checks the overrides impose on the given observed columns, in column
+/// order: the overridden type must hold per value, and an override to
+/// `nullable: false` makes the field required (ADR-0038). Columns without an
+/// override — and properties an override leaves unset — check nothing.
+fn override_checks<'a>(
+    overrides: &SchemaOverrides,
+    columns: impl Iterator<Item = (&'a String, usize)>,
+) -> Vec<FieldCheck> {
+    columns
+        .filter_map(|(name, observed_index)| {
+            overrides.get(name).map(|override_| FieldCheck {
+                name: name.clone(),
+                observed_index,
+                expected_type: override_
+                    .field_type
+                    .map(|field_type| (field_type, TypeOrigin::Overridden)),
+                required: override_.nullable == Some(false),
+            })
+        })
+        .collect()
+}
+
+/// Splits CSV records into the survivors and the records the checks rejected
+/// (ADR-0035).
+fn partition_text(
+    records: Vec<TextRecord>,
+    checks: &[FieldCheck],
+    field_names: &[String],
+) -> (Vec<TextRecord>, Vec<RejectedRecord>) {
+    let mut survivors = Vec::with_capacity(records.len());
+    let mut rejected = Vec::new();
+    for record in records {
+        match validate_text_record(&record, checks, field_names) {
+            Some(rejection) => rejected.push(rejection),
+            None => survivors.push(record),
+        }
+    }
+    (survivors, rejected)
+}
+
+/// Splits JSONL records into the survivors and the records the checks
+/// rejected (ADR-0035).
+fn partition_json(
+    records: Vec<JsonRecord>,
+    checks: &[FieldCheck],
+) -> (Vec<JsonRecord>, Vec<RejectedRecord>) {
+    let mut survivors = Vec::with_capacity(records.len());
+    let mut rejected = Vec::new();
+    for record in records {
+        match validate_json_record(&record, checks) {
+            Some(rejection) => rejected.push(rejection),
+            None => survivors.push(record),
+        }
+    }
+    (survivors, rejected)
+}
+
+/// Validates one CSV record against the field checks, in check order: the
+/// first null cell in a required field or the first cell whose observed type
+/// does not widen to its expected type rejects the record (ADR-0035).
 fn validate_text_record(
     record: &TextRecord,
-    matched: &[PlannedField],
+    checks: &[FieldCheck],
     field_names: &[String],
 ) -> Option<RejectedRecord> {
-    for planned in matched {
-        match record.cells[planned.observed_index].as_deref() {
+    for check in checks {
+        match record.cells[check.observed_index].as_deref() {
             None => {
-                if !planned.nullable {
+                if check.required {
                     return Some(required_field_rejection(
                         record.line,
-                        planned,
+                        &check.name,
                         text_record_json(field_names, &record.cells),
                     ));
                 }
             }
             Some(value) => {
-                if !fits_pinned_type(infer_text_type(value), planned.materialized_type) {
-                    return Some(type_rejection(
-                        record.line,
-                        planned,
-                        json!(value),
-                        text_record_json(field_names, &record.cells),
-                    ));
+                if let Some((expected_type, origin)) = check.expected_type {
+                    if !fits_expected_type(infer_text_type(value), expected_type) {
+                        return Some(type_rejection(
+                            record.line,
+                            check,
+                            expected_type,
+                            origin,
+                            json!(value),
+                            text_record_json(field_names, &record.cells),
+                        ));
+                    }
                 }
             }
         }
@@ -516,28 +948,32 @@ fn validate_text_record(
     None
 }
 
-/// Validates one JSONL record against the matched pinned fields; see
+/// Validates one JSONL record against the field checks; see
 /// [`validate_text_record`]. A field absent from the record reads as null.
-fn validate_json_record(record: &JsonRecord, matched: &[PlannedField]) -> Option<RejectedRecord> {
-    for planned in matched {
-        match record.object.get(&planned.name) {
+fn validate_json_record(record: &JsonRecord, checks: &[FieldCheck]) -> Option<RejectedRecord> {
+    for check in checks {
+        match record.object.get(&check.name) {
             None | Some(Value::Null) => {
-                if !planned.nullable {
+                if check.required {
                     return Some(required_field_rejection(
                         record.line,
-                        planned,
+                        &check.name,
                         Value::Object(record.object.clone()),
                     ));
                 }
             }
             Some(value) => {
-                if !fits_pinned_type(infer_json_type(value), planned.materialized_type) {
-                    return Some(type_rejection(
-                        record.line,
-                        planned,
-                        value.clone(),
-                        Value::Object(record.object.clone()),
-                    ));
+                if let Some((expected_type, origin)) = check.expected_type {
+                    if !fits_expected_type(infer_json_type(value), expected_type) {
+                        return Some(type_rejection(
+                            record.line,
+                            check,
+                            expected_type,
+                            origin,
+                            value.clone(),
+                            Value::Object(record.object.clone()),
+                        ));
+                    }
                 }
             }
         }
@@ -545,38 +981,41 @@ fn validate_json_record(record: &JsonRecord, matched: &[PlannedField]) -> Option
     None
 }
 
-/// A value fits a pinned field iff its observed type widens to the pinned
-/// type under the inference lattice — the per-cell restriction of the
-/// ADR-0034 column rule (ADR-0035). Building a surviving record's cell with
-/// its pinned type can then never fail per value.
-fn fits_pinned_type(observed: InferredType, pinned: InferredType) -> bool {
-    observed.merge(pinned) == pinned
+/// A value fits a pinned or overridden field iff its observed type widens to
+/// the expected type under the inference lattice — the per-cell restriction
+/// of the ADR-0034 column rule (ADR-0035, ADR-0038). Building a surviving
+/// record's cell with its expected type can then never fail per value.
+fn fits_expected_type(observed: InferredType, expected: InferredType) -> bool {
+    observed.merge(expected) == expected
 }
 
-fn required_field_rejection(line: u64, planned: &PlannedField, record: Value) -> RejectedRecord {
+fn required_field_rejection(line: u64, field_name: &str, record: Value) -> RejectedRecord {
     RejectedRecord {
         line,
         code: rejection::MISSING_REQUIRED_FIELD,
-        field: Some(planned.name.clone()),
-        message: format!("required field {:?} is null", planned.name),
+        field: Some(field_name.to_string()),
+        message: format!("required field {field_name:?} is null"),
         record,
     }
 }
 
 fn type_rejection(
     line: u64,
-    planned: &PlannedField,
+    check: &FieldCheck,
+    expected_type: InferredType,
+    origin: TypeOrigin,
     value: Value,
     record: Value,
 ) -> RejectedRecord {
     RejectedRecord {
         line,
         code: rejection::TYPE_COERCION_FAILED,
-        field: Some(planned.name.clone()),
+        field: Some(check.name.clone()),
         message: format!(
-            "value {value} does not fit pinned type {} for field {:?}",
-            planned.materialized_type.name(),
-            planned.name
+            "value {value} does not fit {} type {} for field {:?}",
+            origin.wording(),
+            expected_type.name(),
+            check.name
         ),
         record,
     }
@@ -602,18 +1041,29 @@ fn text_record_json(field_names: &[String], cells: &[Option<String>]) -> Value {
 
 /// Types the added fields a pinned load appends under the additive policy
 /// from the observed types of the surviving records (all-null defaults to
-/// text). Added fields are always nullable: inference cannot prove more.
+/// text). Added fields default to nullable — inference cannot prove more —
+/// but an override naming an added field is explicit intent and wins over
+/// both defaults, including `nullable: false` (ADR-0038); the rewritten pin
+/// then records the overridden properties.
 fn planned_added_fields(
     added: Vec<(String, usize)>,
     survivor_types: &[InferredType],
+    overrides: &SchemaOverrides,
 ) -> Vec<PlannedField> {
     added
         .into_iter()
-        .map(|(name, observed_index)| PlannedField {
-            name,
-            materialized_type: default_null_to_text(survivor_types[observed_index]),
-            nullable: true,
-            observed_index,
+        .map(|(name, observed_index)| {
+            let override_ = overrides.get(&name);
+            PlannedField {
+                materialized_type: override_
+                    .and_then(|override_| override_.field_type)
+                    .unwrap_or_else(|| default_null_to_text(survivor_types[observed_index])),
+                nullable: override_
+                    .and_then(|override_| override_.nullable)
+                    .unwrap_or(true),
+                name,
+                observed_index,
+            }
         })
         .collect()
 }
@@ -626,6 +1076,7 @@ fn assemble_pinned_plan(
     pinned_path: &str,
     matched: Vec<PlannedField>,
     added: Vec<PlannedField>,
+    overrides: &SchemaOverrides,
 ) -> FieldPlan {
     if added.is_empty() {
         let decision = json!({
@@ -636,7 +1087,7 @@ fn assemble_pinned_plan(
         });
         return FieldPlan {
             fields: matched,
-            decision,
+            decision: overrides.stamp(decision),
             pinned_schema_write: None,
         };
     }
@@ -644,14 +1095,14 @@ fn assemble_pinned_plan(
     let added_json = fields_json(&added);
     let mut fields = matched;
     fields.extend(added);
-    let decision = json!({
+    let decision = overrides.stamp(json!({
         "mode": "pinned",
         "fields": fields_json(&fields),
         "drift_status": "additive_fields_added",
         "added_fields": added_json,
         "pinned_schema_path": pinned_path,
         "pinned_schema_persisted": true,
-    });
+    }));
     let pinned_schema_write = Some(PinnedSchemaWrite {
         pinned_path: pinned_path.to_string(),
         yaml: pin_yaml(&fields),
@@ -669,16 +1120,17 @@ fn assemble_pinned_plan(
 fn drift_failure(
     pinned_path: &str,
     pin: &PinnedSchema,
+    overrides: &SchemaOverrides,
     detail: String,
     drift: Value,
 ) -> ExecutionFailure {
-    let decision = json!({
+    let decision = overrides.stamp(json!({
         "mode": "pinned",
         "fields": pinned_fields_json(pin),
         "drift_status": "failed_on_drift",
         "drift": drift,
         "pinned_schema_path": pinned_path,
-    });
+    }));
     ExecutionFailure {
         failure: LoadFailure {
             code: "schema_drift",
@@ -909,10 +1361,10 @@ fn build_text_array(
 /// old JSON → String → re-parse round-trip: integers come from `as_i64`, floats
 /// from `as_f64`, booleans are taken directly, and text columns reuse
 /// [`json_scalar_to_string`]. The coercion arms are unreachable: inference only
-/// picks a type every cell already carries, and a pinned load builds only over
-/// surviving records, whose cells per-record validation proved to fit
-/// (ADR-0035). They return a clean failure rather than panicking if that
-/// invariant is ever broken.
+/// picks a type every cell already carries, and pinned and overridden fields
+/// build only over surviving records, whose cells per-record validation proved
+/// to fit (ADR-0035, ADR-0038). They return a clean failure rather than
+/// panicking if that invariant is ever broken.
 fn build_json_array(
     inferred_type: InferredType,
     records: &[JsonRecord],
@@ -1277,7 +1729,7 @@ mod tests {
     #[test]
     fn from_text_columns_infers_types_values_and_schema_decision() {
         let materialized = from_text_columns(
-            &SchemaDirective::Inferred,
+            &SchemaDirective::inferred(),
             names(&["id", "name", "total"]),
             vec![
                 record(2, &[Some("1"), Some("Ada"), Some("42.50")]),
@@ -1318,7 +1770,7 @@ mod tests {
     #[test]
     fn from_text_columns_widens_mixed_columns_and_defaults_empty_columns_to_text() {
         let materialized = from_text_columns(
-            &SchemaDirective::Inferred,
+            &SchemaDirective::inferred(),
             names(&["mixed", "widened", "empty"]),
             vec![
                 record(2, &[Some("1"), Some("1"), None]),
@@ -1351,7 +1803,7 @@ mod tests {
         // numbers falls to Utf8 under the disagreements-fall-to-text merge rule
         // and stores the original strings verbatim.
         let materialized = from_text_columns(
-            &SchemaDirective::Inferred,
+            &SchemaDirective::inferred(),
             names(&["reading"]),
             vec![record(2, &[Some("1.5")]), record(3, &[Some("inf")])],
         )
@@ -1369,7 +1821,7 @@ mod tests {
         // integers falls to Utf8 under the disagreements-fall-to-text merge rule
         // and stores the original strings verbatim.
         let materialized = from_text_columns(
-            &SchemaDirective::Inferred,
+            &SchemaDirective::inferred(),
             names(&["account"]),
             vec![record(2, &[Some("007")]), record(3, &[Some("1234")])],
         )
@@ -1390,7 +1842,7 @@ mod tests {
             json_record(2, r#"{"zip": "00987", "balance": 5}"#),
         ];
         let materialized = from_json_columns(
-            &SchemaDirective::Inferred,
+            &SchemaDirective::inferred(),
             names(&["zip", "balance", "active"]),
             records,
         )
@@ -1420,7 +1872,7 @@ mod tests {
             json_record(2, r#"{"amount": 42.5}"#),
         ];
         let materialized =
-            from_json_columns(&SchemaDirective::Inferred, names(&["amount"]), records)
+            from_json_columns(&SchemaDirective::inferred(), names(&["amount"]), records)
                 .expect("materialize");
         let batch = &materialized.batch;
 
@@ -1436,7 +1888,7 @@ mod tests {
     fn from_json_columns_stringifies_composites_and_reports_schema_decision() {
         let records = vec![json_record(1, r#"{"tags": ["a", "b"], "meta": {"k": 1}}"#)];
         let materialized = from_json_columns(
-            &SchemaDirective::Inferred,
+            &SchemaDirective::inferred(),
             names(&["tags", "meta"]),
             records,
         )
@@ -1464,8 +1916,9 @@ mod tests {
     #[test]
     fn from_json_columns_defaults_all_null_columns_to_text() {
         let records = vec![json_record(1, r#"{"note": null}"#), json_record(2, "{}")];
-        let materialized = from_json_columns(&SchemaDirective::Inferred, names(&["note"]), records)
-            .expect("materialize");
+        let materialized =
+            from_json_columns(&SchemaDirective::inferred(), names(&["note"]), records)
+                .expect("materialize");
         let batch = &materialized.batch;
 
         assert_eq!(schema_types(batch), vec![DataType::Utf8]);
@@ -1606,10 +2059,42 @@ mod tests {
     // ---- Pinned materialization and drift (ADR-0034) ----
 
     fn pinned_directive(pin_yaml: &str, drift_policy: DriftPolicy) -> SchemaDirective {
+        overridden_pinned_directive(pin_yaml, drift_policy, SchemaOverrides::none())
+    }
+
+    fn overridden_pinned_directive(
+        pin_yaml: &str,
+        drift_policy: DriftPolicy,
+        overrides: SchemaOverrides,
+    ) -> SchemaDirective {
         SchemaDirective::Pinned {
             pinned_path: "customers.schema.yml".to_string(),
             pin: PinnedSchema::from_yaml(pin_yaml).expect("test pin parses"),
             drift_policy,
+            overrides,
+        }
+    }
+
+    /// Builds validated overrides from `(name, type, nullable)` triples.
+    fn overrides(entries: &[(&str, Option<&str>, Option<bool>)]) -> SchemaOverrides {
+        SchemaOverrides::from_entries(
+            &entries
+                .iter()
+                .map(|(name, field_type, nullable)| OverrideEntry {
+                    name: name.to_string(),
+                    field_type: field_type.map(str::to_string),
+                    nullable: *nullable,
+                })
+                .collect::<Vec<_>>(),
+        )
+        .expect("test overrides validate")
+    }
+
+    fn overridden_inferred_directive(
+        entries: &[(&str, Option<&str>, Option<bool>)],
+    ) -> SchemaDirective {
+        SchemaDirective::Inferred {
+            overrides: overrides(entries),
         }
     }
 
@@ -1998,6 +2483,7 @@ mod tests {
         let materialized = from_text_columns(
             &SchemaDirective::PinInferred {
                 pinned_path: "customers.schema.yml".to_string(),
+                overrides: SchemaOverrides::none(),
             },
             names(&["id", "total"]),
             vec![record(2, &[Some("1"), Some("42.5")])],
@@ -2254,6 +2740,495 @@ mod tests {
         assert_eq!(
             PinnedSchema::from_yaml(&pin.to_yaml()).expect("reparse"),
             pin
+        );
+    }
+
+    // ---- Schema overrides (ADR-0038) ----
+
+    #[test]
+    fn from_text_columns_applies_overrides_to_inferred_fields_and_rejects_misfits() {
+        // `account` infers utf8 because of "n/a"; the override corrects it to
+        // int64 — the ADR-0038 core scenario — so the dirty record is
+        // rejected per record exactly like a pinned misfit and the survivors
+        // materialize under the overridden type.
+        let materialized = from_text_columns(
+            &overridden_inferred_directive(&[("account", Some("int64"), None)]),
+            names(&["account", "note"]),
+            vec![
+                record(2, &[Some("42"), Some("a")]),
+                record(3, &[Some("n/a"), Some("b")]),
+                record(4, &[Some("7"), Some("c")]),
+            ],
+        )
+        .expect("override misfits reject records, not the load");
+        let batch = &materialized.batch;
+
+        assert_eq!(schema_types(batch), vec![DataType::Int64, DataType::Utf8]);
+        assert_eq!(ints(batch, 0).value(0), 42);
+        assert_eq!(ints(batch, 0).value(1), 7);
+
+        assert_eq!(materialized.rejected.len(), 1);
+        let rejected = &materialized.rejected[0];
+        assert_eq!(rejected.line, 3);
+        assert_eq!(rejected.code, "type_coercion_failed");
+        assert_eq!(rejected.field.as_deref(), Some("account"));
+        assert_eq!(
+            rejected.message,
+            "value \"n/a\" does not fit overridden type int64 for field \"account\""
+        );
+        assert_eq!(rejected.record, json!({ "account": "n/a", "note": "b" }));
+
+        assert_eq!(
+            materialized.schema_decision,
+            json!({
+                "mode": "inferred",
+                "fields": [
+                    {"name": "account", "type": "int64", "nullable": true},
+                    {"name": "note", "type": "utf8", "nullable": true}
+                ],
+                "drift_status": "not_applicable",
+                "overrides": [
+                    {"name": "account", "type": "int64"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn from_text_columns_shapes_unoverridden_fields_from_surviving_records_only() {
+        // The record rejected by the `account` override carries the only text
+        // in `score`: its value must not widen the surviving column, which
+        // types from survivors alone.
+        let materialized = from_text_columns(
+            &overridden_inferred_directive(&[("account", Some("int64"), None)]),
+            names(&["account", "score"]),
+            vec![
+                record(2, &[Some("1"), Some("10")]),
+                record(3, &[Some("bad"), Some("high")]),
+            ],
+        )
+        .expect("materialize");
+
+        assert_eq!(
+            schema_types(&materialized.batch),
+            vec![DataType::Int64, DataType::Int64]
+        );
+        assert_eq!(materialized.rejected.len(), 1);
+    }
+
+    #[test]
+    fn from_text_columns_overrides_an_all_null_column_to_the_overridden_type() {
+        // An all-null column defaults to text under inference; the override
+        // decides the type instead, and null cells still fit a nullable
+        // overridden field.
+        let materialized = from_text_columns(
+            &overridden_inferred_directive(&[("score", Some("int64"), None)]),
+            names(&["score"]),
+            vec![record(2, &[None]), record(3, &[None])],
+        )
+        .expect("materialize");
+
+        assert_eq!(schema_types(&materialized.batch), vec![DataType::Int64]);
+        assert!(ints(&materialized.batch, 0).is_null(0));
+        assert!(materialized.rejected.is_empty());
+    }
+
+    #[test]
+    fn from_json_columns_rejects_null_and_absent_under_a_non_nullable_override() {
+        // A `nullable: false` override makes the field required (ADR-0038)
+        // with pinned-field per-record semantics (ADR-0035): a JSON null and
+        // an absent field both reject their record. The type stays inferred
+        // from the survivors, and the materialized Arrow field is
+        // non-nullable.
+        let materialized = from_json_columns(
+            &SchemaDirective::Inferred {
+                overrides: overrides(&[("email", None, Some(false))]),
+            },
+            names(&["id", "email"]),
+            vec![
+                json_record(1, r#"{"id": 1, "email": "a@example.com"}"#),
+                json_record(2, r#"{"id": 2, "email": null}"#),
+                json_record(3, r#"{"id": 3}"#),
+            ],
+        )
+        .expect("required-field violations reject records, not the load");
+        let batch = &materialized.batch;
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(schema_types(batch), vec![DataType::Int64, DataType::Utf8]);
+        assert!(!batch.schema().field(1).is_nullable());
+        assert_eq!(materialized.rejected.len(), 2);
+        for (rejected, line) in [
+            (&materialized.rejected[0], 2),
+            (&materialized.rejected[1], 3),
+        ] {
+            assert_eq!(rejected.line, line);
+            assert_eq!(rejected.code, "missing_required_field");
+            assert_eq!(rejected.field.as_deref(), Some("email"));
+            assert_eq!(rejected.message, "required field \"email\" is null");
+        }
+        assert_eq!(
+            materialized.schema_decision["overrides"],
+            json!([{"name": "email", "nullable": false}])
+        );
+    }
+
+    #[test]
+    fn from_json_columns_rejects_a_json_string_against_an_overridden_numeric_field() {
+        // A JSON string that merely looks numeric misfits an overridden int64
+        // exactly like it misfits a pinned int64: the value's declared type
+        // does not widen to the override.
+        let materialized = from_json_columns(
+            &overridden_inferred_directive(&[("balance", Some("int64"), None)]),
+            names(&["balance"]),
+            vec![
+                json_record(1, r#"{"balance": 7}"#),
+                json_record(2, r#"{"balance": "10"}"#),
+            ],
+        )
+        .expect("string vs overridden int64 rejects the record");
+
+        assert_eq!(materialized.batch.num_rows(), 1);
+        assert_eq!(ints(&materialized.batch, 0).value(0), 7);
+        assert_eq!(materialized.rejected.len(), 1);
+        assert_eq!(
+            materialized.rejected[0].message,
+            "value \"10\" does not fit overridden type int64 for field \"balance\""
+        );
+    }
+
+    #[test]
+    fn from_json_columns_widens_values_into_an_overridden_wider_type() {
+        // Overridden fields build like pinned fields: integer cells widen
+        // into an overridden float64 column per the lattice.
+        let materialized = from_json_columns(
+            &overridden_inferred_directive(&[("amount", Some("float64"), None)]),
+            names(&["amount"]),
+            vec![json_record(1, r#"{"amount": 10}"#)],
+        )
+        .expect("materialize");
+
+        assert_eq!(schema_types(&materialized.batch), vec![DataType::Float64]);
+        assert_eq!(floats(&materialized.batch, 0).value(0), 10.0);
+        assert!(materialized.rejected.is_empty());
+    }
+
+    #[test]
+    fn from_text_columns_persists_the_overridden_schema_as_the_new_pin() {
+        // The bootstrap load persists the overridden schema (ADR-0038): the
+        // pin records the effective schema, with no override annotation.
+        let materialized = from_text_columns(
+            &SchemaDirective::PinInferred {
+                pinned_path: "customers.schema.yml".to_string(),
+                overrides: overrides(&[("customer_id", Some("utf8"), Some(false))]),
+            },
+            names(&["customer_id", "total"]),
+            vec![record(2, &[Some("1"), Some("42.5")])],
+        )
+        .expect("materialize");
+
+        assert_eq!(
+            materialized.schema_decision,
+            json!({
+                "mode": "inferred",
+                "fields": [
+                    {"name": "customer_id", "type": "utf8", "nullable": false},
+                    {"name": "total", "type": "float64", "nullable": true}
+                ],
+                "drift_status": "not_applicable",
+                "pinned_schema_path": "customers.schema.yml",
+                "pinned_schema_persisted": true,
+                "overrides": [
+                    {"name": "customer_id", "type": "utf8", "nullable": false}
+                ]
+            })
+        );
+        assert_eq!(
+            materialized
+                .pinned_schema_write
+                .expect("bootstrap pin")
+                .yaml,
+            "version: 1\n\
+             fields:\n\
+             - name: customer_id\n\
+             \x20 type: utf8\n\
+             \x20 nullable: false\n\
+             - name: total\n\
+             \x20 type: float64\n\
+             \x20 nullable: true\n"
+        );
+    }
+
+    #[test]
+    fn from_text_columns_fails_on_an_override_naming_an_unobserved_field() {
+        // An override names the observed source shape — for CSV, the header.
+        // A name the source does not carry fails the load before anything is
+        // materialized, echoing the configured posture.
+        let error = from_text_columns(
+            &overridden_inferred_directive(&[("vip", Some("boolean"), None)]),
+            names(&["id", "name"]),
+            vec![record(2, &[Some("1"), Some("Ada")])],
+        )
+        .err()
+        .expect("unknown override field rejected");
+
+        assert_eq!(error.failure.code, "unknown_override_field");
+        assert_eq!(
+            error.failure.message,
+            "schema overrides name fields absent from the observed source shape: vip"
+        );
+        assert!(error.rejected.is_empty());
+        assert_eq!(
+            *error.schema_decision.expect("decision echoes the posture"),
+            json!({
+                "mode": "inferred",
+                "drift_status": "not_applicable",
+                "overrides": [
+                    {"name": "vip", "type": "boolean"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn from_json_columns_treats_a_batch_wide_absent_override_target_as_unknown() {
+        // JSONL's observed shape is the union of the batch's record keys, so
+        // a field absent from every record is absent from the shape — an
+        // override naming it is unknown, mirroring missing-field drift's
+        // batch-wide rule (ADR-0034).
+        let error = from_json_columns(
+            &overridden_inferred_directive(&[("email", None, Some(false))]),
+            names(&["id"]),
+            vec![json_record(1, r#"{"id": 1}"#)],
+        )
+        .err()
+        .expect("batch-wide absent override target rejected");
+
+        assert_eq!(error.failure.code, "unknown_override_field");
+    }
+
+    #[test]
+    fn unknown_override_fields_fail_before_missing_field_drift() {
+        // The override names a pinned field the source batch does not carry:
+        // both an unknown override name and missing-field drift are present,
+        // and the unknown override wins — it is checked as soon as the
+        // observed names are known, before any pin comparison (ADR-0038).
+        let directive = overridden_pinned_directive(
+            "version: 1\n\
+             fields:\n\
+             - name: id\n\
+             \x20 type: int64\n\
+             - name: name\n\
+             \x20 type: utf8\n",
+            DriftPolicy::Fail,
+            overrides(&[("name", None, Some(false))]),
+        );
+        let error = from_text_columns(&directive, names(&["id"]), vec![record(2, &[Some("1")])])
+            .err()
+            .expect("unknown override field rejected");
+
+        assert_eq!(error.failure.code, "unknown_override_field");
+        assert_eq!(
+            *error.schema_decision.expect("decision echoes the pin"),
+            json!({
+                "mode": "pinned",
+                "fields": [
+                    {"name": "id", "type": "int64", "nullable": true},
+                    {"name": "name", "type": "utf8", "nullable": true}
+                ],
+                "drift_status": "not_applicable",
+                "pinned_schema_path": "customers.schema.yml",
+                "overrides": [
+                    {"name": "name", "nullable": false}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn overrides_conflicting_with_the_pin_fail_as_override_conflicts() {
+        // A field the pin governs takes nothing from an override, but the
+        // override must agree with it: a contradiction on a set property
+        // fails the load with the conflict detail (ADR-0038).
+        let directive = overridden_pinned_directive(
+            "version: 1\nfields:\n- name: id\n  type: int64\n",
+            DriftPolicy::Fail,
+            overrides(&[("id", Some("utf8"), None)]),
+        );
+        let error = from_text_columns(&directive, names(&["id"]), vec![record(2, &[Some("1")])])
+            .err()
+            .expect("conflicting override rejected");
+
+        assert_eq!(error.failure.code, "schema_override_conflict");
+        assert_eq!(
+            error.failure.message,
+            "schema override for field \"id\" contradicts pinned schema \
+             customers.schema.yml: pinned type int64, override type utf8"
+        );
+        assert_eq!(
+            *error
+                .schema_decision
+                .expect("decision carries the conflict"),
+            json!({
+                "mode": "pinned",
+                "fields": [
+                    {"name": "id", "type": "int64", "nullable": true}
+                ],
+                "drift_status": "not_applicable",
+                "conflict": {
+                    "field": "id",
+                    "pinned": {"type": "int64", "nullable": true},
+                    "override": {"type": "utf8"}
+                },
+                "pinned_schema_path": "customers.schema.yml",
+                "overrides": [
+                    {"name": "id", "type": "utf8"}
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn override_conflicts_fail_before_drift_comparison() {
+        // A definition contradicting its pin is broken regardless of what the
+        // batch looks like, so the conflict wins over the added-field drift
+        // also present in this source.
+        let directive = overridden_pinned_directive(
+            "version: 1\nfields:\n- name: id\n  type: int64\n",
+            DriftPolicy::Fail,
+            overrides(&[("id", None, Some(false))]),
+        );
+        let error = from_text_columns(
+            &directive,
+            names(&["id", "extra"]),
+            vec![record(2, &[Some("1"), Some("x")])],
+        )
+        .err()
+        .expect("conflicting override rejected");
+
+        assert_eq!(error.failure.code, "schema_override_conflict");
+        assert_eq!(
+            error.failure.message,
+            "schema override for field \"id\" contradicts pinned schema \
+             customers.schema.yml: pinned nullable true, override nullable false"
+        );
+    }
+
+    #[test]
+    fn overrides_agreeing_with_the_pin_change_nothing() {
+        // An override that restates what the pin declares is consistent — the
+        // load validates exactly as without it, still wording rejections as
+        // pinned misfits — and the decision still echoes the directive.
+        let directive = overridden_pinned_directive(
+            "version: 1\nfields:\n- name: id\n  type: int64\n",
+            DriftPolicy::Fail,
+            overrides(&[("id", Some("int64"), None)]),
+        );
+        let materialized = from_text_columns(
+            &directive,
+            names(&["id"]),
+            vec![record(2, &[Some("1")]), record(3, &[Some("abc")])],
+        )
+        .expect("agreeing override loads");
+
+        assert_eq!(materialized.batch.num_rows(), 1);
+        assert_eq!(materialized.rejected.len(), 1);
+        assert_eq!(
+            materialized.rejected[0].message,
+            "value \"abc\" does not fit pinned type int64 for field \"id\""
+        );
+        assert_eq!(materialized.schema_decision["drift_status"], "none");
+        assert_eq!(
+            materialized.schema_decision["overrides"],
+            json!([{"name": "id", "type": "int64"}])
+        );
+    }
+
+    #[test]
+    fn from_text_columns_applies_overrides_to_added_fields_and_the_extended_pin() {
+        // Under the additive policy an override naming the added field is
+        // explicit intent: it beats the policy's nullable default and the
+        // survivor-observed type, the required field rejects the record that
+        // leaves it null, and the rewritten pin records the overridden
+        // properties (ADR-0038).
+        let directive = overridden_pinned_directive(
+            "version: 1\nfields:\n- name: id\n  type: int64\n",
+            DriftPolicy::AllowAdditiveNullable,
+            overrides(&[("vip", Some("utf8"), Some(false))]),
+        );
+        let materialized = from_text_columns(
+            &directive,
+            names(&["id", "vip"]),
+            vec![
+                record(2, &[Some("1"), Some("true")]),
+                record(3, &[Some("2"), None]),
+            ],
+        )
+        .expect("materialize");
+        let batch = &materialized.batch;
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(schema_types(batch), vec![DataType::Int64, DataType::Utf8]);
+        assert!(!batch.schema().field(1).is_nullable());
+        assert_eq!(strings(batch, 1).value(0), "true");
+
+        assert_eq!(materialized.rejected.len(), 1);
+        assert_eq!(materialized.rejected[0].code, "missing_required_field");
+        assert_eq!(materialized.rejected[0].field.as_deref(), Some("vip"));
+
+        assert_eq!(
+            materialized.schema_decision,
+            json!({
+                "mode": "pinned",
+                "fields": [
+                    {"name": "id", "type": "int64", "nullable": true},
+                    {"name": "vip", "type": "utf8", "nullable": false}
+                ],
+                "drift_status": "additive_fields_added",
+                "added_fields": [
+                    {"name": "vip", "type": "utf8", "nullable": false}
+                ],
+                "pinned_schema_path": "customers.schema.yml",
+                "pinned_schema_persisted": true,
+                "overrides": [
+                    {"name": "vip", "type": "utf8", "nullable": false}
+                ]
+            })
+        );
+        assert_eq!(
+            materialized.pinned_schema_write.expect("extended pin").yaml,
+            "version: 1\n\
+             fields:\n\
+             - name: id\n\
+             \x20 type: int64\n\
+             \x20 nullable: true\n\
+             - name: vip\n\
+             \x20 type: utf8\n\
+             \x20 nullable: false\n"
+        );
+    }
+
+    #[test]
+    fn drift_failures_echo_the_configured_overrides() {
+        // The overrides echo rides every decision the schema module reports,
+        // failure paths included.
+        let directive = overridden_pinned_directive(
+            "version: 1\nfields:\n- name: id\n  type: int64\n",
+            DriftPolicy::Fail,
+            overrides(&[("extra", Some("utf8"), None)]),
+        );
+        let error = from_text_columns(
+            &directive,
+            names(&["id", "extra"]),
+            vec![record(2, &[Some("1"), Some("x")])],
+        )
+        .err()
+        .expect("added field rejected by default");
+
+        assert_eq!(error.failure.code, "schema_drift");
+        assert_eq!(
+            error.schema_decision.expect("decision")["overrides"],
+            json!([{"name": "extra", "type": "utf8"}])
         );
     }
 

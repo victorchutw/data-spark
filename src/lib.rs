@@ -215,13 +215,17 @@ struct ArtifactsConfig {
 }
 
 /// The `schema` block of a load definition: the path of the pinned schema file
-/// the load reuses (ADR-0033) and the drift policy that decides whether a load
-/// may continue when schema drift is detected (ADR-0007).
+/// the load reuses (ADR-0033), the drift policy that decides whether a load
+/// may continue when schema drift is detected (ADR-0007), and the per-field
+/// overrides applied to whatever the load infers (ADR-0038). The block is
+/// valid with `pinned_path`, `overrides`, or both; `drift_policy` still
+/// requires `pinned_path`.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SchemaConfig {
     pinned_path: Option<PathBuf>,
     drift_policy: Option<String>,
+    overrides: Option<Vec<schema::OverrideEntry>>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -650,23 +654,53 @@ fn execute_supported_load(
 /// Resolves the definition's `schema` block into the schema directive the
 /// source materializes under: no block means inference, a named pinned schema
 /// file that does not exist yet means this load persists the inferred schema as
-/// the new pin (ADR-0033), and an existing file is parsed and validated against
-/// (ADR-0034).
+/// the new pin (ADR-0033), an existing file is parsed and validated against
+/// (ADR-0034), and `overrides` travel on every directive to rewrite whatever
+/// the load infers (ADR-0038). A block with `overrides` but no `pinned_path`
+/// is a plain inference directive with overrides.
 fn resolve_schema_directive(
     schema_config: Option<&SchemaConfig>,
 ) -> Result<schema::SchemaDirective, LoadFailure> {
     let Some(schema_config) = schema_config else {
-        return Ok(schema::SchemaDirective::Inferred);
+        return Ok(schema::SchemaDirective::inferred());
     };
-    let pinned_path = schema_config
+    let invalid_schema_config = |message: String| LoadFailure {
+        code: "invalid_schema_config",
+        message,
+    };
+
+    // A written-but-empty setting is noise, not an absent one: fail loud
+    // instead of silently reinterpreting the block (ADR-0037's spirit).
+    if schema_config
         .pinned_path
         .as_ref()
-        .filter(|pinned_path| !pinned_path.as_os_str().is_empty())
-        .ok_or_else(|| LoadFailure {
-            code: "invalid_schema_config",
-            message: "schema.pinned_path is required when a load definition has a schema block"
-                .to_string(),
-        })?;
+        .is_some_and(|pinned_path| pinned_path.as_os_str().is_empty())
+    {
+        return Err(invalid_schema_config(
+            "schema.pinned_path must not be empty".to_string(),
+        ));
+    }
+    if schema_config
+        .overrides
+        .as_ref()
+        .is_some_and(|overrides| overrides.is_empty())
+    {
+        return Err(invalid_schema_config(
+            "schema.overrides must declare at least one override".to_string(),
+        ));
+    }
+    if schema_config.pinned_path.is_none() {
+        if schema_config.drift_policy.is_some() {
+            return Err(invalid_schema_config(
+                "schema.drift_policy requires schema.pinned_path".to_string(),
+            ));
+        }
+        if schema_config.overrides.is_none() {
+            return Err(invalid_schema_config(
+                "a schema block must set schema.pinned_path or schema.overrides".to_string(),
+            ));
+        }
+    }
     let drift_policy = match schema_config.drift_policy.as_deref() {
         None | Some("fail") => schema::DriftPolicy::Fail,
         Some("allow_additive_nullable") => schema::DriftPolicy::AllowAdditiveNullable,
@@ -677,16 +711,25 @@ fn resolve_schema_directive(
             })
         }
     };
+    let overrides = match &schema_config.overrides {
+        None => schema::SchemaOverrides::none(),
+        Some(entries) => schema::SchemaOverrides::from_entries(entries)?,
+    };
 
+    let Some(pinned_path) = schema_config.pinned_path.as_ref() else {
+        return Ok(schema::SchemaDirective::Inferred { overrides });
+    };
     match fs::read_to_string(pinned_path) {
         Ok(pin_text) => Ok(schema::SchemaDirective::Pinned {
             pinned_path: path_string(pinned_path),
             pin: schema::PinnedSchema::from_yaml(&pin_text)?,
             drift_policy,
+            overrides,
         }),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             Ok(schema::SchemaDirective::PinInferred {
                 pinned_path: path_string(pinned_path),
+                overrides,
             })
         }
         Err(error) => Err(LoadFailure {
@@ -1072,6 +1115,7 @@ mod tests {
         definition.schema = Some(SchemaConfig {
             pinned_path: Some(pinned_path.clone()),
             drift_policy: None,
+            overrides: None,
         });
 
         let failure = execute_supported_load(&definition)
@@ -1118,8 +1162,12 @@ mod tests {
                 "rename",
             ),
             (
-                "version: 1\nschema:\n  pinned_path: p.yml\n  overrides: {}\n",
-                "overrides",
+                "version: 1\nschema:\n  pinned_path: p.yml\n  checksum: abc123\n",
+                "checksum",
+            ),
+            (
+                "version: 1\nschema:\n  overrides:\n  - name: id\n    coerce: true\n",
+                "coerce",
             ),
             (
                 "version: 1\nartifacts:\n  dir: runs\n  retention_days: 7\n",
@@ -1143,29 +1191,133 @@ mod tests {
         SchemaConfig {
             pinned_path: pinned_path.map(PathBuf::from),
             drift_policy: drift_policy.map(str::to_string),
+            overrides: None,
         }
+    }
+
+    fn overrides_yaml(overrides: &str) -> Option<Vec<schema::OverrideEntry>> {
+        Some(serde_yaml::from_str(overrides).expect("test overrides parse"))
     }
 
     #[test]
     fn resolve_schema_directive_defaults_to_inference_without_a_schema_block() {
         assert!(matches!(
             resolve_schema_directive(None),
-            Ok(schema::SchemaDirective::Inferred)
+            Ok(schema::SchemaDirective::Inferred { .. })
         ));
     }
 
     #[test]
-    fn resolve_schema_directive_requires_a_pinned_path_in_a_schema_block() {
-        for config in [
-            schema_config(None, None),
-            schema_config(None, Some("fail")),
-            schema_config(Some(""), None),
+    fn resolve_schema_directive_rejects_underspecified_schema_blocks() {
+        // The block is valid with pinned_path, overrides, or both (ADR-0038);
+        // drift_policy still requires pinned_path, and a written-but-empty
+        // setting is noise, not an absent one.
+        let mut empty_overrides = schema_config(Some("p.yml"), None);
+        empty_overrides.overrides = Some(Vec::new());
+        for (config, expected_message_part) in [
+            (
+                schema_config(None, None),
+                "a schema block must set schema.pinned_path or schema.overrides",
+            ),
+            (
+                schema_config(None, Some("fail")),
+                "schema.drift_policy requires schema.pinned_path",
+            ),
+            (
+                schema_config(Some(""), None),
+                "schema.pinned_path must not be empty",
+            ),
+            (
+                empty_overrides,
+                "schema.overrides must declare at least one override",
+            ),
         ] {
             let error = resolve_schema_directive(Some(&config))
                 .err()
-                .expect("schema block without pinned_path rejected");
+                .expect("underspecified schema block rejected");
             assert_eq!(error.code, "invalid_schema_config");
-            assert!(error.message.contains("schema.pinned_path is required"));
+            assert!(
+                error.message.contains(expected_message_part),
+                "message {:?} misses {expected_message_part:?}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_schema_directive_accepts_overrides_without_a_pinned_path() {
+        // Standalone overrides are an inference directive with overrides
+        // (ADR-0038): no pin is read, bootstrapped, or required.
+        let mut config = schema_config(None, None);
+        config.overrides = overrides_yaml("- name: id\n  type: int64\n");
+
+        match resolve_schema_directive(Some(&config)).expect("standalone overrides resolve") {
+            schema::SchemaDirective::Inferred { overrides } => assert!(!overrides.is_empty()),
+            _ => panic!("expected the Inferred directive"),
+        }
+    }
+
+    #[test]
+    fn resolve_schema_directive_carries_overrides_onto_pin_directives() {
+        let work = tempfile::TempDir::new().expect("tempdir");
+        let pinned_path = work.path().join("customers.schema.yml");
+        let mut config = schema_config(Some(pinned_path.to_str().expect("utf8 path")), None);
+        config.overrides = overrides_yaml("- name: id\n  nullable: false\n");
+
+        // Absent pin file: the bootstrap directive carries the overrides.
+        match resolve_schema_directive(Some(&config)).expect("absent pin bootstraps") {
+            schema::SchemaDirective::PinInferred { overrides, .. } => {
+                assert!(!overrides.is_empty())
+            }
+            _ => panic!("expected the PinInferred directive"),
+        }
+
+        // Existing pin file: the pinned directive carries the overrides.
+        fs::write(
+            &pinned_path,
+            "version: 1\nfields:\n- name: id\n  type: int64\n",
+        )
+        .expect("write pin");
+        match resolve_schema_directive(Some(&config)).expect("existing pin loads") {
+            schema::SchemaDirective::Pinned { overrides, .. } => assert!(!overrides.is_empty()),
+            _ => panic!("expected the Pinned directive"),
+        }
+    }
+
+    #[test]
+    fn resolve_schema_directive_rejects_invalid_overrides_before_reading_the_pin() {
+        // The pin path does not exist: override validation must fail instead
+        // of silently bootstrapping. Duplicate names and a no-op entry are
+        // config errors; a type outside the vocabulary mirrors
+        // unsupported_drift_policy.
+        for (overrides, expected_code, expected_message_part) in [
+            (
+                "- name: id\n  type: int64\n- name: id\n  nullable: false\n",
+                "invalid_schema_config",
+                "schema override for field \"id\" is declared more than once",
+            ),
+            (
+                "- name: id\n",
+                "invalid_schema_config",
+                "schema override for field \"id\" must set at least one of type or nullable",
+            ),
+            (
+                "- name: id\n  type: date\n",
+                "unsupported_override_type",
+                "unsupported schema override type for field \"id\": date",
+            ),
+        ] {
+            let mut config = schema_config(Some("/does/not/exist.schema.yml"), None);
+            config.overrides = overrides_yaml(overrides);
+            let error = resolve_schema_directive(Some(&config))
+                .err()
+                .expect("invalid overrides rejected");
+            assert_eq!(error.code, expected_code, "code for {overrides:?}");
+            assert!(
+                error.message.contains(expected_message_part),
+                "message {:?} misses {expected_message_part:?}",
+                error.message
+            );
         }
     }
 
@@ -1185,11 +1337,41 @@ mod tests {
     fn resolve_schema_directive_bootstraps_when_the_pin_file_is_absent() {
         let config = schema_config(Some("/does/not/exist/customers.schema.yml"), Some("fail"));
         match resolve_schema_directive(Some(&config)).expect("absent pin bootstraps") {
-            schema::SchemaDirective::PinInferred { pinned_path } => {
+            schema::SchemaDirective::PinInferred { pinned_path, .. } => {
                 assert_eq!(pinned_path, "/does/not/exist/customers.schema.yml");
             }
             _ => panic!("expected the PinInferred directive"),
         }
+    }
+
+    #[test]
+    fn load_definition_parses_schema_overrides() {
+        // Entries may set type, nullable, or both; name alone still parses —
+        // rejecting a no-op entry is directive resolution's job, so the error
+        // is a schema config failure rather than a YAML parse failure.
+        let definition = serde_yaml::from_str::<LoadDefinition>(
+            "version: 1\n\
+             schema:\n\
+             \x20 overrides:\n\
+             \x20 - name: customer_id\n\
+             \x20   type: utf8\n\
+             \x20 - name: email\n\
+             \x20   nullable: false\n\
+             \x20 - name: total\n",
+        )
+        .expect("definition with overrides parses");
+        let overrides = definition
+            .schema
+            .expect("schema block")
+            .overrides
+            .expect("overrides");
+        assert_eq!(overrides.len(), 3);
+
+        // An entry without a name is not part of the contract.
+        assert!(serde_yaml::from_str::<LoadDefinition>(
+            "version: 1\nschema:\n  overrides:\n  - type: utf8\n"
+        )
+        .is_err());
     }
 
     #[test]

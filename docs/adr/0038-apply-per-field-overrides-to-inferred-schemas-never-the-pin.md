@@ -1,0 +1,7 @@
+---
+status: accepted
+---
+
+# Apply Per-Field Overrides to Inferred Schemas, Never the Pin
+
+Data Spark will let a load definition override selected fields of an inferred schema through `schema.overrides` entries that name a field and replace its inferred type, nullability, or both. An override is a durable correction to inference, so it applies wherever inference decides a field's shape — an inference-driven load, the first load that bootstraps a pinned schema, and the added fields an additive drift policy admits — and the overridden schema is what gets materialized, persisted as the pin, and compared on later loads. A field already governed by an existing pinned schema takes nothing from an override, but the override must agree with the pinned field; a contradiction fails the load as an override conflict instead of being silently ignored, so a definition and a hand-edited pin cannot drift apart unnoticed. Overridden fields validate per record exactly like pinned fields: values that do not widen to the overridden type, and nulls in a field overridden non-nullable, become rejected records under the reject threshold — which means a load with overrides can reject records even though pure inference never does. Narrowing overrides are deliberate: correcting a text-inferred column to its true numeric type while rejecting the few values that made inference widen is the capability's core scenario.
