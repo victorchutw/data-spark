@@ -1255,7 +1255,7 @@ mod tests {
             format: Some("xml".to_string()),
         };
         let error = source
-            .read(&SchemaDirective::Inferred)
+            .read(&SchemaDirective::inferred())
             .err()
             .expect("unknown format rejected");
         assert_eq!(error.failure.code, "unsupported_source_format");
@@ -1288,7 +1288,7 @@ mod tests {
             path: source_path,
             format: Some("csv".to_string()),
         };
-        let read = source.read(&SchemaDirective::Inferred).expect("read csv");
+        let read = source.read(&SchemaDirective::inferred()).expect("read csv");
 
         assert_eq!(read.batch.num_rows(), 2);
         assert_eq!(
@@ -1317,7 +1317,9 @@ mod tests {
             path: source_path,
             format: Some("jsonl".to_string()),
         };
-        let read = source.read(&SchemaDirective::Inferred).expect("read jsonl");
+        let read = source
+            .read(&SchemaDirective::inferred())
+            .expect("read jsonl");
 
         assert_eq!(read.batch.num_rows(), 2);
         assert_eq!(
@@ -1347,7 +1349,7 @@ mod tests {
             format: Some("csv".to_string()),
         };
         let read = source
-            .read(&SchemaDirective::Inferred)
+            .read(&SchemaDirective::inferred())
             .expect("a bad record rejects the record, not the load");
 
         assert_eq!(read.batch.num_rows(), 2);
@@ -1381,7 +1383,7 @@ mod tests {
             format: Some("csv".to_string()),
         };
         let read = source
-            .read(&SchemaDirective::Inferred)
+            .read(&SchemaDirective::inferred())
             .expect("an unparseable record rejects the record, not the load");
 
         assert_eq!(read.batch.num_rows(), 2);
@@ -1416,7 +1418,7 @@ mod tests {
             format: Some("jsonl".to_string()),
         };
         let read = source
-            .read(&SchemaDirective::Inferred)
+            .read(&SchemaDirective::inferred())
             .expect("bad lines reject their records, not the load");
 
         assert_eq!(read.batch.num_rows(), 2);
@@ -1458,6 +1460,7 @@ mod tests {
             )
             .expect("test pin parses"),
             drift_policy: schema::DriftPolicy::Fail,
+            overrides: schema::SchemaOverrides::none(),
         };
         let read = source
             .read(&directive)
@@ -1486,7 +1489,7 @@ mod tests {
             format: Some("jsonl".to_string()),
         };
         let error = source
-            .read(&SchemaDirective::Inferred)
+            .read(&SchemaDirective::inferred())
             .err()
             .expect("a source with no parseable records fails the load");
 
@@ -1515,7 +1518,7 @@ mod tests {
             format: Some("jsonl".to_string()),
         };
         let error = source
-            .read(&SchemaDirective::Inferred)
+            .read(&SchemaDirective::inferred())
             .err()
             .expect("a source with no fields fails the load");
 
@@ -1537,7 +1540,7 @@ mod tests {
             path: source_path,
             format: Some("csv".to_string()),
         }
-        .read(&SchemaDirective::Inferred)
+        .read(&SchemaDirective::inferred())
         .expect("read csv")
         .batch;
 
@@ -1578,7 +1581,7 @@ mod tests {
             path: source_path,
             format: Some("csv".to_string()),
         }
-        .read(&SchemaDirective::Inferred)
+        .read(&SchemaDirective::inferred())
         .expect("read csv")
         .batch;
 
@@ -1626,7 +1629,7 @@ mod tests {
                 path: source_path,
                 format: Some("csv".to_string()),
             }
-            .read(&SchemaDirective::Inferred)
+            .read(&SchemaDirective::inferred())
             .expect("read csv")
             .batch;
             destination

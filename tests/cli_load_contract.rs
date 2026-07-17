@@ -1915,7 +1915,7 @@ destination:
 "#,
         ),
         (
-            "overrides",
+            "checksum",
             r#"
 version: 1
 source:
@@ -1927,7 +1927,7 @@ destination:
   path: {destination}
 schema:
   pinned_path: customers.schema.yml
-  overrides: {}
+  checksum: abc123
 "#,
         ),
         (
@@ -2963,6 +2963,727 @@ schema:
         .downcast_ref::<Int64Array>()
         .expect("customer_id is int64");
     assert_eq!(customer_ids.value(0), 1);
+}
+
+#[test]
+fn csv_overrides_narrow_an_inferred_text_column_and_reject_dirty_records_for_duckdb() {
+    // The ADR-0038 core scenario: `customer_id` infers utf8 only because of
+    // the dirty "n/a" value, and a standalone override (no pinned_path)
+    // corrects the column to its true int64 type while the dirty record is
+    // rejected under the threshold.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "customer_id,name\n1,Ada\nn/a,Grace\n3,Lin\n")
+        .expect("write source csv");
+
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: duckdb
+  path: {}
+dataset: customers
+load_mode: full_refresh
+schema:
+  overrides:
+  - name: customer_id
+    type: int64
+reject_threshold: 1
+"#,
+            source_path.display(),
+            database_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "override load writes one artifact directory",
+    );
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["row_counts"]["source"], 3);
+    assert_eq!(report["row_counts"]["written"], 2);
+    assert_eq!(report["row_counts"]["rejected"], 1);
+    assert_eq!(
+        report["schema_decision"],
+        serde_json::json!({
+            "mode": "inferred",
+            "fields": [
+                {"name": "customer_id", "type": "int64", "nullable": true},
+                {"name": "name", "type": "utf8", "nullable": true}
+            ],
+            "drift_status": "not_applicable",
+            "overrides": [
+                {"name": "customer_id", "type": "int64"}
+            ]
+        })
+    );
+
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let rejected_lines = read_rejected_records(&artifact_path);
+    assert_eq!(rejected_lines.len(), 1);
+    assert_eq!(rejected_lines[0]["line"], 3);
+    assert_eq!(rejected_lines[0]["code"], "type_coercion_failed");
+    assert_eq!(rejected_lines[0]["field"], "customer_id");
+    assert_eq!(
+        rejected_lines[0]["message"],
+        "value \"n/a\" does not fit overridden type int64 for field \"customer_id\""
+    );
+
+    // DuckDB reads the overridden column as BIGINT, not the inferred VARCHAR.
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 2);
+    let customer_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_id is int64");
+    assert_eq!(customer_ids.value(0), 1);
+    assert_eq!(customer_ids.value(1), 3);
+}
+
+#[test]
+fn jsonl_non_nullable_override_rejects_null_and_absent_records_for_parquet() {
+    // A `nullable: false` override makes the field required with pinned-field
+    // per-record semantics (ADR-0038): a JSON null and an omitted field both
+    // reject their record, and the Parquet schema shows the field as
+    // required.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    fs::write(
+        &source_path,
+        "{\"customer_id\": 1, \"email\": \"ada@example.com\"}\n\
+         {\"customer_id\": 2, \"email\": null}\n\
+         {\"customer_id\": 3}\n",
+    )
+    .expect("write source jsonl");
+
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+schema:
+  overrides:
+  - name: email
+    nullable: false
+reject_threshold: 2
+"#,
+            source_path.display(),
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "override load writes one artifact directory",
+    );
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["row_counts"]["written"], 1);
+    assert_eq!(report["row_counts"]["rejected"], 2);
+    assert_eq!(
+        report["schema_decision"]["fields"][1],
+        serde_json::json!({"name": "email", "type": "utf8", "nullable": false})
+    );
+    assert_eq!(
+        report["schema_decision"]["overrides"],
+        serde_json::json!([{"name": "email", "nullable": false}])
+    );
+
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let rejected_lines = read_rejected_records(&artifact_path);
+    assert_eq!(rejected_lines.len(), 2);
+    for (rejected, line, record) in [
+        (
+            &rejected_lines[0],
+            2,
+            serde_json::json!({"customer_id": 2, "email": null}),
+        ),
+        (&rejected_lines[1], 3, serde_json::json!({"customer_id": 3})),
+    ] {
+        assert_eq!(rejected["line"], line);
+        assert_eq!(rejected["code"], "missing_required_field");
+        assert_eq!(rejected["field"], "email");
+        assert_eq!(rejected["message"], "required field \"email\" is null");
+        assert_eq!(rejected["record"], record);
+    }
+
+    // The Parquet schema records the overridden field as required.
+    let batch = read_single_parquet_batch(&single_parquet_file(&destination_path));
+    assert_eq!(batch.num_rows(), 1);
+    assert!(!batch.schema().field(1).is_nullable());
+    let emails = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("email is utf8");
+    assert_eq!(emails.value(0), "ada@example.com");
+}
+
+#[test]
+fn csv_override_bootstrap_persists_the_overridden_pin_then_reuses_it_for_parquet() {
+    // The bootstrap load persists the *overridden* schema as the pin
+    // (ADR-0038): `customer_id` would infer int64, but the override keeps it
+    // text, so the pin and the destination both record utf8 — and a second
+    // run of the same definition finds the override consistent with the pin.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "customer_id,name\n1,Ada\n2,Grace\n").expect("write source csv");
+
+    let destination_path = work.path().join("customers_dataset");
+    let pinned_path = work.path().join("customers.schema.yml");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+  overrides:
+  - name: customer_id
+    type: utf8
+"#,
+            source_path.display(),
+            destination_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-first"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_to_string(&pinned_path).expect("pinned schema file persisted"),
+        "version: 1\n\
+         fields:\n\
+         - name: customer_id\n\
+         \x20 type: utf8\n\
+         \x20 nullable: true\n\
+         - name: name\n\
+         \x20 type: utf8\n\
+         \x20 nullable: true\n"
+    );
+    let (_, first_report) = read_single_report(
+        &work.path().join("artifacts-first"),
+        "bootstrap load writes one artifact directory",
+    );
+    assert_eq!(first_report["schema_decision"]["mode"], "inferred");
+    assert_eq!(
+        first_report["schema_decision"]["pinned_schema_persisted"],
+        true
+    );
+    assert_eq!(
+        first_report["schema_decision"]["fields"][0],
+        serde_json::json!({"name": "customer_id", "type": "utf8", "nullable": true})
+    );
+
+    // Repeat load: the pin now governs `customer_id`, and the override agrees
+    // with it.
+    fs::write(&source_path, "customer_id,name\n3,Katherine\n")
+        .expect("write replacement source csv");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-second"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, second_report) = read_single_report(
+        &work.path().join("artifacts-second"),
+        "pinned load writes one artifact directory",
+    );
+    assert_eq!(second_report["schema_decision"]["mode"], "pinned");
+    assert_eq!(second_report["schema_decision"]["drift_status"], "none");
+    assert_eq!(
+        second_report["schema_decision"]["overrides"],
+        serde_json::json!([{"name": "customer_id", "type": "utf8"}])
+    );
+
+    // The destination holds the overridden text column, not the inferred
+    // int64.
+    let batch = read_single_parquet_batch(&single_parquet_file(&destination_path));
+    assert_eq!(batch.num_rows(), 1);
+    let customer_ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("customer_id is utf8");
+    assert_eq!(customer_ids.value(0), "3");
+}
+
+#[test]
+fn jsonl_override_conflicting_with_the_pin_fails_for_duckdb() {
+    // A field an existing pin governs takes nothing from an override, but the
+    // override must agree with it: the bootstrapped pin declares
+    // `customer_id` nullable, so a later `nullable: false` override is an
+    // override conflict (ADR-0038) — the load fails before touching the
+    // destination, and the report carries the conflict detail.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    fs::write(&source_path, "{\"customer_id\": 1, \"name\": \"Ada\"}\n")
+        .expect("write source jsonl");
+
+    let database_path = work.path().join("customers.duckdb");
+    let pinned_path = work.path().join("customers.schema.yml");
+    let definition_path = work.path().join("load.yml");
+    let definition = |overrides_block: &str| {
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: duckdb
+  path: {}
+dataset: customers
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+{overrides_block}"#,
+            source_path.display(),
+            database_path.display(),
+            pinned_path.display()
+        )
+    };
+    fs::write(&definition_path, definition("")).expect("write load definition");
+
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-first"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    // The definition now overrides a pinned field's nullability without
+    // editing the pin.
+    fs::write(
+        &definition_path,
+        definition("  overrides:\n  - name: customer_id\n    nullable: false\n"),
+    )
+    .expect("write conflicting load definition");
+    let assert = Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-second"))
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let (_, report) = read_single_report(
+        &work.path().join("artifacts-second"),
+        "conflict-failed load writes one artifact directory",
+    );
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["error_summary"]["code"], "schema_override_conflict");
+    assert_eq!(
+        report["error_summary"]["message"],
+        format!(
+            "schema override for field \"customer_id\" contradicts pinned schema {}: \
+             pinned nullable true, override nullable false",
+            pinned_path.display()
+        )
+    );
+    assert_eq!(report["schema_decision"]["mode"], "pinned");
+    assert_eq!(
+        report["schema_decision"]["drift_status"], "not_applicable",
+        "the load failed before any drift comparison"
+    );
+    assert_eq!(
+        report["schema_decision"]["conflict"],
+        serde_json::json!({
+            "field": "customer_id",
+            "pinned": {"type": "int64", "nullable": true},
+            "override": {"nullable": false}
+        })
+    );
+    assert_eq!(
+        report["schema_decision"]["overrides"],
+        serde_json::json!([{"name": "customer_id", "nullable": false}])
+    );
+    assert!(stdout.contains("contradicts pinned schema"));
+
+    // Write boundary (ADR-0019): the destination still holds the first
+    // load's record.
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 1);
+}
+
+#[test]
+fn unknown_override_fields_fail_before_missing_field_drift() {
+    // The override names a pinned field the source no longer carries: both an
+    // unknown override name and missing-field drift are present, and the load
+    // fails as unknown_override_field — the override check runs as soon as
+    // the observed names are known, before any pin comparison (ADR-0038).
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "customer_id\n1\n").expect("write source csv");
+
+    let pinned_path = work.path().join("customers.schema.yml");
+    fs::write(
+        &pinned_path,
+        "version: 1\n\
+         fields:\n\
+         - name: customer_id\n\
+         \x20 type: int64\n\
+         - name: name\n\
+         \x20 type: utf8\n",
+    )
+    .expect("write pinned schema");
+
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+  overrides:
+  - name: name
+    nullable: false
+"#,
+            source_path.display(),
+            destination_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    assert!(
+        !destination_path.exists(),
+        "an unknown override field must fail before destination writing"
+    );
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "override-failed load writes one artifact directory",
+    );
+    assert_eq!(report["error_summary"]["code"], "unknown_override_field");
+    assert_eq!(
+        report["error_summary"]["message"],
+        "schema overrides name fields absent from the observed source shape: name"
+    );
+    assert_eq!(report["schema_decision"]["mode"], "pinned");
+    assert_eq!(report["schema_decision"]["drift_status"], "not_applicable");
+    assert_eq!(
+        report["schema_decision"]["overrides"],
+        serde_json::json!([{"name": "name", "nullable": false}])
+    );
+}
+
+#[test]
+fn invalid_override_configs_fail_before_source_or_destination_work() {
+    // The override failure taxonomy (ADR-0038), one format each: every case
+    // is definition validation, so the missing source file and the
+    // never-created destination prove the failure boundary (ADR-0019).
+    let work = TempDir::new().expect("tempdir");
+    let destination_path = work.path().join("should-not-exist");
+    let cases = [
+        (
+            "unsupported-type",
+            "csv",
+            "  - name: customer_id\n    type: date\n",
+            "unsupported_override_type",
+            "unsupported schema override type for field \"customer_id\": date",
+        ),
+        (
+            "duplicate-names",
+            "jsonl",
+            "  - name: customer_id\n    type: int64\n  - name: customer_id\n    nullable: false\n",
+            "invalid_schema_config",
+            "schema override for field \"customer_id\" is declared more than once",
+        ),
+        (
+            "no-op-entry",
+            "csv",
+            "  - name: customer_id\n",
+            "invalid_schema_config",
+            "schema override for field \"customer_id\" must set at least one of type or nullable",
+        ),
+        (
+            "unknown-entry-key",
+            "jsonl",
+            "  - name: customer_id\n    coerce: true\n",
+            "invalid_load_definition_yaml",
+            "unknown field `coerce`",
+        ),
+    ];
+
+    for (label, format, overrides_block, expected_code, expected_message_part) in cases {
+        let definition_path = work.path().join(format!("load-{label}.yml"));
+        fs::write(
+            &definition_path,
+            format!(
+                "version: 1\n\
+                 source:\n\
+                 \x20 connector: local_file\n\
+                 \x20 path: missing-source.{format}\n\
+                 \x20 format: {format}\n\
+                 destination:\n\
+                 \x20 connector: parquet\n\
+                 \x20 path: {}\n\
+                 schema:\n\
+                 \x20 overrides:\n{overrides_block}",
+                destination_path.display()
+            ),
+        )
+        .expect("write load definition");
+        let artifacts_dir = work.path().join(format!("artifacts-{label}"));
+
+        Command::cargo_bin("data-spark")
+            .expect("binary")
+            .current_dir(work.path())
+            .arg("load")
+            .arg("--output-dir")
+            .arg(&artifacts_dir)
+            .arg(&definition_path)
+            .assert()
+            .failure();
+
+        assert!(
+            !destination_path.exists(),
+            "case {label} must fail before destination writing"
+        );
+        let (_, report) = read_single_report(
+            &artifacts_dir,
+            "failed override config still has one artifact directory",
+        );
+        assert_eq!(
+            report["error_summary"]["code"], expected_code,
+            "code for case {label}"
+        );
+        let message = report["error_summary"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            message.contains(expected_message_part),
+            "case {label} message {message:?} misses {expected_message_part:?}"
+        );
+    }
+}
+
+#[test]
+fn additive_override_shapes_the_added_field_and_the_rewritten_pin_for_parquet() {
+    // Under the additive policy an override naming the added field is
+    // explicit intent (ADR-0038): it beats the policy's nullable default, the
+    // required field rejects the record that omits it, and the rewritten pin
+    // records the overridden properties.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    fs::write(
+        &source_path,
+        "{\"customer_id\": 1, \"vip\": \"gold\"}\n{\"customer_id\": 2}\n",
+    )
+    .expect("write source jsonl");
+
+    let pinned_path = work.path().join("customers.schema.yml");
+    fs::write(
+        &pinned_path,
+        "version: 1\n\
+         fields:\n\
+         - name: customer_id\n\
+         \x20 type: int64\n\
+         \x20 nullable: true\n",
+    )
+    .expect("write pinned schema");
+
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: parquet
+  path: {}
+dataset: customers
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+  drift_policy: allow_additive_nullable
+  overrides:
+  - name: vip
+    type: utf8
+    nullable: false
+reject_threshold: 1
+"#,
+            source_path.display(),
+            destination_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "additive override load writes one artifact directory",
+    );
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["row_counts"]["written"], 1);
+    assert_eq!(report["row_counts"]["rejected"], 1);
+    assert_eq!(
+        report["schema_decision"]["drift_status"],
+        "additive_fields_added"
+    );
+    assert_eq!(
+        report["schema_decision"]["added_fields"],
+        serde_json::json!([{"name": "vip", "type": "utf8", "nullable": false}])
+    );
+    assert_eq!(
+        report["schema_decision"]["overrides"],
+        serde_json::json!([{"name": "vip", "type": "utf8", "nullable": false}])
+    );
+
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let rejected_lines = read_rejected_records(&artifact_path);
+    assert_eq!(rejected_lines.len(), 1);
+    assert_eq!(rejected_lines[0]["line"], 2);
+    assert_eq!(rejected_lines[0]["code"], "missing_required_field");
+    assert_eq!(rejected_lines[0]["field"], "vip");
+
+    // The rewritten pin records the overridden properties, so later loads
+    // hold the field to them.
+    assert_eq!(
+        fs::read_to_string(&pinned_path).expect("pinned schema file"),
+        "version: 1\n\
+         fields:\n\
+         - name: customer_id\n\
+         \x20 type: int64\n\
+         \x20 nullable: true\n\
+         - name: vip\n\
+         \x20 type: utf8\n\
+         \x20 nullable: false\n"
+    );
+
+    // The destination materializes the overridden field: required utf8.
+    let batch = read_single_parquet_batch(&single_parquet_file(&destination_path));
+    assert_eq!(batch.num_rows(), 1);
+    assert!(!batch.schema().field(1).is_nullable());
+    let vips = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("vip is utf8");
+    assert_eq!(vips.value(0), "gold");
 }
 
 #[test]

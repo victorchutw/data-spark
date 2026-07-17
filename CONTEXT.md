@@ -188,6 +188,10 @@ _Avoid_: Auto schema, detected schema
 User-provided changes to an inferred schema before records are loaded.
 _Avoid_: Manual schema, schema mapping
 
+**Override Conflict**:
+A contradiction between a schema override and the pinned schema field it names.
+_Avoid_: Schema mismatch, pin mismatch
+
 **Pinned Schema**:
 A dataset schema that is reused across loads to keep a BI-ready dataset stable.
 _Avoid_: Fixed schema, locked schema
