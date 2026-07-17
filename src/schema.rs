@@ -221,6 +221,20 @@ impl SchemaOverrides {
             .find(|override_| override_.name == name)
     }
 
+    /// The override-named fields absent from the observed source shape, in
+    /// declaration order.
+    fn unknown_names(&self, observed_names: &[String]) -> Vec<&str> {
+        let observed = observed_names
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        self.overrides
+            .iter()
+            .map(|override_| override_.name.as_str())
+            .filter(|name| !observed.contains(name))
+            .collect()
+    }
+
     /// Renders the overrides as the `schema_decision.overrides` echo: the
     /// directive as written, with unspecified properties omitted.
     fn echo(&self) -> Value {
@@ -529,16 +543,7 @@ fn check_override_names(
     observed_names: &[String],
 ) -> Result<(), ExecutionFailure> {
     let overrides = directive.overrides();
-    let observed = observed_names
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    let unknown = overrides
-        .overrides
-        .iter()
-        .map(|override_| override_.name.as_str())
-        .filter(|name| !observed.contains(name))
-        .collect::<Vec<_>>();
+    let unknown = overrides.unknown_names(observed_names);
     if unknown.is_empty() {
         return Ok(());
     }
@@ -564,20 +569,16 @@ fn check_override_names(
             "pinned_schema_path": pinned_path,
         }),
     };
-    Err(ExecutionFailure {
-        failure: LoadFailure {
+    Err(pre_materialization_failure(
+        LoadFailure {
             code: "unknown_override_field",
             message: format!(
                 "schema overrides name fields absent from the observed source shape: {}",
                 unknown.join(", ")
             ),
         },
-        schema_decision: Some(Box::new(overrides.stamp(decision))),
-        source_rows: None,
-        written_records: 0,
-        rejected: Vec::new(),
-        destination_write: Box::new(DestinationWriteFacts::not_applicable()),
-    })
+        overrides.stamp(decision),
+    ))
 }
 
 /// Fails the load with `schema_override_conflict` when an override
@@ -633,8 +634,8 @@ fn check_override_conflicts(
             },
             "pinned_schema_path": pinned_path,
         });
-        return Err(ExecutionFailure {
-            failure: LoadFailure {
+        return Err(pre_materialization_failure(
+            LoadFailure {
                 code: "schema_override_conflict",
                 message: format!(
                     "schema override for field {:?} contradicts pinned schema {pinned_path}: {}",
@@ -642,14 +643,24 @@ fn check_override_conflicts(
                     segments.join("; ")
                 ),
             },
-            schema_decision: Some(Box::new(overrides.stamp(decision))),
-            source_rows: None,
-            written_records: 0,
-            rejected: Vec::new(),
-            destination_write: Box::new(DestinationWriteFacts::not_applicable()),
-        });
+            overrides.stamp(decision),
+        ));
     }
     Ok(())
+}
+
+/// An execution failure raised before any record was validated or written:
+/// only the schema decision travels with it — no source count, no
+/// rejections, no destination write.
+fn pre_materialization_failure(failure: LoadFailure, decision: Value) -> ExecutionFailure {
+    ExecutionFailure {
+        failure,
+        schema_decision: Some(Box::new(decision)),
+        source_rows: None,
+        written_records: 0,
+        rejected: Vec::new(),
+        destination_write: Box::new(DestinationWriteFacts::not_applicable()),
+    }
 }
 
 /// One field the load will materialize: its output name, the type its column is
@@ -1131,17 +1142,13 @@ fn drift_failure(
         "drift": drift,
         "pinned_schema_path": pinned_path,
     }));
-    ExecutionFailure {
-        failure: LoadFailure {
+    pre_materialization_failure(
+        LoadFailure {
             code: "schema_drift",
             message: format!("schema drift against pinned schema {pinned_path}: {detail}"),
         },
-        schema_decision: Some(Box::new(decision)),
-        source_rows: None,
-        written_records: 0,
-        rejected: Vec::new(),
-        destination_write: Box::new(DestinationWriteFacts::not_applicable()),
-    }
+        decision,
+    )
 }
 
 /// Renders a pinned schema's fields as the `fields` array of a schema decision.
