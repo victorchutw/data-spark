@@ -336,8 +336,9 @@ impl<'de> Deserialize<'de> for RenameMap {
             {
                 let mut entries: Vec<(String, String)> =
                     Vec::with_capacity(access.size_hint().unwrap_or(0));
+                let mut seen_sources = HashSet::new();
                 while let Some((source, target)) = access.next_entry::<String, String>()? {
-                    if entries.iter().any(|(seen, _)| *seen == source) {
+                    if !seen_sources.insert(source.clone()) {
                         return Err(serde::de::Error::custom(format!(
                             "duplicate transform.rename key {source:?}"
                         )));
@@ -877,12 +878,18 @@ fn resolve_transform(
 
     // A dataset name produced by more than one column is a collision only
     // when a rename put it there; identity renames are config-invalid, so a
-    // renamed column is exactly one whose names differ.
+    // renamed column is exactly one whose names differ. Columns are grouped
+    // once by dataset name, then reported at the first colliding column in
+    // dataset order, with its sources in dataset order too.
+    let mut columns_by_dataset_name: HashMap<&str, Vec<&DatasetColumn>> = HashMap::new();
     for column in &columns {
-        let colliding = columns
-            .iter()
-            .filter(|other| other.dataset_name == column.dataset_name)
-            .collect::<Vec<_>>();
+        columns_by_dataset_name
+            .entry(column.dataset_name.as_str())
+            .or_default()
+            .push(column);
+    }
+    for column in &columns {
+        let colliding = &columns_by_dataset_name[column.dataset_name.as_str()];
         if colliding.len() > 1
             && colliding
                 .iter()
