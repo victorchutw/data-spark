@@ -749,7 +749,7 @@ enum InferredType {
 /// A dataset field type: the vocabulary schema overrides, pinned schema
 /// files, and schema decisions name, and the type a materialized column is
 /// built as. The four inference-reachable types mirror the observation
-/// lattice one-to-one; the declared-only logical types (ADR-0042) — the two
+/// lattice one-to-one; the declared-only types (ADR-0042) — the two
 /// timestamps split by offset discipline (ADR-0043) and the parameterized
 /// decimal (ADR-0044) — enter a schema only through explicit declaration,
 /// never inference, so they extend this vocabulary while [`InferredType`]
@@ -1978,19 +1978,26 @@ fn clock_misfit_cause(value: &str) -> String {
     if parse_timestamp_micros(&format!("{value} 00:00:00")).is_some() {
         return "date-only text has no time part".to_string();
     }
+    if fraction_exceeds_six_digits(value) {
+        return "the fraction has more than 6 digits, which never truncate".to_string();
+    }
+    "the text does not match YYYY-MM-DD HH:MM:SS with an optional fraction of 1 to 6 digits"
+        .to_string()
+}
+
+/// Whether otherwise-valid clock text fails only by an over-length fraction:
+/// the fixed-width menu puts the fraction point at byte 19 (after
+/// `YYYY-MM-DD HH:MM:SS`), so the probe re-reads the prefix at that offset
+/// and counts the digits the strict parser refused to truncate.
+fn fraction_exceeds_six_digits(value: &str) -> bool {
     let bytes = value.as_bytes();
-    if bytes.get(19) == Some(&b'.')
+    bytes.get(19) == Some(&b'.')
         && bytes[20..]
             .iter()
             .take_while(|byte| byte.is_ascii_digit())
             .count()
             > 6
         && parse_timestamp_micros(&value[..19]).is_some()
-    {
-        return "the fraction has more than 6 digits, which never truncate".to_string();
-    }
-    "the text does not match YYYY-MM-DD HH:MM:SS with an optional fraction of 1 to 6 digits"
-        .to_string()
 }
 
 /// The decimal-text causes, probed from the rejection menu of ADR-0044:
@@ -2518,10 +2525,11 @@ fn build_text_array(
             let mut values: Vec<Option<i64>> = Vec::with_capacity(records.len());
             for record in records {
                 values.push(match &record.cells[column_index] {
-                    Some(value) => Some(
-                        parse_declared_timestamp(value, field_type)
-                            .ok_or_else(|| coercion_failure(column_index, value, "timestamp"))?,
-                    ),
+                    Some(value) => {
+                        Some(parse_declared_timestamp(value, field_type).ok_or_else(|| {
+                            coercion_failure(column_index, value, &field_type.name())
+                        })?)
+                    }
                     None => None,
                 });
             }
@@ -2531,10 +2539,9 @@ fn build_text_array(
             let mut values: Vec<Option<i128>> = Vec::with_capacity(records.len());
             for record in records {
                 values.push(match &record.cells[column_index] {
-                    Some(value) => Some(
-                        parse_decimal_scaled(value, precision, scale)
-                            .ok_or_else(|| coercion_failure(column_index, value, "decimal"))?,
-                    ),
+                    Some(value) => Some(parse_decimal_scaled(value, precision, scale).ok_or_else(
+                        || coercion_failure(column_index, value, &field_type.name()),
+                    )?),
                     None => None,
                 });
             }
@@ -2682,15 +2689,16 @@ fn build_json_array(
             for record in records {
                 values.push(match source.json_value(&record.object) {
                     None | Some(Value::Null) => None,
-                    Some(Value::String(text)) => Some(
-                        parse_declared_timestamp(text, field_type)
-                            .ok_or_else(|| coercion_failure(column_index, text, "timestamp"))?,
-                    ),
+                    Some(Value::String(text)) => {
+                        Some(parse_declared_timestamp(text, field_type).ok_or_else(|| {
+                            coercion_failure(column_index, text, &field_type.name())
+                        })?)
+                    }
                     Some(other) => {
                         return Err(coercion_failure(
                             column_index,
                             &other.to_string(),
-                            "timestamp",
+                            &field_type.name(),
                         ))
                     }
                 });
@@ -2702,22 +2710,27 @@ fn build_json_array(
             for record in records {
                 values.push(match source.json_value(&record.object) {
                     None | Some(Value::Null) => None,
-                    Some(Value::String(text)) => Some(
-                        parse_decimal_scaled(text, precision, scale)
-                            .ok_or_else(|| coercion_failure(column_index, text, "decimal"))?,
-                    ),
+                    Some(Value::String(text)) => {
+                        Some(parse_decimal_scaled(text, precision, scale).ok_or_else(|| {
+                            coercion_failure(column_index, text, &field_type.name())
+                        })?)
+                    }
                     Some(Value::Number(number)) => Some(
                         json_integer(number)
                             .and_then(|integer| rescale_decimal_integer(integer, precision, scale))
                             .ok_or_else(|| {
-                                coercion_failure(column_index, &number.to_string(), "decimal")
+                                coercion_failure(
+                                    column_index,
+                                    &number.to_string(),
+                                    &field_type.name(),
+                                )
                             })?,
                     ),
                     Some(other) => {
                         return Err(coercion_failure(
                             column_index,
                             &other.to_string(),
-                            "decimal",
+                            &field_type.name(),
                         ))
                     }
                 });
@@ -4008,7 +4021,7 @@ mod tests {
     }
 
     #[test]
-    fn pinned_schema_accepts_declared_logical_types_and_round_trips_them() {
+    fn pinned_schema_accepts_declared_types_and_round_trips_them() {
         // ADR-0042: the declared-only types are pin vocabulary like any other
         // field type, and the persisted YAML prints them exactly as declared.
         let yaml = "version: 1\n\

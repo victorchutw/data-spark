@@ -6350,7 +6350,7 @@ fn jsonl_declared_type_misfits_reject_json_shapes_naming_the_cause() {
     )
     .expect("write source jsonl");
 
-    let destination_path = work.path().join("orders_dataset");
+    let database_path = work.path().join("orders.duckdb");
     let definition_path = work.path().join("load.yml");
     fs::write(
         &definition_path,
@@ -6362,7 +6362,7 @@ source:
   path: {}
   format: jsonl
 destination:
-  connector: parquet
+  connector: duckdb
   path: {}
 dataset: orders
 load_mode: full_refresh
@@ -6375,7 +6375,7 @@ schema:
     type: decimal(10,2)
 "#,
             source_path.display(),
-            destination_path.display()
+            database_path.display()
         ),
     )
     .expect("write load definition");
@@ -6433,6 +6433,33 @@ schema:
             "message {message:?} misses the cause {cause_part:?}"
         );
     }
+
+    // The JSONL leg of the destination matrix: the surviving record lands in
+    // DuckDB under the declared column types.
+    assert_eq!(
+        duckdb_column_types(&database_path, "orders"),
+        vec![
+            (
+                "settled_at".to_string(),
+                "TIMESTAMP WITH TIME ZONE".to_string()
+            ),
+            ("amount".to_string(), "DECIMAL(10,2)".to_string()),
+        ]
+    );
+    let batch = read_single_duckdb_batch(&database_path, "orders");
+    assert_eq!(batch.num_rows(), 1);
+    let settled = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .expect("settled_at reads back as microsecond timestamps");
+    assert_eq!(settled.value(0), DECLARED_INSTANT_MICROS);
+    let amounts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("amount reads back as decimal128");
+    assert_eq!(amounts.value(0), 120);
 }
 
 #[test]
@@ -6512,6 +6539,22 @@ schema:
     assert_eq!(
         first_report["schema_decision"]["pinned_schema_persisted"],
         true
+    );
+    // The CSV leg of the destination matrix: the bootstrap load's Parquet
+    // dataset materializes the declared column types.
+    let first_batch = read_single_parquet_batch(&single_parquet_file(&destination_path));
+    assert_eq!(
+        first_batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Decimal128(10, 2),
+            DataType::Utf8,
+        ]
     );
 
     // The same source under the same pin, but the definition no longer
