@@ -1948,18 +1948,34 @@ fn json_integer(number: &serde_json::Number) -> Option<i128> {
 
 /// Names the concrete cause a CSV cell missed a declared type, appended to
 /// its `type_coercion_failed` message (ADR-0043, ADR-0044). Lattice-typed
-/// misfits keep their established wording and carry no cause.
+/// misfits keep their established wording and carry no cause. Both timestamp
+/// arms probe the clock prefix first, so offset-discipline causes name the
+/// offset even when it is malformed rather than falling to the generic menu
+/// wording.
 fn text_misfit_cause(value: &str, expected: FieldType) -> Option<String> {
     match expected {
-        FieldType::Timestamp => Some(if parse_timestamptz_micros(value).is_some() {
-            "the text carries a UTC offset, which wall-clock timestamp text must not".to_string()
-        } else {
-            clock_misfit_cause(value)
+        FieldType::Timestamp => Some(match parse_datetime_prefix(value) {
+            Some((_, offset_text)) if !offset_text.is_empty() => {
+                if parse_offset_seconds(offset_text).is_some() {
+                    "the text carries a UTC offset, which wall-clock timestamp text must not"
+                        .to_string()
+                } else {
+                    "the text continues after the clock reading, which wall-clock timestamp \
+                     text must not"
+                        .to_string()
+                }
+            }
+            _ => clock_misfit_cause(value),
         }),
-        FieldType::Timestamptz => Some(if parse_timestamp_micros(value).is_some() {
-            "the text is missing its mandatory UTC offset (Z or ±hh:mm)".to_string()
-        } else {
-            clock_misfit_cause(value)
+        FieldType::Timestamptz => Some(match parse_datetime_prefix(value) {
+            Some((_, "")) => {
+                "the text is missing its mandatory UTC offset (Z or ±hh:mm)".to_string()
+            }
+            Some((_, offset_text)) if parse_offset_seconds(offset_text).is_none() => {
+                "the UTC offset is malformed; an instant timestamp needs Z, z, or ±hh:mm"
+                    .to_string()
+            }
+            _ => clock_misfit_cause(value),
         }),
         FieldType::Decimal { precision, scale } => {
             Some(decimal_misfit_cause(value, precision, scale))
@@ -1979,7 +1995,7 @@ fn clock_misfit_cause(value: &str) -> String {
         return "date-only text has no time part".to_string();
     }
     if fraction_exceeds_six_digits(value) {
-        return "the fraction has more than 6 digits, which never truncate".to_string();
+        return "the fraction has more than 6 digits and is never truncated".to_string();
     }
     "the text does not match YYYY-MM-DD HH:MM:SS with an optional fraction of 1 to 6 digits"
         .to_string()
@@ -3643,6 +3659,11 @@ mod tests {
     fn from_text_columns_rejects_declared_type_misfits_naming_the_cause() {
         for (field_type, value, cause_part) in [
             ("timestamp", "2026-07-14T17:00:00Z", "carries a UTC offset"),
+            (
+                "timestamp",
+                "2026-07-14T17:00:00UTC",
+                "continues after the clock reading",
+            ),
             ("timestamp", "2026-07-14", "date-only"),
             ("timestamp", "1784048400", "epoch numbers"),
             ("timestamp", "2026-07-14 17:00:00.1234567", "more than 6"),
@@ -3650,6 +3671,16 @@ mod tests {
                 "timestamptz",
                 "2026-07-14T17:00:00",
                 "missing its mandatory UTC offset",
+            ),
+            (
+                "timestamptz",
+                "2026-07-14T17:00:00+8:00",
+                "UTC offset is malformed",
+            ),
+            (
+                "timestamptz",
+                "2026-07-14T17:00:00ZZ",
+                "UTC offset is malformed",
             ),
             ("decimal(10,2)", "1.234", "more than scale 2"),
             ("decimal(10,2)", "100000000.00", "overflows decimal(10,2)"),
