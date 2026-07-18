@@ -331,7 +331,12 @@ impl<'de> Deserialize<'de> for RenameMap {
     where
         D: serde::Deserializer<'de>,
     {
-        deserialize_ordered_unique_map(deserializer, "transform.rename").map(RenameMap)
+        deserialize_ordered_unique_map(
+            deserializer,
+            "transform.rename",
+            "a map of source field name to dataset field name",
+        )
+        .map(RenameMap)
     }
 }
 
@@ -347,7 +352,12 @@ impl<'de> Deserialize<'de> for FlattenMap {
     where
         D: serde::Deserializer<'de>,
     {
-        deserialize_ordered_unique_map(deserializer, "transform.flatten").map(FlattenMap)
+        deserialize_ordered_unique_map(
+            deserializer,
+            "transform.flatten",
+            "a map of source path to dataset field name",
+        )
+        .map(FlattenMap)
     }
 }
 
@@ -356,30 +366,32 @@ impl Serialize for FlattenMap {
     where
         S: serde::Serializer,
     {
-        serializer.collect_map(self.0.iter().map(|(path, output)| (path, output)))
+        serialize_ordered_map(&self.0, serializer)
     }
 }
 
 /// Deserializes a YAML map into its entries in declaration order, failing on
 /// a duplicate key — serde's default map handling would silently keep the
 /// last entry. `map_label` names the load-definition key in the error, e.g.
-/// `transform.rename`.
+/// `transform.rename`; `expecting` describes the map in the caller's terms.
 fn deserialize_ordered_unique_map<'de, D>(
     deserializer: D,
     map_label: &'static str,
+    expecting: &'static str,
 ) -> Result<Vec<(String, String)>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     struct OrderedUniqueMapVisitor {
         map_label: &'static str,
+        expecting: &'static str,
     }
 
     impl<'de> serde::de::Visitor<'de> for OrderedUniqueMapVisitor {
         type Value = Vec<(String, String)>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a map of source name to dataset field name")
+            formatter.write_str(self.expecting)
         }
 
         fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
@@ -402,7 +414,10 @@ where
         }
     }
 
-    deserializer.deserialize_map(OrderedUniqueMapVisitor { map_label })
+    deserializer.deserialize_map(OrderedUniqueMapVisitor {
+        map_label,
+        expecting,
+    })
 }
 
 impl Serialize for RenameMap {
@@ -410,8 +425,17 @@ impl Serialize for RenameMap {
     where
         S: serde::Serializer,
     {
-        serializer.collect_map(self.0.iter().map(|(source, target)| (source, target)))
+        serialize_ordered_map(&self.0, serializer)
     }
+}
+
+/// Serializes declaration-ordered map entries back as a map, so a definition
+/// echo renders the mapping exactly as written.
+fn serialize_ordered_map<S>(entries: &[(String, String)], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.collect_map(entries.iter().map(|(key, value)| (key, value)))
 }
 
 /// The validated structural transform of a load definition (ADR-0039,
@@ -1023,6 +1047,12 @@ impl SourceAddress {
             SourceAddress::Field(name) => name.clone(),
             SourceAddress::Path(segments) => segments.join("."),
         }
+    }
+
+    /// Whether this address walks a flatten path rather than reading a
+    /// top-level field.
+    fn is_path(&self) -> bool {
+        matches!(self, SourceAddress::Path(_))
     }
 
     /// Reads the addressed value from a JSONL record: a top-level lookup, or
@@ -2044,7 +2074,7 @@ fn observe_json_types(
 ) -> Vec<InferredType> {
     let flatten_count = columns
         .iter()
-        .filter(|column| matches!(column.source, SourceAddress::Path(_)))
+        .filter(|column| column.source.is_path())
         .count();
     let mut observed_types = vec![InferredType::Null; field_names.len() + flatten_count];
     for record in records {
@@ -2056,7 +2086,7 @@ fn observe_json_types(
         }
     }
     for column in columns {
-        if matches!(column.source, SourceAddress::Path(_)) {
+        if column.source.is_path() {
             for record in records {
                 if let Some(value) = column.source.json_value(&record.object) {
                     observed_types[column.observed_index] =
