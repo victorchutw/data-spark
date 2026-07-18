@@ -52,6 +52,10 @@ _Avoid_: Schema, table definition
 A transformation that changes record shape or representation so a load can produce a BI-ready dataset.
 _Avoid_: Data cleaning, mapping, light transform
 
+**Flatten Mapping**:
+A structural transform that extracts the values at declared source paths into added dataset fields, leaving existing fields unchanged.
+_Avoid_: JSON flattening, unnest, explode
+
 **Field Selection**:
 A structural transform that keeps only named source fields of each record, in the declared order.
 _Avoid_: Projection, column pruning, field filter
@@ -59,6 +63,10 @@ _Avoid_: Projection, column pruning, field filter
 **Rename Mapping**:
 A structural transform that maps source field names to dataset field names after field selection, leaving unmapped fields under their source names.
 _Avoid_: Alias, column mapping, field mapping
+
+**Source Path**:
+The dot-notation address of a nested value inside a source field's structure.
+_Avoid_: JSON path, pointer, selector
 
 **Analytical Transform**:
 A transformation that derives analytical meaning through joins, aggregations, calculations, or business logic.

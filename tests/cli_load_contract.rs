@@ -3998,7 +3998,7 @@ transform:
     assert_eq!(report["error_summary"]["code"], "unknown_transform_field");
     assert_eq!(
         report["error_summary"]["message"],
-        "transform selects or renames fields absent from the observed source shape: vip"
+        "transform selects, renames, or flattens fields absent from the observed source shape: vip"
     );
     assert_eq!(
         report["schema_decision"],
@@ -4277,6 +4277,1015 @@ reject_threshold: 1
         .expect("customer_id is int64");
     assert_eq!(customer_ids.value(0), 1);
     assert_eq!(customer_ids.value(1), 2);
+}
+
+#[test]
+fn jsonl_flatten_combines_with_select_and_rename_for_duckdb() {
+    // The flatten happy path (ADR-0041): flatten evaluates first, its
+    // outputs are ordinary fields to select (placing them anywhere) and
+    // rename, and the destination carries the dataset names in select order
+    // with correctly typed extracted values. The report echoes the flatten
+    // mapping as written.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.jsonl");
+    fs::write(
+        &source_path,
+        "{\"id\": 1, \"customer\": {\"name\": \"Ada\", \"age\": 36}}\n\
+         {\"id\": 2, \"customer\": {\"name\": \"Bo\", \"age\": 52}}\n",
+    )
+    .expect("write source jsonl");
+
+    let database_path = work.path().join("orders.duckdb");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: duckdb
+  path: {}
+dataset: orders
+load_mode: full_refresh
+transform:
+  flatten:
+    customer.name: customer_name
+    customer.age: customer_age
+  select: [id, customer_name, customer_age]
+  rename:
+    customer_name: contact
+"#,
+            source_path.display(),
+            database_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) =
+        read_single_report(&artifacts_dir, "flatten load writes one artifact directory");
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["row_counts"]["source"], 2);
+    assert_eq!(report["row_counts"]["written"], 2);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert_eq!(
+        report["schema_decision"],
+        serde_json::json!({
+            "mode": "inferred",
+            "fields": [
+                {"name": "id", "type": "int64", "nullable": true},
+                {"name": "contact", "type": "utf8", "nullable": true},
+                {"name": "customer_age", "type": "int64", "nullable": true}
+            ],
+            "drift_status": "not_applicable",
+            "transform": {
+                "flatten": {
+                    "customer.name": "customer_name",
+                    "customer.age": "customer_age"
+                },
+                "select": ["id", "customer_name", "customer_age"],
+                "rename": {"customer_name": "contact"}
+            }
+        })
+    );
+
+    let batch = read_single_duckdb_batch(&database_path, "orders");
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>(),
+        vec!["id", "contact", "customer_age"]
+    );
+    assert_eq!(batch.num_rows(), 2);
+    let contacts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("contact is utf8");
+    let ages = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_age is int64");
+    assert_eq!(contacts.value(0), "Ada");
+    assert_eq!(ages.value(0), 36);
+    assert_eq!(contacts.value(1), "Bo");
+    assert_eq!(ages.value(1), 52);
+}
+
+#[test]
+fn jsonl_flatten_combines_with_select_and_rename_for_parquet() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.jsonl");
+    fs::write(
+        &source_path,
+        "{\"id\": 1, \"customer\": {\"name\": \"Ada\", \"age\": 36}}\n\
+         {\"id\": 2, \"customer\": {\"name\": \"Bo\", \"age\": 52}}\n",
+    )
+    .expect("write source jsonl");
+
+    let destination_path = work.path().join("orders_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: parquet
+  path: {}
+dataset: orders
+load_mode: full_refresh
+transform:
+  flatten:
+    customer.name: customer_name
+  select: [customer_name, id]
+  rename:
+    customer_name: contact
+"#,
+            source_path.display(),
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) =
+        read_single_report(&artifacts_dir, "flatten load writes one artifact directory");
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(
+        report["schema_decision"]["transform"],
+        serde_json::json!({
+            "flatten": {"customer.name": "customer_name"},
+            "select": ["customer_name", "id"],
+            "rename": {"customer_name": "contact"}
+        })
+    );
+
+    // The Parquet schema carries the dataset names in select order — the
+    // flatten output placed first — and the extracted values.
+    let batch = read_single_parquet_batch(&single_parquet_file(&destination_path));
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>(),
+        vec!["contact", "id"]
+    );
+    let contacts = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("contact is utf8");
+    assert_eq!(contacts.value(0), "Ada");
+    assert_eq!(contacts.value(1), "Bo");
+}
+
+#[test]
+fn jsonl_flatten_yields_null_for_missing_null_and_scalar_steps() {
+    // The extraction table of ADR-0041 within one load: a missing leaf key,
+    // a null parent, and a scalar intermediate segment all yield null in the
+    // flatten column, while the parent column keeps its JSON text.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.jsonl");
+    fs::write(
+        &source_path,
+        "{\"id\": 1, \"customer\": {\"name\": \"Ada\"}}\n\
+         {\"id\": 2, \"customer\": {\"vip\": true}}\n\
+         {\"id\": 3, \"customer\": null}\n\
+         {\"id\": 4, \"customer\": \"opaque\"}\n",
+    )
+    .expect("write source jsonl");
+
+    let database_path = work.path().join("orders.duckdb");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: duckdb
+  path: {}
+dataset: orders
+load_mode: full_refresh
+transform:
+  flatten:
+    customer.name: customer_name
+"#,
+            source_path.display(),
+            database_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "flatten null-semantics load writes one artifact directory",
+    );
+    // Extraction is total: nothing rejects, every record lands.
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["row_counts"]["written"], 4);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+
+    let batch = read_single_duckdb_batch(&database_path, "orders");
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>(),
+        vec!["id", "customer", "customer_name"]
+    );
+    let parents = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("customer is utf8");
+    let names = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("customer_name is utf8");
+    assert_eq!(names.value(0), "Ada");
+    assert!(names.is_null(1), "missing leaf key extracts to null");
+    assert!(names.is_null(2), "null parent extracts to null");
+    assert!(names.is_null(3), "scalar intermediate extracts to null");
+    assert_eq!(parents.value(0), "{\"name\":\"Ada\"}");
+    assert_eq!(parents.value(1), "{\"vip\":true}");
+    assert!(parents.is_null(2), "null parent stays null");
+    assert_eq!(parents.value(3), "opaque");
+}
+
+#[test]
+fn jsonl_flatten_structured_leaf_stays_json_text_and_deeper_path_coexists() {
+    // An object leaf materializes its compact JSON text, and a deeper path
+    // on the same parent coexists as its own typed column (ADR-0041).
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.jsonl");
+    fs::write(
+        &source_path,
+        "{\"id\": 1, \"customer\": {\"address\": {\"city\": \"Taipei\", \"zip\": \"100\"}}}\n",
+    )
+    .expect("write source jsonl");
+
+    let destination_path = work.path().join("orders_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: parquet
+  path: {}
+dataset: orders
+load_mode: full_refresh
+transform:
+  flatten:
+    customer.address: address
+    customer.address.city: city
+"#,
+            source_path.display(),
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let batch = read_single_parquet_batch(&single_parquet_file(&destination_path));
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().to_string())
+            .collect::<Vec<_>>(),
+        vec!["id", "customer", "address", "city"]
+    );
+    let addresses = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("address is utf8");
+    let cities = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("city is utf8");
+    assert_eq!(addresses.value(0), "{\"city\":\"Taipei\",\"zip\":\"100\"}");
+    assert_eq!(cities.value(0), "Taipei");
+}
+
+#[test]
+fn invalid_flatten_configs_fail_before_source_or_destination_work() {
+    // The flatten config failure matrix (ADR-0041), one case each: every
+    // case is definition validation, so the schema decision stays
+    // not-evaluated, the missing source file is never read, and the
+    // destination is never created (ADR-0019).
+    let work = TempDir::new().expect("tempdir");
+    let destination_path = work.path().join("should-not-exist");
+    let cases = [
+        (
+            "single-segment-path",
+            "jsonl",
+            "transform:\n  flatten:\n    customer: contact\n",
+            "transform.flatten path \"customer\" must have at least two dot-separated segments",
+        ),
+        (
+            "duplicate-output-names",
+            "jsonl",
+            "transform:\n  flatten:\n    customer.name: contact\n    customer.email: contact\n",
+            "transform.flatten maps more than one path to \"contact\"",
+        ),
+        (
+            "collides-with-rename-target",
+            "jsonl",
+            "transform:\n  flatten:\n    customer.name: contact\n  rename:\n    id: contact\n",
+            "transform.flatten and transform.rename map more than one field \
+             to the dataset name \"contact\"",
+        ),
+        (
+            "absent-from-select",
+            "jsonl",
+            "transform:\n  flatten:\n    customer.name: contact\n  select: [id]\n",
+            "transform.flatten output \"contact\" is not in transform.select",
+        ),
+        (
+            "csv-source",
+            "csv",
+            "transform:\n  flatten:\n    customer.name: contact\n",
+            "transform.flatten requires a JSONL source format; \
+             the resolved source format is csv",
+        ),
+    ];
+
+    for (label, format, transform_block, expected_message) in cases {
+        let definition_path = work.path().join(format!("load-{label}.yml"));
+        fs::write(
+            &definition_path,
+            format!(
+                "version: 1\n\
+                 source:\n\
+                 \x20 connector: local_file\n\
+                 \x20 path: missing-source.{format}\n\
+                 \x20 format: {format}\n\
+                 destination:\n\
+                 \x20 connector: parquet\n\
+                 \x20 path: {}\n\
+                 {transform_block}",
+                destination_path.display()
+            ),
+        )
+        .expect("write load definition");
+        let artifacts_dir = work.path().join(format!("artifacts-{label}"));
+
+        Command::cargo_bin("data-spark")
+            .expect("binary")
+            .current_dir(work.path())
+            .arg("load")
+            .arg("--output-dir")
+            .arg(&artifacts_dir)
+            .arg(&definition_path)
+            .assert()
+            .failure();
+
+        assert!(
+            !destination_path.exists(),
+            "case {label} must fail before destination writing"
+        );
+        let (_, report) = read_single_report(
+            &artifacts_dir,
+            "failed flatten config still has one artifact directory",
+        );
+        assert_eq!(
+            report["error_summary"]["code"], "invalid_transform_config",
+            "code for case {label}"
+        );
+        assert_eq!(
+            report["error_summary"]["message"], expected_message,
+            "message for case {label}"
+        );
+        assert_eq!(
+            report["schema_decision"],
+            serde_json::json!({ "mode": "not_evaluated" }),
+            "schema decision for case {label}"
+        );
+    }
+}
+
+#[test]
+fn unknown_flatten_first_segments_fail_before_destination_writing() {
+    // A flatten path whose first segment names no batch-wide observed field
+    // is an unknown transform field, reported as the user wrote the full
+    // path; a deeper segment absent from records is a null value instead.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.jsonl");
+    fs::write(&source_path, "{\"id\": 1}\n").expect("write source jsonl");
+
+    let database_path = work.path().join("should-not-exist.duckdb");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: duckdb
+  path: {}
+dataset: orders
+load_mode: full_refresh
+transform:
+  flatten:
+    customer.name: contact
+"#,
+            source_path.display(),
+            database_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    assert!(
+        !database_path.exists(),
+        "an unknown flatten path must fail before destination writing"
+    );
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "flatten-failed load writes one artifact directory",
+    );
+    assert_eq!(report["error_summary"]["code"], "unknown_transform_field");
+    assert_eq!(
+        report["error_summary"]["message"],
+        "transform selects, renames, or flattens fields absent from the observed source shape: customer.name"
+    );
+    assert_eq!(
+        report["schema_decision"],
+        serde_json::json!({
+            "mode": "inferred",
+            "drift_status": "not_applicable",
+            "transform": {
+                "flatten": {"customer.name": "contact"}
+            }
+        })
+    );
+}
+
+#[test]
+fn flatten_outputs_shadowing_observed_fields_fail_before_destination_writing() {
+    // A flatten output may never shadow an observed source field — even one
+    // the select list would drop (ADR-0041).
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.jsonl");
+    fs::write(
+        &source_path,
+        "{\"id\": 1, \"customer\": {\"name\": \"Ada\"}}\n",
+    )
+    .expect("write source jsonl");
+
+    for (label, transform_block) in [
+        (
+            "shadows-observed",
+            "transform:\n  flatten:\n    customer.name: id\n",
+        ),
+        (
+            "shadows-select-dropped",
+            "transform:\n  flatten:\n    customer.name: id\n  select: [id]\n",
+        ),
+    ] {
+        let database_path = work.path().join(format!("no-{label}.duckdb"));
+        let definition_path = work.path().join(format!("load-{label}.yml"));
+        fs::write(
+            &definition_path,
+            format!(
+                "version: 1\n\
+                 source:\n\
+                 \x20 connector: local_file\n\
+                 \x20 path: {}\n\
+                 \x20 format: jsonl\n\
+                 destination:\n\
+                 \x20 connector: duckdb\n\
+                 \x20 path: {}\n\
+                 dataset: orders\n\
+                 load_mode: full_refresh\n\
+                 {transform_block}",
+                source_path.display(),
+                database_path.display()
+            ),
+        )
+        .expect("write load definition");
+        let artifacts_dir = work.path().join(format!("artifacts-{label}"));
+
+        Command::cargo_bin("data-spark")
+            .expect("binary")
+            .current_dir(work.path())
+            .arg("load")
+            .arg("--output-dir")
+            .arg(&artifacts_dir)
+            .arg(&definition_path)
+            .assert()
+            .failure();
+
+        assert!(
+            !database_path.exists(),
+            "case {label} must fail before destination writing"
+        );
+        let (_, report) = read_single_report(
+            &artifacts_dir,
+            "flatten-collision load writes one artifact directory",
+        );
+        assert_eq!(
+            report["error_summary"]["code"], "transform_name_collision",
+            "code for case {label}"
+        );
+        assert_eq!(
+            report["error_summary"]["message"],
+            "transform flatten collides on dataset field \"id\": \
+             source path customer.name shadows an observed source field",
+            "message for case {label}"
+        );
+        assert_eq!(
+            report["schema_decision"]["mode"], "inferred",
+            "posture for case {label}"
+        );
+        assert_eq!(
+            report["schema_decision"]["drift_status"], "not_applicable",
+            "drift for case {label}"
+        );
+    }
+}
+
+#[test]
+fn flatten_pin_bootstrap_records_outputs_then_a_removed_entry_drifts() {
+    // The bootstrap pin records flatten outputs like any dataset field — by
+    // output name, in dataset order (ADR-0033, ADR-0041) — so removing the
+    // flatten entry later leaves the pinned field missing: schema drift.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.jsonl");
+    fs::write(
+        &source_path,
+        "{\"id\": 1, \"customer\": {\"name\": \"Ada\"}}\n",
+    )
+    .expect("write source jsonl");
+    let destination_path = work.path().join("orders_dataset");
+    let pinned_path = work.path().join("orders.schema.yml");
+
+    let definition_path = work.path().join("load.yml");
+    let definition = |transform_block: &str| {
+        format!(
+            "version: 1\n\
+             source:\n\
+             \x20 connector: local_file\n\
+             \x20 path: {}\n\
+             \x20 format: jsonl\n\
+             destination:\n\
+             \x20 connector: parquet\n\
+             \x20 path: {}\n\
+             dataset: orders\n\
+             load_mode: full_refresh\n\
+             {transform_block}\
+             schema:\n\
+             \x20 pinned_path: {}\n",
+            source_path.display(),
+            destination_path.display(),
+            pinned_path.display()
+        )
+    };
+    fs::write(
+        &definition_path,
+        definition("transform:\n  flatten:\n    customer.name: customer_name\n"),
+    )
+    .expect("write load definition");
+
+    let bootstrap_artifacts = work.path().join("artifacts-bootstrap");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&bootstrap_artifacts)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    // The persisted pin records the flatten output in dataset order.
+    assert_eq!(
+        fs::read_to_string(&pinned_path).expect("pin persisted"),
+        "version: 1\n\
+         fields:\n\
+         - name: id\n\
+         \x20 type: int64\n\
+         \x20 nullable: true\n\
+         - name: customer\n\
+         \x20 type: utf8\n\
+         \x20 nullable: true\n\
+         - name: customer_name\n\
+         \x20 type: utf8\n\
+         \x20 nullable: true\n"
+    );
+    let (_, report) = read_single_report(
+        &bootstrap_artifacts,
+        "bootstrap load writes one artifact directory",
+    );
+    assert_eq!(report["schema_decision"]["pinned_schema_persisted"], true);
+
+    // Dropping the flatten entry leaves the pinned output missing.
+    fs::write(&definition_path, definition("")).expect("rewrite load definition");
+    let drift_artifacts = work.path().join("artifacts-drift");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&drift_artifacts)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    let (_, report) =
+        read_single_report(&drift_artifacts, "drift load writes one artifact directory");
+    assert_eq!(report["error_summary"]["code"], "schema_drift");
+    assert_eq!(report["schema_decision"]["drift_status"], "failed_on_drift");
+    assert_eq!(
+        report["schema_decision"]["drift"]["missing_fields"],
+        serde_json::json!(["customer_name"])
+    );
+}
+
+#[test]
+fn adding_a_flatten_entry_under_a_pin_follows_the_drift_policy() {
+    // A flatten entry added after the pin was recorded is ordinary additive
+    // drift: the default policy fails, allow_additive_nullable proceeds and
+    // extends the pin with the output (ADR-0034, ADR-0041).
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.jsonl");
+    fs::write(
+        &source_path,
+        "{\"id\": 1, \"customer\": {\"name\": \"Ada\"}}\n",
+    )
+    .expect("write source jsonl");
+    let destination_path = work.path().join("orders_dataset");
+    let pinned_path = work.path().join("orders.schema.yml");
+
+    let definition_path = work.path().join("load.yml");
+    let definition = |transform_block: &str, drift_policy: &str| {
+        format!(
+            "version: 1\n\
+             source:\n\
+             \x20 connector: local_file\n\
+             \x20 path: {}\n\
+             \x20 format: jsonl\n\
+             destination:\n\
+             \x20 connector: parquet\n\
+             \x20 path: {}\n\
+             dataset: orders\n\
+             load_mode: full_refresh\n\
+             {transform_block}\
+             schema:\n\
+             \x20 pinned_path: {}\n\
+             {drift_policy}",
+            source_path.display(),
+            destination_path.display(),
+            pinned_path.display()
+        )
+    };
+
+    // Bootstrap the pin without any flatten declaration.
+    fs::write(&definition_path, definition("", "")).expect("write load definition");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-bootstrap"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    // Declaring the flatten under the default fail policy is drift.
+    let flatten_block = "transform:\n  flatten:\n    customer.name: customer_name\n";
+    fs::write(&definition_path, definition(flatten_block, "")).expect("rewrite load definition");
+    let fail_artifacts = work.path().join("artifacts-fail");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&fail_artifacts)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+    let (_, report) = read_single_report(
+        &fail_artifacts,
+        "failed drift load writes one artifact directory",
+    );
+    assert_eq!(report["error_summary"]["code"], "schema_drift");
+    assert_eq!(
+        report["schema_decision"]["drift"]["added_fields"],
+        serde_json::json!(["customer_name"])
+    );
+
+    // The additive policy admits the output and extends the pin.
+    fs::write(
+        &definition_path,
+        definition(
+            flatten_block,
+            "\x20 drift_policy: allow_additive_nullable\n",
+        ),
+    )
+    .expect("rewrite load definition");
+    let additive_artifacts = work.path().join("artifacts-additive");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&additive_artifacts)
+        .arg(&definition_path)
+        .assert()
+        .success();
+    let (_, report) = read_single_report(
+        &additive_artifacts,
+        "additive drift load writes one artifact directory",
+    );
+    assert_eq!(
+        report["schema_decision"]["drift_status"],
+        "additive_fields_added"
+    );
+    assert_eq!(
+        report["schema_decision"]["added_fields"],
+        serde_json::json!([
+            {"name": "customer_name", "type": "utf8", "nullable": true}
+        ])
+    );
+    assert!(
+        fs::read_to_string(&pinned_path)
+            .expect("extended pin")
+            .contains("- name: customer_name\n"),
+        "the extended pin records the flatten output"
+    );
+}
+
+#[test]
+fn pinned_flatten_misfits_reject_records_with_the_declared_path() {
+    // Strictness composes through the pin (ADR-0035): a pinned flatten
+    // output whose extracted value misfits produces the existing per-record
+    // rejection, whose artifact line names the output and carries the
+    // declared source path as source_field.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.jsonl");
+    fs::write(&source_path, "{\"id\": 1, \"customer\": {\"code\": 7}}\n")
+        .expect("write source jsonl");
+    let destination_path = work.path().join("orders_dataset");
+    let pinned_path = work.path().join("orders.schema.yml");
+
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: parquet
+  path: {}
+dataset: orders
+load_mode: full_refresh
+transform:
+  flatten:
+    customer.code: customer_code
+schema:
+  pinned_path: {}
+"#,
+            source_path.display(),
+            destination_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    // Bootstrap pins customer_code as int64 from the observed batch.
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-bootstrap"))
+        .arg(&definition_path)
+        .assert()
+        .success();
+    assert!(
+        fs::read_to_string(&pinned_path)
+            .expect("pin persisted")
+            .contains("- name: customer_code\n\x20 type: int64\n"),
+        "the bootstrap pins the extracted int64"
+    );
+
+    // The next batch extracts a string: the record rejects per ADR-0035 and
+    // the default threshold fails the load before any destination change.
+    fs::write(
+        &source_path,
+        "{\"id\": 2, \"customer\": {\"code\": \"n/a\"}}\n",
+    )
+    .expect("rewrite source jsonl");
+    let misfit_artifacts = work.path().join("artifacts-misfit");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&misfit_artifacts)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    let (report_path, report) = read_single_report(
+        &misfit_artifacts,
+        "misfit load writes one artifact directory",
+    );
+    assert_eq!(report["error_summary"]["code"], "reject_threshold_exceeded");
+    assert_eq!(report["rejected_records"]["count"], 1);
+    let artifact_dir = report_path.parent().expect("artifact directory");
+    let rejected_lines = read_rejected_records(&artifact_dir.join("rejected-records.jsonl"));
+    assert_eq!(rejected_lines.len(), 1);
+    assert_eq!(rejected_lines[0]["code"], "type_coercion_failed");
+    assert_eq!(rejected_lines[0]["field"], "customer_code");
+    assert_eq!(rejected_lines[0]["source_field"], "customer.code");
+    assert_eq!(
+        rejected_lines[0]["record"],
+        serde_json::json!({"id": 2, "customer": {"code": "n/a"}})
+    );
+}
+
+#[test]
+fn overrides_shape_flatten_outputs_like_any_dataset_field() {
+    // schema.overrides names dataset fields (ADR-0038, ADR-0040): naming a
+    // flatten output overrides its inferred type, and naming a dropped or
+    // unknown field keeps failing as unknown_override_field.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.jsonl");
+    fs::write(&source_path, "{\"id\": 1, \"customer\": {\"code\": 7}}\n")
+        .expect("write source jsonl");
+    let destination_path = work.path().join("orders_dataset");
+
+    let definition_path = work.path().join("load.yml");
+    let definition = |overridden_field: &str| {
+        format!(
+            "version: 1\n\
+             source:\n\
+             \x20 connector: local_file\n\
+             \x20 path: {}\n\
+             \x20 format: jsonl\n\
+             destination:\n\
+             \x20 connector: parquet\n\
+             \x20 path: {}\n\
+             dataset: orders\n\
+             load_mode: full_refresh\n\
+             transform:\n\
+             \x20 flatten:\n\
+             \x20\x20\x20 customer.code: customer_code\n\
+             \x20 select: [id, customer_code]\n\
+             schema:\n\
+             \x20 overrides:\n\
+             \x20\x20\x20 - name: {overridden_field}\n\
+             \x20\x20\x20\x20\x20 type: utf8\n",
+            source_path.display(),
+            destination_path.display()
+        )
+    };
+
+    // Overriding the flatten output rewrites its inferred int64 to utf8.
+    fs::write(&definition_path, definition("customer_code")).expect("write load definition");
+    let override_artifacts = work.path().join("artifacts-override");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&override_artifacts)
+        .arg(&definition_path)
+        .assert()
+        .success();
+    let (_, report) = read_single_report(
+        &override_artifacts,
+        "override load writes one artifact directory",
+    );
+    assert_eq!(
+        report["schema_decision"]["fields"],
+        serde_json::json!([
+            {"name": "id", "type": "int64", "nullable": true},
+            {"name": "customer_code", "type": "utf8", "nullable": true}
+        ])
+    );
+    let batch = read_single_parquet_batch(&single_parquet_file(&destination_path));
+    let codes = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("customer_code is utf8");
+    assert_eq!(codes.value(0), "7");
+
+    // Naming the select-dropped parent stays an unknown override field.
+    fs::write(&definition_path, definition("customer")).expect("rewrite load definition");
+    let unknown_artifacts = work.path().join("artifacts-unknown");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&unknown_artifacts)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+    let (_, report) = read_single_report(
+        &unknown_artifacts,
+        "unknown-override load writes one artifact directory",
+    );
+    assert_eq!(report["error_summary"]["code"], "unknown_override_field");
+    assert_eq!(
+        report["error_summary"]["message"],
+        "schema overrides name fields absent from the observed source shape: customer"
+    );
 }
 
 #[test]

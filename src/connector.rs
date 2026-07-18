@@ -354,14 +354,22 @@ impl LocalFileSource {
     /// Resolves the source format from the explicit `format` or, failing that,
     /// the path extension.
     fn resolved_format(&self) -> String {
-        self.format.clone().unwrap_or_else(|| {
-            self.path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .unwrap_or("")
-                .to_string()
-        })
+        resolved_source_format(&self.path, self.format.as_deref())
     }
+}
+
+/// Resolves a definition's source format — the explicit `format` or, failing
+/// that, the path extension. Pure: no I/O, so config-time checks that hinge
+/// on the format (`transform.flatten` requires a JSONL source, ADR-0041) run
+/// before any file is touched, while format *validation* stays inside
+/// [`Source::read`] to preserve error precedence.
+pub(crate) fn resolved_source_format(path: &Path, format: Option<&str>) -> String {
+    format.map(str::to_string).unwrap_or_else(|| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("")
+            .to_string()
+    })
 }
 
 /// Writes an Arrow batch to a local Parquet directory. Full refresh stages the

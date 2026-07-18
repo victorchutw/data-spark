@@ -22,15 +22,23 @@
 //! drift comparison. Overridden fields validate per record exactly like
 //! pinned fields.
 //! A load definition may also declare a structural transform
-//! ([`SchemaTransform`], ADR-0039): field selection evaluates first against
-//! the observed source names and fixes the dataset field order, then the
-//! rename mapping applies simultaneously over the selected fields. The
-//! transform runs before everything above (ADR-0040), so overrides, pins,
-//! drift, and per-record validation all speak the transformed dataset names
-//! while rejections keep the original source content — a transform naming an
-//! unobserved field fails the load as `unknown_transform_field`, and a rename
-//! target colliding with another dataset field fails it as
-//! `transform_name_collision`, both before any override or pin comparison.
+//! ([`SchemaTransform`], ADR-0039, ADR-0041): the flatten mapping evaluates
+//! first, against the observed source shape, adding one path-extracted
+//! dataset field per declared source path after the observed fields; field
+//! selection then evaluates against the post-flatten names and fixes the
+//! dataset field order, and the rename mapping applies simultaneously over
+//! the selected fields. The transform runs before everything above
+//! (ADR-0040), so overrides, pins, drift, and per-record validation all
+//! speak the transformed dataset names while rejections keep the original
+//! source content — a transform naming an unobserved field (or a flatten
+//! path whose first segment names none) fails the load as
+//! `unknown_transform_field`, and a rename target colliding with another
+//! dataset field or a flatten output shadowing an observed source field
+//! fails it as `transform_name_collision`, both before any override or pin
+//! comparison. Flatten extraction is total and never rejects a record: a
+//! scalar leaf feeds the inference lattice, an object or array leaf
+//! materializes as its compact JSON text, and a missing, null, or non-object
+//! step anywhere on the path yields null (ADR-0041).
 //! Everything type-related — the lattice, observation rules, the pinned schema
 //! file contract ([`PinnedSchema`], ADR-0033), drift comparison, per-record
 //! validation, materialization, and the `schema_decision` shape — is private
@@ -297,13 +305,15 @@ impl SchemaOverrides {
     }
 }
 
-/// The `transform` block of a load definition as written (ADR-0039): the
+/// The `transform` block of a load definition as written (ADR-0039,
+/// ADR-0041): the source paths to flatten into added dataset fields, the
 /// source fields to keep, in dataset order, and the source-to-dataset rename
 /// mapping. Part of the versioned load-definition contract, so unknown keys
 /// inside the block are rejected at parse time (ADR-0037).
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TransformConfig {
+    flatten: Option<FlattenMap>,
     select: Option<Vec<String>>,
     rename: Option<RenameMap>,
 }
@@ -321,36 +331,78 @@ impl<'de> Deserialize<'de> for RenameMap {
     where
         D: serde::Deserializer<'de>,
     {
-        struct RenameMapVisitor;
+        deserialize_ordered_unique_map(deserializer, "transform.rename").map(RenameMap)
+    }
+}
 
-        impl<'de> serde::de::Visitor<'de> for RenameMapVisitor {
-            type Value = RenameMap;
+/// The `transform.flatten` mapping as written (ADR-0041): source path to
+/// dataset field name, in declaration order. Deserialized like [`RenameMap`]
+/// so a duplicate path key fails YAML parsing and the echo preserves the
+/// declaration order.
+#[derive(Debug)]
+struct FlattenMap(Vec<(String, String)>);
 
-            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-                formatter.write_str("a map of source field name to dataset field name")
-            }
+impl<'de> Deserialize<'de> for FlattenMap {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_ordered_unique_map(deserializer, "transform.flatten").map(FlattenMap)
+    }
+}
 
-            fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                let mut entries: Vec<(String, String)> =
-                    Vec::with_capacity(access.size_hint().unwrap_or(0));
-                let mut seen_sources = HashSet::new();
-                while let Some((source, target)) = access.next_entry::<String, String>()? {
-                    if !seen_sources.insert(source.clone()) {
-                        return Err(serde::de::Error::custom(format!(
-                            "duplicate transform.rename key {source:?}"
-                        )));
-                    }
-                    entries.push((source, target));
-                }
-                Ok(RenameMap(entries))
-            }
+impl Serialize for FlattenMap {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_map(self.0.iter().map(|(path, output)| (path, output)))
+    }
+}
+
+/// Deserializes a YAML map into its entries in declaration order, failing on
+/// a duplicate key — serde's default map handling would silently keep the
+/// last entry. `map_label` names the load-definition key in the error, e.g.
+/// `transform.rename`.
+fn deserialize_ordered_unique_map<'de, D>(
+    deserializer: D,
+    map_label: &'static str,
+) -> Result<Vec<(String, String)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct OrderedUniqueMapVisitor {
+        map_label: &'static str,
+    }
+
+    impl<'de> serde::de::Visitor<'de> for OrderedUniqueMapVisitor {
+        type Value = Vec<(String, String)>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a map of source name to dataset field name")
         }
 
-        deserializer.deserialize_map(RenameMapVisitor)
+        fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut entries: Vec<(String, String)> =
+                Vec::with_capacity(access.size_hint().unwrap_or(0));
+            let mut seen_keys = HashSet::new();
+            while let Some((key, value)) = access.next_entry::<String, String>()? {
+                if !seen_keys.insert(key.clone()) {
+                    return Err(serde::de::Error::custom(format!(
+                        "duplicate {} key {key:?}",
+                        self.map_label
+                    )));
+                }
+                entries.push((key, value));
+            }
+            Ok(entries)
+        }
     }
+
+    deserializer.deserialize_map(OrderedUniqueMapVisitor { map_label })
 }
 
 impl Serialize for RenameMap {
@@ -362,23 +414,44 @@ impl Serialize for RenameMap {
     }
 }
 
-/// The validated structural transform of a load definition (ADR-0039): field
-/// selection evaluates first, against observed source names, with the select
-/// list order fixing the dataset field order; the rename mapping evaluates
-/// second, applied simultaneously over the selected (or, without `select`,
-/// full observed) field set, so swaps are legal and unmapped fields pass
-/// through under their source names. Empty when the definition configures
-/// none, so every [`SchemaDirective`] can carry one without an optional
-/// wrapper.
+/// The validated structural transform of a load definition (ADR-0039,
+/// ADR-0041): the flatten mapping evaluates first, against the observed
+/// source shape, adding one dataset field per declared source path — in
+/// declaration order, after the observed fields; field selection evaluates
+/// second, against the post-flatten names, with the select list order fixing
+/// the dataset field order; the rename mapping evaluates last, applied
+/// simultaneously over the selected (or, without `select`, full post-flatten)
+/// field set, so swaps are legal and unmapped fields pass through under
+/// their post-flatten names. Empty when the definition configures none, so
+/// every [`SchemaDirective`] can carry one without an optional wrapper.
 pub(crate) struct SchemaTransform {
+    flatten: Vec<FlattenEntry>,
     select: Option<Vec<String>>,
     rename: Vec<(String, String)>,
+}
+
+/// One validated `transform.flatten` entry (ADR-0041): the declared source
+/// path split into its dot-notation segments — at least two, all non-empty —
+/// and the dataset field name its extracted values materialize under.
+struct FlattenEntry {
+    segments: Vec<String>,
+    output: String,
+}
+
+impl FlattenEntry {
+    /// The declared source path as the user wrote it. Segments never contain
+    /// dots — a source key with a literal dot is unaddressable (ADR-0041) —
+    /// so rejoining reproduces the declaration exactly.
+    fn path(&self) -> String {
+        self.segments.join(".")
+    }
 }
 
 impl SchemaTransform {
     /// No transform configured.
     pub(crate) fn none() -> Self {
         SchemaTransform {
+            flatten: Vec::new(),
             select: None,
             rename: Vec::new(),
         }
@@ -386,24 +459,82 @@ impl SchemaTransform {
 
     /// Validates the `transform` block of a load definition before any data
     /// is read (`invalid_transform_config`): the block must transform
-    /// something, select entries must be unique, and every rename must map an
-    /// actual name change onto a usable, unique target drawn from the select
-    /// list when one is declared — no implicit selection and no lenient
-    /// no-ops (ADR-0039). With `select`, the dataset shape is fully
-    /// config-determined, so a rename target colliding with another selected
-    /// field's dataset name is also rejected here; without `select`, the
-    /// pass-through field set is only known at read time and collisions
-    /// surface there as `transform_name_collision`.
-    pub(crate) fn from_config(config: &TransformConfig) -> Result<Self, LoadFailure> {
+    /// something, flatten paths must spell at least two non-empty segments
+    /// onto usable, unique output names — on a JSONL source only, since CSV
+    /// cells hold no addressable structure (ADR-0041) — select entries must
+    /// be unique, and every rename must map an actual name change onto a
+    /// usable, unique target drawn from the select list when one is declared
+    /// — no implicit selection and no lenient no-ops (ADR-0039). Flatten
+    /// outputs are ordinary fields to selection and renaming, so a declared
+    /// select list must also list every output (no no-op extraction), and
+    /// every config-determined dataset name — a select-resolved name with
+    /// `select`, a rename target or flatten output's final name without —
+    /// must stay unique here; without `select`, the pass-through field set
+    /// is only known at read time and collisions with it surface there as
+    /// `transform_name_collision`.
+    pub(crate) fn from_config(
+        config: &TransformConfig,
+        source_format: &str,
+    ) -> Result<Self, LoadFailure> {
         let invalid = |message: String| LoadFailure {
             code: "invalid_transform_config",
             message,
         };
-        if config.select.is_none() && config.rename.is_none() {
+        if config.flatten.is_none() && config.select.is_none() && config.rename.is_none() {
             return Err(invalid(
-                "a transform block must set transform.select or transform.rename".to_string(),
+                "a transform block must set transform.flatten, transform.select, \
+                 or transform.rename"
+                    .to_string(),
             ));
         }
+        let flatten = match &config.flatten {
+            None => Vec::new(),
+            Some(_) if source_format == "csv" => {
+                return Err(invalid(
+                    "transform.flatten requires a JSONL source format; \
+                     the resolved source format is csv"
+                        .to_string(),
+                ))
+            }
+            Some(flatten) if flatten.0.is_empty() => {
+                return Err(invalid(
+                    "transform.flatten must map at least one path".to_string(),
+                ))
+            }
+            Some(flatten) => {
+                let mut entries = Vec::with_capacity(flatten.0.len());
+                let mut seen_outputs = HashSet::new();
+                for (path, output) in &flatten.0 {
+                    let segments: Vec<String> = path.split('.').map(str::to_string).collect();
+                    if segments.len() < 2 {
+                        return Err(invalid(format!(
+                            "transform.flatten path {path:?} must have at least two \
+                             dot-separated segments"
+                        )));
+                    }
+                    if segments.iter().any(|segment| segment.is_empty()) {
+                        return Err(invalid(format!(
+                            "transform.flatten path {path:?} must not contain empty segments"
+                        )));
+                    }
+                    if output.trim().is_empty() {
+                        return Err(invalid(format!(
+                            "transform.flatten output name for path {path:?} must not be empty"
+                        )));
+                    }
+                    if !seen_outputs.insert(output.as_str()) {
+                        return Err(invalid(format!(
+                            "transform.flatten maps more than one path to {output:?}"
+                        )));
+                    }
+                    entries.push(FlattenEntry {
+                        segments,
+                        output: output.clone(),
+                    });
+                }
+                entries
+            }
+        };
         if let Some(select) = &config.select {
             if select.is_empty() {
                 return Err(invalid(
@@ -453,14 +584,30 @@ impl SchemaTransform {
                 }
             }
         }
+        // The final dataset name a post-flatten field materializes under: its
+        // rename target, or the field name passed through.
+        fn final_dataset_name<'a>(rename: &'a [(String, String)], name: &'a str) -> &'a str {
+            rename
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, target)| target.as_str())
+                .unwrap_or(name)
+        }
         if let Some(select) = &config.select {
+            // No no-op extraction: with a declared select list, a flatten
+            // output outside it would be extracted and dropped, matching the
+            // rename rule above (ADR-0041).
+            for entry in &flatten {
+                if !select.contains(&entry.output) {
+                    return Err(invalid(format!(
+                        "transform.flatten output {:?} is not in transform.select",
+                        entry.output
+                    )));
+                }
+            }
             let mut seen_dataset_names = HashSet::new();
             for source in select {
-                let dataset_name = rename
-                    .iter()
-                    .find(|(key, _)| key == source)
-                    .map(|(_, target)| target.as_str())
-                    .unwrap_or(source.as_str());
+                let dataset_name = final_dataset_name(&rename, source);
                 if !seen_dataset_names.insert(dataset_name) {
                     return Err(invalid(format!(
                         "transform.select and transform.rename map more than one field \
@@ -468,15 +615,37 @@ impl SchemaTransform {
                     )));
                 }
             }
+        } else if !flatten.is_empty() {
+            // Without `select`, the config-determined dataset names are the
+            // rename targets and the flatten outputs' final names; a rename
+            // whose key is a flatten output renames that output, so its
+            // target is the output's final name, not a separate one.
+            let flatten_outputs: HashSet<&str> =
+                flatten.iter().map(|entry| entry.output.as_str()).collect();
+            let mut seen_config_names: HashSet<&str> = rename
+                .iter()
+                .filter(|(source, _)| !flatten_outputs.contains(source.as_str()))
+                .map(|(_, target)| target.as_str())
+                .collect();
+            for entry in &flatten {
+                let dataset_name = final_dataset_name(&rename, &entry.output);
+                if !seen_config_names.insert(dataset_name) {
+                    return Err(invalid(format!(
+                        "transform.flatten and transform.rename map more than one field \
+                         to the dataset name {dataset_name:?}"
+                    )));
+                }
+            }
         }
         Ok(SchemaTransform {
+            flatten,
             select: config.select.clone(),
             rename,
         })
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.select.is_none() && self.rename.is_empty()
+        self.flatten.is_empty() && self.select.is_none() && self.rename.is_empty()
     }
 
     /// The dataset field name a selected source field materializes under: its
@@ -493,6 +662,17 @@ impl SchemaTransform {
     /// block as written, with unset keys omitted.
     fn echo(&self) -> Value {
         let mut entry = serde_json::Map::new();
+        if !self.flatten.is_empty() {
+            entry.insert(
+                "flatten".to_string(),
+                Value::Object(
+                    self.flatten
+                        .iter()
+                        .map(|flatten_entry| (flatten_entry.path(), json!(flatten_entry.output)))
+                        .collect(),
+                ),
+            );
+        }
         if let Some(select) = &self.select {
             entry.insert("select".to_string(), json!(select));
         }
@@ -791,7 +971,7 @@ fn json_materialization(
             let mut checks = pinned_checks(&matched);
             checks.extend(override_checks(overrides, added.iter()));
             let (survivors, rejected) = partition_json(records, &checks);
-            let survivor_types = observe_json_types(&field_names, &survivors);
+            let survivor_types = observe_json_types(&field_names, &columns, &survivors);
             let added = planned_added_fields(added, &survivor_types, overrides);
             let plan = assemble_pinned_plan(pinned_path, matched, added);
             build_json(plan, &survivors, rejected)
@@ -801,27 +981,87 @@ fn json_materialization(
 
 /// One field of the dataset a load materializes, produced by resolving the
 /// structural transform against the observed source shape: the dataset name
-/// the field writes under, the source field it reads from, and that source
-/// field's observed column index. Without a transform the dataset view is the
-/// observed source shape itself.
+/// the field writes under, the source address it reads from, and its column
+/// index into the observed types — a virtual index past the observed fields
+/// for a flatten column (ADR-0041). Without a transform the dataset view is
+/// the observed source shape itself.
 #[derive(Clone)]
 struct DatasetColumn {
     dataset_name: String,
-    source_name: String,
+    source: SourceAddress,
     observed_index: usize,
+}
+
+impl DatasetColumn {
+    /// Whether the transform changed this column's name: a renamed source
+    /// field, or a flatten column, whose dataset name never spells its
+    /// source path.
+    fn name_changed(&self) -> bool {
+        match &self.source {
+            SourceAddress::Field(source_name) => &self.dataset_name != source_name,
+            SourceAddress::Path(_) => true,
+        }
+    }
+}
+
+/// How a dataset column reads its value from a source record: a top-level
+/// source field — by observed column index for CSV cells and by source name
+/// for JSONL objects — or a flatten path into a top-level field's nested
+/// JSON structure (ADR-0041). Paths reach only JSONL loads: a flatten
+/// declaration on a CSV source is rejected at config time.
+#[derive(Clone)]
+enum SourceAddress {
+    Field(String),
+    Path(Vec<String>),
+}
+
+impl SourceAddress {
+    /// The source name reports and rejections carry: the top-level field
+    /// name, or the declared source path as the user wrote it.
+    fn as_written(&self) -> String {
+        match self {
+            SourceAddress::Field(name) => name.clone(),
+            SourceAddress::Path(segments) => segments.join("."),
+        }
+    }
+
+    /// Reads the addressed value from a JSONL record: a top-level lookup, or
+    /// the total path walk of ADR-0041 — `None` (an Arrow null downstream)
+    /// for a missing key or a null or non-object value anywhere before the
+    /// leaf, and the leaf value itself otherwise, so an object or array leaf
+    /// stays a [`Value`] that materializes as its compact JSON text.
+    fn json_value<'a>(&self, object: &'a serde_json::Map<String, Value>) -> Option<&'a Value> {
+        match self {
+            SourceAddress::Field(name) => object.get(name),
+            SourceAddress::Path(segments) => {
+                let mut value = object.get(&segments[0])?;
+                for segment in &segments[1..] {
+                    value = value.as_object()?.get(segment)?;
+                }
+                Some(value)
+            }
+        }
+    }
 }
 
 /// Resolves the directive's structural transform against the observed source
 /// names into the dataset columns everything downstream operates on
-/// (ADR-0040). Fails with `unknown_transform_field` when a select entry or
-/// rename key names no observed field — reported as the user wrote them —
-/// and with `transform_name_collision` when a rename target collides with a
-/// pass-through field name, which is reachable only without `select`: with
-/// one, the dataset shape is config-determined and collisions were already
-/// rejected at directive resolution. Duplicate observed names resolve to
-/// their first occurrence; purely pass-through duplicates keep their
-/// pre-transform meaning (drift under a pin) rather than becoming a
-/// transform failure.
+/// (ADR-0040). The flatten mapping resolves first (ADR-0041): each entry
+/// becomes one path-addressed column — placed by the select list when one is
+/// declared, appended after the observed fields in declaration order
+/// otherwise — whose observed-type slot is a virtual index past the observed
+/// fields. Fails with `unknown_transform_field` when a select entry or
+/// rename key names no post-flatten field, or a flatten path's first segment
+/// names no observed field — reported as the user wrote them — and with
+/// `transform_name_collision` when a flatten output shadows an observed
+/// source field (even one selection would drop, or the post-flatten names
+/// select and rename resolve against would turn ambiguous) or a rename
+/// target collides with a pass-through field name, which is reachable only
+/// without `select`: with one, the dataset shape is config-determined and
+/// collisions were already rejected at directive resolution. Duplicate
+/// observed names resolve to their first occurrence; purely pass-through
+/// duplicates keep their pre-transform meaning (drift under a pin) rather
+/// than becoming a transform failure.
 fn resolve_transform(
     directive: &SchemaDirective,
     observed_names: &[String],
@@ -831,16 +1071,35 @@ fn resolve_transform(
     for (index, name) in observed_names.iter().enumerate() {
         observed_indexes.entry(name.as_str()).or_insert(index);
     }
+    let flatten_positions: HashMap<&str, usize> = transform
+        .flatten
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| (entry.output.as_str(), position))
+        .collect();
 
-    let mut unknown: Vec<&str> = Vec::new();
+    // Select entries and rename keys naming flatten outputs are known
+    // fields; a flatten path is unknown when its first segment names no
+    // observed field, whatever deeper segments spell — a deeper absence is a
+    // null value, never a failure (ADR-0041).
+    let mut unknown: Vec<String> = Vec::new();
     for name in transform
         .select
         .iter()
         .flatten()
         .chain(transform.rename.iter().map(|(source, _)| source))
     {
-        if !observed_indexes.contains_key(name.as_str()) && !unknown.contains(&name.as_str()) {
-            unknown.push(name);
+        if !observed_indexes.contains_key(name.as_str())
+            && !flatten_positions.contains_key(name.as_str())
+            && !unknown.contains(name)
+        {
+            unknown.push(name.clone());
+        }
+    }
+    for entry in &transform.flatten {
+        let path = entry.path();
+        if !observed_indexes.contains_key(entry.segments[0].as_str()) && !unknown.contains(&path) {
+            unknown.push(path);
         }
     }
     if !unknown.is_empty() {
@@ -848,7 +1107,7 @@ fn resolve_transform(
             LoadFailure {
                 code: "unknown_transform_field",
                 message: format!(
-                    "transform selects or renames fields absent from the observed source shape: {}",
+                    "transform selects, renames, or flattens fields absent from the observed source shape: {}",
                     unknown.join(", ")
                 ),
             },
@@ -856,31 +1115,63 @@ fn resolve_transform(
         ));
     }
 
+    for entry in &transform.flatten {
+        if observed_indexes.contains_key(entry.output.as_str()) {
+            return Err(pre_materialization_failure(
+                LoadFailure {
+                    code: "transform_name_collision",
+                    message: format!(
+                        "transform flatten collides on dataset field {:?}: source path {} shadows an observed source field",
+                        entry.output,
+                        entry.path()
+                    ),
+                },
+                configured_posture_decision(directive),
+            ));
+        }
+    }
+
+    let flatten_column = |position: usize| {
+        let entry = &transform.flatten[position];
+        DatasetColumn {
+            dataset_name: transform.dataset_name(&entry.output),
+            source: SourceAddress::Path(entry.segments.clone()),
+            observed_index: observed_names.len() + position,
+        }
+    };
     let columns = match &transform.select {
         Some(select) => select
             .iter()
-            .map(|source_name| DatasetColumn {
-                dataset_name: transform.dataset_name(source_name),
-                source_name: source_name.clone(),
-                observed_index: observed_indexes[source_name.as_str()],
-            })
+            .map(
+                |source_name| match flatten_positions.get(source_name.as_str()) {
+                    Some(&position) => flatten_column(position),
+                    None => DatasetColumn {
+                        dataset_name: transform.dataset_name(source_name),
+                        source: SourceAddress::Field(source_name.clone()),
+                        observed_index: observed_indexes[source_name.as_str()],
+                    },
+                },
+            )
             .collect::<Vec<_>>(),
         None => observed_names
             .iter()
             .enumerate()
             .map(|(observed_index, source_name)| DatasetColumn {
                 dataset_name: transform.dataset_name(source_name),
-                source_name: source_name.clone(),
+                source: SourceAddress::Field(source_name.clone()),
                 observed_index,
             })
+            .chain((0..transform.flatten.len()).map(flatten_column))
             .collect(),
     };
 
     // A dataset name produced by more than one column is a collision only
-    // when a rename put it there; identity renames are config-invalid, so a
-    // renamed column is exactly one whose names differ. Columns are grouped
-    // once by dataset name, then reported at the first colliding column in
-    // dataset order, with its sources in dataset order too.
+    // when the transform changed a name to put it there; identity renames
+    // are config-invalid and a flatten column shadowing an observed field
+    // was rejected above, so the remaining reachable case is a name renamed
+    // onto a pass-through field. Columns are grouped once by dataset name,
+    // then reported at the first colliding column in dataset order, with its
+    // sources in dataset order too.
     let mut columns_by_dataset_name: HashMap<&str, Vec<&DatasetColumn>> = HashMap::new();
     for column in &columns {
         columns_by_dataset_name
@@ -890,14 +1181,10 @@ fn resolve_transform(
     }
     for column in &columns {
         let colliding = &columns_by_dataset_name[column.dataset_name.as_str()];
-        if colliding.len() > 1
-            && colliding
-                .iter()
-                .any(|other| other.dataset_name != other.source_name)
-        {
+        if colliding.len() > 1 && colliding.iter().any(|other| other.name_changed()) {
             let sources = colliding
                 .iter()
-                .map(|other| other.source_name.as_str())
+                .map(|other| other.source.as_written())
                 .collect::<Vec<_>>();
             return Err(pre_materialization_failure(
                 LoadFailure {
@@ -972,7 +1259,7 @@ fn inferred_json(
 ) -> Result<Materialized, ExecutionFailure> {
     let checks = override_checks(overrides, columns.iter());
     let (survivors, rejected) = partition_json(records, &checks);
-    let survivor_types = observe_json_types(field_names, &survivors);
+    let survivor_types = observe_json_types(field_names, columns, &survivors);
     let plan = inferred_plan(columns, &survivor_types, pinned_path, overrides);
     build_json(plan, &survivors, rejected)
 }
@@ -1093,14 +1380,14 @@ fn pre_materialization_failure(failure: LoadFailure, decision: Value) -> Executi
     }
 }
 
-/// One field the load will materialize: its dataset name, the source field it
-/// reads from — by observed column index for CSV cells and by source name for
-/// JSONL objects — the type its column is built as (never `Null`), and
-/// whether its values may be null. The two names differ exactly when a rename
-/// mapping changed the field's name (ADR-0039).
+/// One field the load will materialize: its dataset name, the source address
+/// it reads from ([`SourceAddress`]), the type its column is built as (never
+/// `Null`), and whether its values may be null. The dataset name differs
+/// from the source when a rename mapping changed the field's name (ADR-0039)
+/// or the field is a flatten output (ADR-0041).
 struct PlannedField {
     name: String,
-    source_name: String,
+    source: SourceAddress,
     materialized_type: InferredType,
     nullable: bool,
     observed_index: usize,
@@ -1134,7 +1421,7 @@ fn inferred_plan(
             let override_ = overrides.get(&column.dataset_name);
             PlannedField {
                 name: column.dataset_name.clone(),
-                source_name: column.source_name.clone(),
+                source: column.source.clone(),
                 materialized_type: override_
                     .and_then(|override_| override_.field_type)
                     .unwrap_or_else(|| default_null_to_text(observed_types[column.observed_index])),
@@ -1212,7 +1499,7 @@ fn match_shape(
             None => missing_fields.push(pin_field.name.clone()),
             Some(column) => matched.push(PlannedField {
                 name: pin_field.name.clone(),
-                source_name: column.source_name.clone(),
+                source: column.source.clone(),
                 materialized_type: pin_field.field_type,
                 nullable: pin_field.nullable,
                 observed_index: column.observed_index,
@@ -1258,25 +1545,31 @@ fn match_shape(
 }
 
 /// One per-record value check (ADR-0035, ADR-0038): the dataset field it
-/// guards, the source field it reads — by observed column index for CSV and
-/// by source name for JSONL — the type its values must widen to — if any —
+/// guards, the source address it reads ([`SourceAddress`]; CSV cells read by
+/// observed column index), the type its values must widen to — if any —
 /// with the wording its rejections carry, and whether a null value rejects
 /// the record. Pinned fields check everything the pin declares; overridden
 /// fields check exactly the properties their override sets.
 struct FieldCheck {
     name: String,
-    source_name: String,
+    source: SourceAddress,
     observed_index: usize,
     expected_type: Option<(InferredType, TypeOrigin)>,
     required: bool,
 }
 
 impl FieldCheck {
-    /// The source field a rejection names alongside the dataset field — set
-    /// only when a rename mapping changed the rejected field's name
-    /// (ADR-0039).
-    fn renamed_source(&self) -> Option<String> {
-        (self.name != self.source_name).then(|| self.source_name.clone())
+    /// The source a rejection names alongside the dataset field: the source
+    /// field name when a rename mapping changed the rejected field's name
+    /// (ADR-0039), or the declared source path as written when the rejected
+    /// field is a flatten output (ADR-0041).
+    fn source_field(&self) -> Option<String> {
+        match &self.source {
+            SourceAddress::Field(source_name) => {
+                (&self.name != source_name).then(|| source_name.clone())
+            }
+            SourceAddress::Path(_) => Some(self.source.as_written()),
+        }
     }
 }
 
@@ -1304,7 +1597,7 @@ fn pinned_checks(matched: &[PlannedField]) -> Vec<FieldCheck> {
         .iter()
         .map(|planned| FieldCheck {
             name: planned.name.clone(),
-            source_name: planned.source_name.clone(),
+            source: planned.source.clone(),
             observed_index: planned.observed_index,
             expected_type: Some((planned.materialized_type, TypeOrigin::Pinned)),
             required: !planned.nullable,
@@ -1326,7 +1619,7 @@ fn override_checks<'a>(
                 .get(&column.dataset_name)
                 .map(|override_| FieldCheck {
                     name: column.dataset_name.clone(),
-                    source_name: column.source_name.clone(),
+                    source: column.source.clone(),
                     observed_index: column.observed_index,
                     expected_type: override_
                         .field_type
@@ -1413,11 +1706,12 @@ fn validate_text_record(
 }
 
 /// Validates one JSONL record against the field checks; see
-/// [`validate_text_record`]. Values are read under their source names; a
-/// field absent from the record reads as null.
+/// [`validate_text_record`]. Values are read through their source addresses
+/// — a top-level name, or a flatten path walk (ADR-0041) — and an absent
+/// address reads as null.
 fn validate_json_record(record: &JsonRecord, checks: &[FieldCheck]) -> Option<RejectedRecord> {
     for check in checks {
-        match record.object.get(&check.source_name) {
+        match check.source.json_value(&record.object) {
             None | Some(Value::Null) => {
                 if check.required {
                     return Some(required_field_rejection(
@@ -1459,7 +1753,7 @@ fn required_field_rejection(line: u64, check: &FieldCheck, record: Value) -> Rej
         line,
         code: rejection::MISSING_REQUIRED_FIELD,
         field: Some(check.name.clone()),
-        source_field: check.renamed_source(),
+        source_field: check.source_field(),
         message: format!("required field {:?} is null", check.name),
         record,
     }
@@ -1477,7 +1771,7 @@ fn type_rejection(
         line,
         code: rejection::TYPE_COERCION_FAILED,
         field: Some(check.name.clone()),
-        source_field: check.renamed_source(),
+        source_field: check.source_field(),
         message: format!(
             "value {value} does not fit {} type {} for field {:?}",
             origin.wording(),
@@ -1529,7 +1823,7 @@ fn planned_added_fields(
                     .and_then(|override_| override_.nullable)
                     .unwrap_or(true),
                 name: column.dataset_name,
-                source_name: column.source_name,
+                source: column.source,
                 observed_index: column.observed_index,
             }
         })
@@ -1668,8 +1962,8 @@ fn build_text(
     materialize(plan, columns, rejected)
 }
 
-/// Builds the planned columns over the surviving JSONL records — read under
-/// their source names — and assembles the batch.
+/// Builds the planned columns over the surviving JSONL records — read
+/// through their source addresses — and assembles the batch.
 fn build_json(
     plan: FieldPlan,
     records: &[JsonRecord],
@@ -1683,7 +1977,7 @@ fn build_json(
             build_json_array(
                 planned.materialized_type,
                 records,
-                &planned.source_name,
+                &planned.source,
                 column_index,
             )
         })
@@ -1738,13 +2032,36 @@ fn observe_text_types(field_count: usize, records: &[TextRecord]) -> Vec<Inferre
     observed_types
 }
 
-fn observe_json_types(field_names: &[String], records: &[JsonRecord]) -> Vec<InferredType> {
-    let mut observed_types = vec![InferredType::Null; field_names.len()];
+/// Observes the type of every source column of a JSONL batch: the observed
+/// top-level fields by name, then each flatten column by walking its source
+/// path (ADR-0041) into the virtual observed-type slot past the observed
+/// fields. A path that yields no value in any record leaves its slot `Null`,
+/// widening to text exactly like an all-absent field.
+fn observe_json_types(
+    field_names: &[String],
+    columns: &[DatasetColumn],
+    records: &[JsonRecord],
+) -> Vec<InferredType> {
+    let flatten_count = columns
+        .iter()
+        .filter(|column| matches!(column.source, SourceAddress::Path(_)))
+        .count();
+    let mut observed_types = vec![InferredType::Null; field_names.len() + flatten_count];
     for record in records {
         for (column_index, field_name) in field_names.iter().enumerate() {
             if let Some(value) = record.object.get(field_name) {
                 observed_types[column_index] =
                     observed_types[column_index].merge(infer_json_type(value));
+            }
+        }
+    }
+    for column in columns {
+        if matches!(column.source, SourceAddress::Path(_)) {
+            for record in records {
+                if let Some(value) = column.source.json_value(&record.object) {
+                    observed_types[column.observed_index] =
+                        observed_types[column.observed_index].merge(infer_json_type(value));
+                }
             }
         }
     }
@@ -1830,14 +2147,14 @@ fn build_text_array(
 fn build_json_array(
     inferred_type: InferredType,
     records: &[JsonRecord],
-    field_name: &str,
+    source: &SourceAddress,
     column_index: usize,
 ) -> Result<ArrayRef, LoadFailure> {
     match inferred_type {
         InferredType::Null | InferredType::Utf8 => {
             let mut builder = StringBuilder::new();
             for record in records {
-                match json_scalar_to_string(record.object.get(field_name)) {
+                match json_scalar_to_string(source.json_value(&record.object)) {
                     Some(value) => builder.append_value(value),
                     None => builder.append_null(),
                 }
@@ -1847,7 +2164,7 @@ fn build_json_array(
         InferredType::Boolean => {
             let mut builder = BooleanBuilder::new();
             for record in records {
-                match record.object.get(field_name) {
+                match source.json_value(&record.object) {
                     None | Some(Value::Null) => builder.append_null(),
                     Some(Value::Bool(flag)) => builder.append_value(*flag),
                     Some(other) => {
@@ -1864,7 +2181,7 @@ fn build_json_array(
         InferredType::Int64 => {
             let mut builder = Int64Builder::new();
             for record in records {
-                match record.object.get(field_name) {
+                match source.json_value(&record.object) {
                     None | Some(Value::Null) => builder.append_null(),
                     Some(Value::Number(number)) => match number.as_i64() {
                         Some(value) => builder.append_value(value),
@@ -1886,7 +2203,7 @@ fn build_json_array(
         InferredType::Float64 => {
             let mut builder = Float64Builder::new();
             for record in records {
-                match record.object.get(field_name) {
+                match source.json_value(&record.object) {
                     None | Some(Value::Null) => builder.append_null(),
                     Some(Value::Number(number)) => match number.as_f64() {
                         Some(value) => builder.append_value(value),
@@ -2571,10 +2888,12 @@ mod tests {
         }
     }
 
-    /// Builds a validated transform from the `transform` block's YAML text.
+    /// Builds a validated transform from the `transform` block's YAML text,
+    /// under the JSONL source format so flatten declarations validate.
     fn transform(yaml: &str) -> SchemaTransform {
         SchemaTransform::from_config(
             &serde_yaml::from_str::<TransformConfig>(yaml).expect("test transform parses"),
+            "jsonl",
         )
         .expect("test transform validates")
     }
@@ -3819,7 +4138,7 @@ mod tests {
         assert_eq!(error.failure.code, "unknown_transform_field");
         assert_eq!(
             error.failure.message,
-            "transform selects or renames fields absent from the observed source shape: vip"
+            "transform selects, renames, or flattens fields absent from the observed source shape: vip"
         );
         assert!(error.rejected.is_empty());
         assert_eq!(
@@ -3851,7 +4170,7 @@ mod tests {
         assert_eq!(error.failure.code, "unknown_transform_field");
         assert_eq!(
             error.failure.message,
-            "transform selects or renames fields absent from the observed source shape: email"
+            "transform selects, renames, or flattens fields absent from the observed source shape: email"
         );
     }
 
@@ -4242,6 +4561,349 @@ mod tests {
             rejected.message,
             "value \"abc\" does not fit pinned type int64 for field \"customer_id\""
         );
+    }
+
+    // ---- Flatten mapping (ADR-0041) ----
+
+    #[test]
+    fn from_json_columns_flattens_declared_paths_into_added_dataset_fields() {
+        // Without select, flatten outputs append after the observed fields in
+        // declaration order; the parent keeps materializing as compact JSON
+        // text, and the decision echoes the mapping as written.
+        let directive = transformed_inferred_directive(
+            "flatten: {customer.name: customer_name, customer.age: customer_age}",
+        );
+        let materialized = from_json_columns(
+            &directive,
+            names(&["id", "customer"]),
+            vec![
+                json_record(1, r#"{"id": 1, "customer": {"name": "Ada", "age": 36}}"#),
+                json_record(2, r#"{"id": 2, "customer": {"name": "Bo", "age": 52}}"#),
+            ],
+        )
+        .expect("flatten materializes");
+        let batch = &materialized.batch;
+
+        assert_eq!(
+            batch_field_names(batch),
+            ["id", "customer", "customer_name", "customer_age"]
+        );
+        assert_eq!(
+            schema_types(batch),
+            vec![
+                DataType::Int64,
+                DataType::Utf8,
+                DataType::Utf8,
+                DataType::Int64
+            ]
+        );
+        assert_eq!(strings(batch, 1).value(0), r#"{"name":"Ada","age":36}"#);
+        assert_eq!(strings(batch, 2).value(0), "Ada");
+        assert_eq!(strings(batch, 2).value(1), "Bo");
+        assert_eq!(ints(batch, 3).value(0), 36);
+        assert_eq!(ints(batch, 3).value(1), 52);
+        assert_eq!(
+            materialized.schema_decision["transform"],
+            json!({
+                "flatten": {"customer.name": "customer_name", "customer.age": "customer_age"}
+            })
+        );
+    }
+
+    #[test]
+    fn flatten_extraction_yields_null_for_missing_null_and_non_object_steps() {
+        // The extraction table of ADR-0041: a missing leaf key, a null
+        // parent, a non-object intermediate, a null leaf, and an absent
+        // parent all yield null — never a rejection — while the parent
+        // column keeps its own materialization.
+        let directive = transformed_inferred_directive("flatten: {customer.name: customer_name}");
+        let materialized = from_json_columns(
+            &directive,
+            names(&["id", "customer"]),
+            vec![
+                json_record(1, r#"{"id": 1, "customer": {"name": "Ada"}}"#),
+                json_record(2, r#"{"id": 2, "customer": {"vip": true}}"#),
+                json_record(3, r#"{"id": 3, "customer": null}"#),
+                json_record(4, r#"{"id": 4, "customer": "opaque"}"#),
+                json_record(5, r#"{"id": 5, "customer": {"name": null}}"#),
+                json_record(6, r#"{"id": 6}"#),
+            ],
+        )
+        .expect("extraction is total and never rejects");
+        let batch = &materialized.batch;
+
+        assert!(materialized.rejected.is_empty());
+        assert_eq!(batch.num_rows(), 6);
+        let flattened = strings(batch, 2);
+        assert_eq!(flattened.value(0), "Ada");
+        for row in 1..6 {
+            assert!(flattened.is_null(row), "row {row} extracts to null");
+        }
+        // The parent column is untouched by extraction.
+        let parents = strings(batch, 1);
+        assert_eq!(parents.value(1), r#"{"vip":true}"#);
+        assert!(parents.is_null(2));
+        assert_eq!(parents.value(3), "opaque");
+    }
+
+    #[test]
+    fn flatten_columns_widen_mixed_leaf_types_and_default_all_null_paths_to_text() {
+        // Extracted scalars feed the same inference lattice as top-level
+        // values: int64 and float64 widen to float64, disagreement falls
+        // back to text, and a path that never yields a value widens to utf8
+        // exactly like an all-absent field.
+        let directive = transformed_inferred_directive("flatten: {m.a: a, m.b: b, m.c: c}");
+        let materialized = from_json_columns(
+            &directive,
+            names(&["m"]),
+            vec![
+                json_record(1, r#"{"m": {"a": 1, "b": 7}}"#),
+                json_record(2, r#"{"m": {"a": 2.5, "b": "seven"}}"#),
+            ],
+        )
+        .expect("mixed flatten types widen");
+        let batch = &materialized.batch;
+
+        assert_eq!(
+            schema_types(batch),
+            vec![
+                DataType::Utf8,
+                DataType::Float64,
+                DataType::Utf8,
+                DataType::Utf8
+            ]
+        );
+        assert_eq!(floats(batch, 1).value(0), 1.0);
+        assert_eq!(floats(batch, 1).value(1), 2.5);
+        assert_eq!(strings(batch, 2).value(0), "7");
+        assert_eq!(strings(batch, 2).value(1), "seven");
+        assert!(strings(batch, 3).is_null(0));
+        assert!(strings(batch, 3).is_null(1));
+        assert_eq!(
+            materialized.schema_decision["fields"][3],
+            json!({"name": "c", "type": "utf8", "nullable": true})
+        );
+    }
+
+    #[test]
+    fn flatten_materializes_object_and_array_leaves_as_compact_json_text() {
+        // An object or array leaf stays JSON text, and a deeper path on the
+        // same parent coexists as its own typed column (ADR-0041).
+        let directive = transformed_inferred_directive(
+            "flatten: {customer.address: address, customer.address.city: city, customer.tags: tags}",
+        );
+        let materialized = from_json_columns(
+            &directive,
+            names(&["customer"]),
+            vec![json_record(
+                1,
+                r#"{"customer": {"address": {"city": "Taipei", "zip": "100"}, "tags": [1, 2]}}"#,
+            )],
+        )
+        .expect("structured leaves materialize as text");
+        let batch = &materialized.batch;
+
+        assert_eq!(
+            batch_field_names(batch),
+            ["customer", "address", "city", "tags"]
+        );
+        assert_eq!(
+            strings(batch, 1).value(0),
+            r#"{"city":"Taipei","zip":"100"}"#
+        );
+        assert_eq!(strings(batch, 2).value(0), "Taipei");
+        assert_eq!(strings(batch, 3).value(0), "[1,2]");
+    }
+
+    #[test]
+    fn select_places_flatten_outputs_and_rename_maps_them() {
+        // Flatten outputs are ordinary fields to the later steps: select
+        // places them anywhere in the dataset order and rename maps them,
+        // with select entries and rename keys speaking the output name.
+        let directive = transformed_inferred_directive(
+            "flatten: {customer.name: customer_name}\n\
+             select: [customer_name, id]\n\
+             rename: {customer_name: contact}",
+        );
+        let materialized = from_json_columns(
+            &directive,
+            names(&["id", "customer"]),
+            vec![json_record(1, r#"{"id": 1, "customer": {"name": "Ada"}}"#)],
+        )
+        .expect("flatten output selects and renames");
+        let batch = &materialized.batch;
+
+        assert_eq!(batch_field_names(batch), ["contact", "id"]);
+        assert_eq!(strings(batch, 0).value(0), "Ada");
+        assert_eq!(ints(batch, 1).value(0), 1);
+        assert_eq!(
+            materialized.schema_decision["transform"],
+            json!({
+                "flatten": {"customer.name": "customer_name"},
+                "select": ["customer_name", "id"],
+                "rename": {"customer_name": "contact"}
+            })
+        );
+    }
+
+    #[test]
+    fn flatten_paths_with_unobserved_first_segments_are_unknown_transform_fields() {
+        // The first segment resolves against the batch-wide observed source
+        // fields; a miss reports the full path as the user wrote it. Deeper
+        // segments are never checked here — their absence is a null value.
+        let directive = transformed_inferred_directive("flatten: {ghost.name: contact}");
+        let error = from_json_columns(
+            &directive,
+            names(&["id"]),
+            vec![json_record(1, r#"{"id": 1}"#)],
+        )
+        .err()
+        .expect("unobserved first segment rejected");
+
+        assert_eq!(error.failure.code, "unknown_transform_field");
+        assert_eq!(
+            error.failure.message,
+            "transform selects, renames, or flattens fields absent from the observed source shape: ghost.name"
+        );
+        assert_eq!(
+            error.schema_decision.expect("decision")["transform"],
+            json!({ "flatten": {"ghost.name": "contact"} })
+        );
+    }
+
+    #[test]
+    fn flatten_outputs_may_never_shadow_observed_fields() {
+        // A flatten output equal to an observed source field name would turn
+        // the post-flatten namespace ambiguous, so it fails — even when a
+        // select list would drop the shadowed field (ADR-0041).
+        for transform_yaml in [
+            "flatten: {customer.name: id}",
+            "flatten: {customer.name: id}\nselect: [id]",
+        ] {
+            let directive = transformed_inferred_directive(transform_yaml);
+            let error = from_json_columns(
+                &directive,
+                names(&["id", "customer"]),
+                vec![json_record(1, r#"{"id": 1, "customer": {"name": "Ada"}}"#)],
+            )
+            .err()
+            .expect("shadowing flatten output rejected");
+
+            assert_eq!(
+                error.failure.code, "transform_name_collision",
+                "code for {transform_yaml:?}"
+            );
+            assert_eq!(
+                error.failure.message,
+                "transform flatten collides on dataset field \"id\": \
+                 source path customer.name shadows an observed source field"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_flatten_outputs_reject_misfits_with_the_declared_path() {
+        // Strictness composes through the pin (ADR-0035): a pinned flatten
+        // output whose extracted value misfits rejects that record, naming
+        // the dataset field and the declared source path, with the record
+        // content staying the original source shape.
+        let directive = transformed_pinned_directive(
+            "version: 1\n\
+             fields:\n\
+             - name: customer\n\
+             \x20 type: utf8\n\
+             - name: customer_name\n\
+             \x20 type: int64\n",
+            DriftPolicy::Fail,
+            transform("flatten: {customer.name: customer_name}"),
+            SchemaOverrides::none(),
+        );
+        let materialized = from_json_columns(
+            &directive,
+            names(&["customer"]),
+            vec![
+                json_record(1, r#"{"customer": {"name": 7}}"#),
+                json_record(2, r#"{"customer": {"name": "Ada"}}"#),
+            ],
+        )
+        .expect("pinned misfits reject records, not the load");
+        let batch = &materialized.batch;
+
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(ints(batch, 1).value(0), 7);
+        assert_eq!(materialized.rejected.len(), 1);
+        let rejected = &materialized.rejected[0];
+        assert_eq!(rejected.line, 2);
+        assert_eq!(rejected.code, "type_coercion_failed");
+        assert_eq!(rejected.field.as_deref(), Some("customer_name"));
+        assert_eq!(rejected.source_field.as_deref(), Some("customer.name"));
+        assert_eq!(
+            rejected.message,
+            "value \"Ada\" does not fit pinned type int64 for field \"customer_name\""
+        );
+        assert_eq!(rejected.record, json!({ "customer": {"name": "Ada"} }));
+    }
+
+    #[test]
+    fn bootstrap_pins_record_flatten_outputs_in_dataset_order() {
+        // The first pin-requesting load records flatten outputs like any
+        // dataset field: by output name, with their inferred types, in
+        // dataset order (ADR-0033, ADR-0041).
+        let directive = SchemaDirective::PinInferred {
+            pinned_path: "customers.schema.yml".to_string(),
+            transform: transform("flatten: {customer.name: customer_name}"),
+            overrides: SchemaOverrides::none(),
+        };
+        let materialized = from_json_columns(
+            &directive,
+            names(&["id", "customer"]),
+            vec![json_record(1, r#"{"id": 1, "customer": {"name": "Ada"}}"#)],
+        )
+        .expect("bootstrap materializes");
+
+        assert_eq!(
+            materialized.pinned_schema_write.expect("new pin").yaml,
+            "version: 1\n\
+             fields:\n\
+             - name: id\n\
+             \x20 type: int64\n\
+             \x20 nullable: true\n\
+             - name: customer\n\
+             \x20 type: utf8\n\
+             \x20 nullable: true\n\
+             - name: customer_name\n\
+             \x20 type: utf8\n\
+             \x20 nullable: true\n"
+        );
+    }
+
+    #[test]
+    fn a_declared_flatten_output_never_triggers_missing_field_drift() {
+        // A declared flatten output always exists in the post-transform
+        // shape — its values may be all null — so a batch where the path
+        // never yields a value is not missing-field drift (ADR-0041).
+        let directive = transformed_pinned_directive(
+            "version: 1\n\
+             fields:\n\
+             - name: customer\n\
+             \x20 type: utf8\n\
+             - name: customer_name\n\
+             \x20 type: utf8\n",
+            DriftPolicy::Fail,
+            transform("flatten: {customer.name: customer_name}"),
+            SchemaOverrides::none(),
+        );
+        let materialized = from_json_columns(
+            &directive,
+            names(&["customer"]),
+            vec![json_record(1, r#"{"customer": {"vip": true}}"#)],
+        )
+        .expect("an all-null flatten output is not drift");
+        let batch = &materialized.batch;
+
+        assert_eq!(materialized.schema_decision["drift_status"], "none");
+        assert_eq!(batch_field_names(batch), ["customer", "customer_name"]);
+        assert!(strings(batch, 1).is_null(0));
     }
 
     // ---- Test helpers ----
