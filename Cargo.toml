@@ -7,6 +7,9 @@ edition = "2021"
 # The Arrow stack tracks the `duckdb` crate's `arrow ^58` pin (ADR-0030).
 arrow-array = "58.3.0"
 arrow-schema = "58.3.0"
+# Already in the dependency tree via arrow; used for calendar validity and
+# epoch math behind the strict declared-timestamp parsers (ADR-0043).
+chrono = { version = "0.4.45", default-features = false }
 clap = { version = "4.5", features = ["derive"] }
 csv = "1.4.0"
 duckdb = { version = "1.10504", features = ["bundled", "vtab-arrow"] }

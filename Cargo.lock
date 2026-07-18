@@ -673,6 +673,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "assert_cmd",
+ "chrono",
  "clap",
  "csv",
  "duckdb",
