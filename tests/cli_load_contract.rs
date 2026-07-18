@@ -1,6 +1,11 @@
-use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
+use arrow_array::{
+    Array, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray,
+    TimestampMicrosecondArray,
+};
+use arrow_schema::{DataType, TimeUnit};
 use assert_cmd::Command;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::basic::LogicalType;
 use serde_json::Value;
 use std::fs;
 use std::fs::File;
@@ -5959,6 +5964,931 @@ reject_threshold: 2
     assert_eq!(names.value(0), "Ada");
 }
 
+// 2026-07-14T17:00:00Z in epoch microseconds, computed independently with
+// `date -u`. The declared-type tests spell this one instant many ways.
+const DECLARED_INSTANT_MICROS: i64 = 1_784_048_400_000_000;
+
+#[test]
+fn csv_declared_types_land_in_duckdb_with_matching_column_types() {
+    // The ADR-0042 tracer for the DuckDB leg: declared overrides materialize
+    // Arrow Timestamp(us, None) / Timestamp(us, UTC) / Decimal128, and DuckDB
+    // stores them as TIMESTAMP / TIMESTAMPTZ / DECIMAL(10,2). The two
+    // settled_at spellings name the same instant from different offsets, so
+    // they must store equal values (ADR-0043).
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.csv");
+    fs::write(
+        &source_path,
+        "order_id,created_at,settled_at,amount\n\
+         1,2026-07-14 17:00:00,2026-07-14T17:00:00Z,1.2\n\
+         2,2026-07-14T17:00:00.5,2026-07-15T01:00:00+08:00,007.50\n",
+    )
+    .expect("write source csv");
+
+    let database_path = work.path().join("orders.duckdb");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: duckdb
+  path: {}
+dataset: orders
+load_mode: full_refresh
+schema:
+  overrides:
+  - name: created_at
+    type: timestamp
+  - name: settled_at
+    type: timestamptz
+  - name: amount
+    type: decimal(10,2)
+"#,
+            source_path.display(),
+            database_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(&artifacts_dir, "load writes one artifact directory");
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["row_counts"]["written"], 2);
+    // The report prints the declared names exactly as declared, and no
+    // contract version changed.
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(
+        report["schema_decision"]["fields"],
+        serde_json::json!([
+            {"name": "order_id", "type": "int64", "nullable": true},
+            {"name": "created_at", "type": "timestamp", "nullable": true},
+            {"name": "settled_at", "type": "timestamptz", "nullable": true},
+            {"name": "amount", "type": "decimal(10,2)", "nullable": true}
+        ])
+    );
+
+    // DuckDB's own catalog states the destination column types.
+    assert_eq!(
+        duckdb_column_types(&database_path, "orders"),
+        vec![
+            ("order_id".to_string(), "BIGINT".to_string()),
+            ("created_at".to_string(), "TIMESTAMP".to_string()),
+            (
+                "settled_at".to_string(),
+                "TIMESTAMP WITH TIME ZONE".to_string()
+            ),
+            ("amount".to_string(), "DECIMAL(10,2)".to_string()),
+        ]
+    );
+
+    let batch = read_single_duckdb_batch(&database_path, "orders");
+    assert_eq!(batch.num_rows(), 2);
+    let created = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .expect("created_at reads back as microsecond timestamps");
+    assert_eq!(created.value(0), DECLARED_INSTANT_MICROS);
+    assert_eq!(created.value(1), DECLARED_INSTANT_MICROS + 500_000);
+    let settled = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .expect("settled_at reads back as microsecond timestamps");
+    // Different offset spellings of one instant store equal instants.
+    assert_eq!(settled.value(0), DECLARED_INSTANT_MICROS);
+    assert_eq!(settled.value(1), DECLARED_INSTANT_MICROS);
+    let amounts = batch
+        .column(3)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("amount reads back as decimal128");
+    assert_eq!(amounts.value(0), 120); // "1.2" landed as 1.20
+    assert_eq!(amounts.value(1), 750); // "007.50" landed as 7.50
+}
+
+#[test]
+fn jsonl_declared_types_land_in_parquet_with_matching_logical_types() {
+    // The Parquet leg of the ADR-0042 tracer: the file's own logical types
+    // carry the declared semantics — TIMESTAMP(MICROS) split by
+    // isAdjustedToUTC (ADR-0043) and DECIMAL(10,2) (ADR-0044) — and a JSON
+    // integer rescales into the declared decimal.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.jsonl");
+    fs::write(
+        &source_path,
+        "{\"created_at\": \"2026-07-14T17:00:00\", \"settled_at\": \"2026-07-15T01:00:00+08:00\", \"amount\": \"1.2\"}\n\
+         {\"created_at\": null, \"settled_at\": \"2026-07-14T17:00:00Z\", \"amount\": 42}\n",
+    )
+    .expect("write source jsonl");
+
+    let destination_path = work.path().join("orders_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: parquet
+  path: {}
+dataset: orders
+load_mode: full_refresh
+schema:
+  overrides:
+  - name: created_at
+    type: timestamp
+  - name: settled_at
+    type: timestamptz
+  - name: amount
+    type: decimal(10,2)
+"#,
+            source_path.display(),
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(&artifacts_dir, "load writes one artifact directory");
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["row_counts"]["written"], 2);
+
+    let parquet_path = single_parquet_file(&destination_path);
+    let batch = read_single_parquet_batch(&parquet_path);
+    assert_eq!(
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect::<Vec<_>>(),
+        vec![
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            DataType::Decimal128(10, 2),
+        ]
+    );
+
+    // The Parquet file's own logical types carry the declared semantics.
+    let file = File::open(&parquet_path).expect("open parquet file");
+    let metadata = ParquetRecordBatchReaderBuilder::try_new(file)
+        .expect("parquet reader")
+        .metadata()
+        .clone();
+    let columns = metadata.file_metadata().schema_descr().columns();
+    assert!(
+        matches!(
+            columns[0].logical_type_ref(),
+            Some(LogicalType::Timestamp {
+                is_adjusted_to_u_t_c: false,
+                unit: parquet::basic::TimeUnit::MICROS,
+            })
+        ),
+        "created_at logical type: {:?}",
+        columns[0].logical_type_ref()
+    );
+    assert!(
+        matches!(
+            columns[1].logical_type_ref(),
+            Some(LogicalType::Timestamp {
+                is_adjusted_to_u_t_c: true,
+                unit: parquet::basic::TimeUnit::MICROS,
+            })
+        ),
+        "settled_at logical type: {:?}",
+        columns[1].logical_type_ref()
+    );
+    assert!(
+        matches!(
+            columns[2].logical_type_ref(),
+            Some(LogicalType::Decimal {
+                precision: 10,
+                scale: 2,
+            })
+        ),
+        "amount logical type: {:?}",
+        columns[2].logical_type_ref()
+    );
+
+    let created = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .expect("created_at reads back as microsecond timestamps");
+    assert_eq!(created.value(0), DECLARED_INSTANT_MICROS);
+    assert!(created.is_null(1));
+    let settled = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .expect("settled_at reads back as microsecond timestamps");
+    // Both spellings of the one instant store equal instants.
+    assert_eq!(settled.value(0), DECLARED_INSTANT_MICROS);
+    assert_eq!(settled.value(1), DECLARED_INSTANT_MICROS);
+    let amounts = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("amount reads back as decimal128");
+    assert_eq!(amounts.value(0), 120); // "1.2" landed as 1.20
+    assert_eq!(amounts.value(1), 4_200); // the JSON integer 42 rescaled
+}
+
+#[test]
+fn csv_declared_type_misfits_reject_records_naming_the_cause_within_the_threshold() {
+    // The ADR-0043/0044 rejection menu end to end: each misfit becomes one
+    // type_coercion_failed rejected record whose artifact line names the
+    // concrete cause, and the load completes because the definition
+    // tolerates them (reject_threshold, ADR-0020/0036).
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.csv");
+    fs::write(
+        &source_path,
+        "created_at,amount\n\
+         2026-07-14 17:00:00,1.2\n\
+         2026-07-14T17:00:00Z,1\n\
+         2026-07-14,1\n\
+         1784048400,1\n\
+         2026-07-14 17:00:00.1234567,1\n\
+         2026-07-14 17:00:00,1.234\n\
+         2026-07-14 17:00:00,100000000.00\n\
+         2026-07-14 17:00:00,1e3\n\
+         2026-07-14 17:00:00,\"1,000\"\n",
+    )
+    .expect("write source csv");
+
+    let destination_path = work.path().join("orders_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: orders
+load_mode: full_refresh
+reject_threshold: 8
+schema:
+  overrides:
+  - name: created_at
+    type: timestamp
+  - name: amount
+    type: decimal(10,2)
+"#,
+            source_path.display(),
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(&artifacts_dir, "load writes one artifact directory");
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["row_counts"]["source"], 9);
+    assert_eq!(report["row_counts"]["written"], 1);
+    assert_eq!(report["row_counts"]["rejected"], 8);
+
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let rejected_lines = read_rejected_records(&artifact_path);
+    assert_eq!(rejected_lines.len(), 8);
+    for (rejected, line, field, cause_part) in [
+        (&rejected_lines[0], 3, "created_at", "carries a UTC offset"),
+        (&rejected_lines[1], 4, "created_at", "date-only text"),
+        (
+            &rejected_lines[2],
+            5,
+            "created_at",
+            "epoch numbers are not accepted",
+        ),
+        (&rejected_lines[3], 6, "created_at", "more than 6 digits"),
+        (&rejected_lines[4], 7, "amount", "more than scale 2"),
+        (&rejected_lines[5], 8, "amount", "overflows decimal(10,2)"),
+        (&rejected_lines[6], 9, "amount", "exponent notation"),
+        (&rejected_lines[7], 10, "amount", "thousands separators"),
+    ] {
+        assert_eq!(rejected["line"], line, "artifact line for {cause_part:?}");
+        assert_eq!(rejected["code"], "type_coercion_failed");
+        assert_eq!(rejected["field"], field);
+        let message = rejected["message"].as_str().expect("artifact message");
+        assert!(
+            message.contains(cause_part),
+            "message {message:?} misses the cause {cause_part:?}"
+        );
+    }
+
+    // Only the clean record reached the destination.
+    let batch = read_single_parquet_batch(&single_parquet_file(&destination_path));
+    assert_eq!(batch.num_rows(), 1);
+}
+
+#[test]
+fn jsonl_declared_type_misfits_reject_json_shapes_naming_the_cause() {
+    // The JSON-shape half of the rejection menu (ADR-0043/0044): epoch
+    // numbers under a timestamp, an offset-less instant, a JSON float whose
+    // digits were already lost, and an over-precision integer each reject
+    // per record with the cause named.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.jsonl");
+    fs::write(
+        &source_path,
+        "{\"settled_at\": \"2026-07-14T17:00:00Z\", \"amount\": \"1.2\"}\n\
+         {\"settled_at\": 1784048400, \"amount\": \"1.2\"}\n\
+         {\"settled_at\": \"2026-07-14T17:00:00\", \"amount\": \"1.2\"}\n\
+         {\"settled_at\": \"2026-07-14T17:00:00Z\", \"amount\": 1.2}\n\
+         {\"settled_at\": \"2026-07-14T17:00:00Z\", \"amount\": 100000000}\n",
+    )
+    .expect("write source jsonl");
+
+    let destination_path = work.path().join("orders_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: parquet
+  path: {}
+dataset: orders
+load_mode: full_refresh
+reject_threshold: 4
+schema:
+  overrides:
+  - name: settled_at
+    type: timestamptz
+  - name: amount
+    type: decimal(10,2)
+"#,
+            source_path.display(),
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(&artifacts_dir, "load writes one artifact directory");
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["row_counts"]["written"], 1);
+    assert_eq!(report["row_counts"]["rejected"], 4);
+
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let rejected_lines = read_rejected_records(&artifact_path);
+    assert_eq!(rejected_lines.len(), 4);
+    for (rejected, line, field, cause_part) in [
+        (
+            &rejected_lines[0],
+            2,
+            "settled_at",
+            "epoch numbers are not accepted",
+        ),
+        (
+            &rejected_lines[1],
+            3,
+            "settled_at",
+            "missing its mandatory UTC offset",
+        ),
+        (
+            &rejected_lines[2],
+            4,
+            "amount",
+            "JSON floats do not fit a declared decimal",
+        ),
+        (&rejected_lines[3], 5, "amount", "overflows decimal(10,2)"),
+    ] {
+        assert_eq!(rejected["line"], line, "artifact line for {cause_part:?}");
+        assert_eq!(rejected["code"], "type_coercion_failed");
+        assert_eq!(rejected["field"], field);
+        let message = rejected["message"].as_str().expect("artifact message");
+        assert!(
+            message.contains(cause_part),
+            "message {message:?} misses the cause {cause_part:?}"
+        );
+    }
+}
+
+#[test]
+fn declared_type_pin_bootstraps_and_an_omitted_override_fails_as_drift() {
+    // ADR-0042 pinning: the bootstrap pin prints the declared names exactly
+    // as declared under the unchanged pin contract version, and a later load
+    // omitting the overrides fails as drift naming pinned vs effective type
+    // with the missing-override hint — before touching the destination.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.csv");
+    fs::write(
+        &source_path,
+        "created_at,amount,note\n2026-07-14 17:00:00,1.2,a\n",
+    )
+    .expect("write source csv");
+
+    let destination_path = work.path().join("orders_dataset");
+    let pinned_path = work.path().join("orders.schema.yml");
+    let declared_definition = work.path().join("load.yml");
+    fs::write(
+        &declared_definition,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: orders
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+  overrides:
+  - name: created_at
+    type: timestamp
+  - name: amount
+    type: decimal(10,2)
+"#,
+            source_path.display(),
+            destination_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-first"))
+        .arg(&declared_definition)
+        .assert()
+        .success();
+
+    assert_eq!(
+        fs::read_to_string(&pinned_path).expect("pinned schema file persisted"),
+        "version: 1\n\
+         fields:\n\
+         - name: created_at\n\
+         \x20 type: timestamp\n\
+         \x20 nullable: true\n\
+         - name: amount\n\
+         \x20 type: decimal(10,2)\n\
+         \x20 nullable: true\n\
+         - name: note\n\
+         \x20 type: utf8\n\
+         \x20 nullable: true\n"
+    );
+    let (_, first_report) = read_single_report(
+        &work.path().join("artifacts-first"),
+        "bootstrap load writes one artifact directory",
+    );
+    assert_eq!(
+        first_report["schema_decision"]["pinned_schema_persisted"],
+        true
+    );
+
+    // The same source under the same pin, but the definition no longer
+    // declares the types: the pin alone cannot resurrect them.
+    let undeclared_definition = work.path().join("load-undeclared.yml");
+    fs::write(
+        &undeclared_definition,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: orders
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+"#,
+            source_path.display(),
+            destination_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_second = work.path().join("artifacts-second");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_second)
+        .arg(&undeclared_definition)
+        .assert()
+        .failure();
+
+    let (_, second_report) = read_single_report(
+        &artifacts_second,
+        "drift-failed load writes one artifact directory",
+    );
+    assert_eq!(second_report["exit_status"], "failed");
+    assert_eq!(second_report["error_summary"]["code"], "schema_drift");
+    let message = second_report["error_summary"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        message.contains("\"created_at\" is pinned as timestamp but its effective type is utf8"),
+        "message {message:?} misses the created_at drift"
+    );
+    assert!(
+        message.contains("\"amount\" is pinned as decimal(10,2) but its effective type is float64"),
+        "message {message:?} misses the amount drift"
+    );
+    assert!(
+        message.contains("override may be missing"),
+        "message {message:?} misses the hint"
+    );
+    assert_eq!(
+        second_report["schema_decision"]["drift_status"],
+        "failed_on_drift"
+    );
+    assert_eq!(
+        second_report["schema_decision"]["drift"]["undeclared_fields"],
+        serde_json::json!([
+            {"name": "created_at", "pinned_type": "timestamp", "effective_type": "utf8"},
+            {"name": "amount", "pinned_type": "decimal(10,2)", "effective_type": "float64"}
+        ])
+    );
+    // The drift failure preceded destination work: the first load's dataset
+    // is untouched.
+    let batch = read_single_parquet_batch(&single_parquet_file(&destination_path));
+    assert_eq!(batch.num_rows(), 1);
+}
+
+#[test]
+fn declared_type_conflicts_and_malformed_declarations_fail_before_any_write() {
+    // ADR-0042/0044 declaration failures are load failures, never per-record
+    // rejections: a parameter change against the pin is a contradiction
+    // under either drift policy, a malformed declaration fails validation,
+    // and a pin file carrying a malformed type string fails its contract —
+    // all before the destination exists.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.csv");
+    fs::write(&source_path, "amount\n1.2\n").expect("write source csv");
+    let pinned_path = work.path().join("orders.schema.yml");
+    fs::write(
+        &pinned_path,
+        "version: 1\nfields:\n- name: amount\n  type: decimal(10,2)\n",
+    )
+    .expect("write pinned schema");
+
+    let destination_path = work.path().join("orders_dataset");
+    let definition = |schema_block: &str, load_name: &str| {
+        let definition_path = work.path().join(load_name);
+        fs::write(
+            &definition_path,
+            format!(
+                r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: orders
+load_mode: full_refresh
+schema:
+{schema_block}
+"#,
+                source_path.display(),
+                destination_path.display()
+            ),
+        )
+        .expect("write load definition");
+        definition_path
+    };
+
+    // A precision change against the pin contradicts it under both policies.
+    for (index, drift_policy) in ["fail", "allow_additive_nullable"].iter().enumerate() {
+        let definition_path = definition(
+            &format!(
+                "  pinned_path: {}\n\
+                 \x20 drift_policy: {drift_policy}\n\
+                 \x20 overrides:\n\
+                 \x20 - name: amount\n\
+                 \x20   type: decimal(12,2)",
+                pinned_path.display()
+            ),
+            &format!("load-conflict-{index}.yml"),
+        );
+        let artifacts_dir = work.path().join(format!("artifacts-conflict-{index}"));
+        Command::cargo_bin("data-spark")
+            .expect("binary")
+            .current_dir(work.path())
+            .arg("load")
+            .arg("--output-dir")
+            .arg(&artifacts_dir)
+            .arg(&definition_path)
+            .assert()
+            .failure();
+        let (_, report) = read_single_report(
+            &artifacts_dir,
+            "conflict load writes one artifact directory",
+        );
+        assert_eq!(
+            report["error_summary"]["code"], "schema_override_conflict",
+            "under drift_policy {drift_policy}"
+        );
+        let message = report["error_summary"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            message.contains("pinned type decimal(10,2), override type decimal(12,2)"),
+            "message {message:?} misses the parameter contradiction"
+        );
+    }
+
+    // Malformed declarations fail override validation before any read.
+    for (index, malformed_type) in ["decimal", "decimal(39,2)", "decimal(10,11)"]
+        .iter()
+        .enumerate()
+    {
+        let definition_path = definition(
+            &format!(
+                "  overrides:\n\
+                 \x20 - name: amount\n\
+                 \x20   type: {malformed_type}"
+            ),
+            &format!("load-malformed-{index}.yml"),
+        );
+        let artifacts_dir = work.path().join(format!("artifacts-malformed-{index}"));
+        Command::cargo_bin("data-spark")
+            .expect("binary")
+            .current_dir(work.path())
+            .arg("load")
+            .arg("--output-dir")
+            .arg(&artifacts_dir)
+            .arg(&definition_path)
+            .assert()
+            .failure();
+        let (_, report) = read_single_report(
+            &artifacts_dir,
+            "malformed-declaration load writes one artifact directory",
+        );
+        assert_eq!(report["error_summary"]["code"], "unsupported_override_type");
+        let message = report["error_summary"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            message.contains(*malformed_type),
+            "message {message:?} misses the malformed type {malformed_type:?}"
+        );
+    }
+
+    // A hand-edited pin carrying a malformed type string fails its contract.
+    fs::write(
+        &pinned_path,
+        "version: 1\nfields:\n- name: amount\n  type: \"decimal(10, 2)\"\n",
+    )
+    .expect("write malformed pinned schema");
+    let definition_path = definition(
+        &format!("  pinned_path: {}", pinned_path.display()),
+        "load-malformed-pin.yml",
+    );
+    let artifacts_dir = work.path().join("artifacts-malformed-pin");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+    let (_, report) = read_single_report(
+        &artifacts_dir,
+        "malformed-pin load writes one artifact directory",
+    );
+    assert_eq!(report["error_summary"]["code"], "invalid_pinned_schema");
+    assert!(
+        report["error_summary"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("unsupported pinned schema field type: decimal(10, 2)"),
+        "message misses the malformed pin type"
+    );
+
+    // None of the failures created the destination.
+    assert!(
+        !destination_path.exists(),
+        "declaration failures must precede destination writes"
+    );
+}
+
+#[test]
+fn an_added_declared_type_field_is_additive_drift_and_rewrites_the_pin() {
+    // ADR-0042 meets ADR-0034's additive policy: a newly added nullable
+    // declared-type field is legal additive drift — the override shapes it,
+    // the rewritten pin records the declared name, and DuckDB stores the
+    // new column as TIMESTAMPTZ.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("orders.csv");
+    fs::write(&source_path, "order_id\n1\n").expect("write source csv");
+
+    let database_path = work.path().join("orders.duckdb");
+    let pinned_path = work.path().join("orders.schema.yml");
+    let first_definition = work.path().join("load-first.yml");
+    fs::write(
+        &first_definition,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: duckdb
+  path: {}
+dataset: orders
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+"#,
+            source_path.display(),
+            database_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(work.path().join("artifacts-first"))
+        .arg(&first_definition)
+        .assert()
+        .success();
+
+    // The source gains settled_at, declared timestamptz by the second load.
+    fs::write(
+        &source_path,
+        "order_id,settled_at\n2,2026-07-15T01:00:00+08:00\n",
+    )
+    .expect("write extended source csv");
+    let second_definition = work.path().join("load-second.yml");
+    fs::write(
+        &second_definition,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: duckdb
+  path: {}
+dataset: orders
+load_mode: full_refresh
+schema:
+  pinned_path: {}
+  drift_policy: allow_additive_nullable
+  overrides:
+  - name: settled_at
+    type: timestamptz
+"#,
+            source_path.display(),
+            database_path.display(),
+            pinned_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_second = work.path().join("artifacts-second");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_second)
+        .arg(&second_definition)
+        .assert()
+        .success();
+
+    let (_, report) = read_single_report(
+        &artifacts_second,
+        "additive load writes one artifact directory",
+    );
+    assert_eq!(
+        report["schema_decision"]["drift_status"],
+        "additive_fields_added"
+    );
+    assert_eq!(
+        report["schema_decision"]["added_fields"],
+        serde_json::json!([
+            {"name": "settled_at", "type": "timestamptz", "nullable": true}
+        ])
+    );
+    assert_eq!(
+        fs::read_to_string(&pinned_path).expect("rewritten pin"),
+        "version: 1\n\
+         fields:\n\
+         - name: order_id\n\
+         \x20 type: int64\n\
+         \x20 nullable: true\n\
+         - name: settled_at\n\
+         \x20 type: timestamptz\n\
+         \x20 nullable: true\n"
+    );
+    assert_eq!(
+        duckdb_column_types(&database_path, "orders"),
+        vec![
+            ("order_id".to_string(), "BIGINT".to_string()),
+            (
+                "settled_at".to_string(),
+                "TIMESTAMP WITH TIME ZONE".to_string()
+            ),
+        ]
+    );
+    let batch = read_single_duckdb_batch(&database_path, "orders");
+    let settled = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<TimestampMicrosecondArray>()
+        .expect("settled_at reads back as microsecond timestamps");
+    assert_eq!(settled.value(0), DECLARED_INSTANT_MICROS);
+}
+
 struct CliLoadResult {
     stdout: String,
     report_path: PathBuf,
@@ -6123,6 +7053,26 @@ fn single_parquet_file(destination_path: &Path) -> PathBuf {
     let files = parquet_files(destination_path);
     assert_eq!(files.len(), 1, "one parquet data file");
     files[0].clone()
+}
+
+/// The `(column_name, data_type)` rows DuckDB's own catalog states for a
+/// table, in column order — the destination-side truth about stored types.
+fn duckdb_column_types(database_path: &Path, dataset: &str) -> Vec<(String, String)> {
+    let connection = duckdb::Connection::open(database_path).expect("open duckdb database");
+    let mut statement = connection
+        .prepare(
+            "SELECT column_name, data_type FROM information_schema.columns \
+             WHERE table_name = ? ORDER BY ordinal_position",
+        )
+        .expect("prepare duckdb catalog query");
+    let column_types = statement
+        .query_map([dataset], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("query duckdb catalog")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read duckdb catalog rows");
+    column_types
 }
 
 fn read_single_duckdb_batch(database_path: &Path, dataset: &str) -> arrow_array::RecordBatch {
