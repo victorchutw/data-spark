@@ -12,8 +12,9 @@
 //! write, mirroring how pinned schema writes stay with the caller. The
 //! artifact contract (ADR-0036): one JSON object per rejected record, in
 //! source-line order, carrying the line, a rejection code, the offending
-//! field when one is known — its dataset name, with the source field named
-//! alongside when a rename mapping changed it (ADR-0039) — a human-readable
+//! field when one is known — its dataset name, with the source named
+//! alongside when a rename mapping changed it (ADR-0039) or, for a flatten
+//! output, as the declared source path (ADR-0041) — a human-readable
 //! message, and the record content the load could recover.
 
 use serde_json::{json, Value};
@@ -33,9 +34,10 @@ pub(crate) const MISSING_REQUIRED_FIELD: &str = "missing_required_field";
 
 /// One rejected record: the source context and error information a
 /// troubleshooter needs to find and fix the record (issue #8). `field` names
-/// the offending dataset field; `source_field` is set only when a rename
-/// mapping changed that field's name, pointing back at the name the source
-/// carries (ADR-0039). `record` is the record content the load could recover
+/// the offending dataset field; `source_field` points back at the source —
+/// set when a rename mapping changed that field's name (ADR-0039), and, for
+/// a flatten output, carrying the declared source path as written
+/// (ADR-0041). `record` is the record content the load could recover
 /// — the parsed record as a JSON object under its source names, the raw line
 /// text for an unparseable JSONL line, or JSON null when nothing could be
 /// recovered.

@@ -13,8 +13,8 @@ mod rejection;
 mod schema;
 
 use connector::{
-    destination_connector, source_connector, DestinationWrite, DestinationWriteFacts, LoadMode,
-    SourceRead,
+    destination_connector, resolved_source_format, source_connector, DestinationWrite,
+    DestinationWriteFacts, LoadMode, SourceRead,
 };
 
 const LOAD_REPORT_VERSION: u8 = 1;
@@ -199,8 +199,8 @@ struct LoadDefinition {
     dataset: Option<String>,
     load_mode: Option<String>,
     /// The structural transform applied before schema pinning, validation,
-    /// and destination writing: field selection, then rename mapping
-    /// (ADR-0039, ADR-0040).
+    /// and destination writing: flatten mapping, field selection, then
+    /// rename mapping (ADR-0039, ADR-0040, ADR-0041).
     transform: Option<schema::TransformConfig>,
     schema: Option<SchemaConfig>,
     artifacts: Option<ArtifactsConfig>,
@@ -570,8 +570,11 @@ fn execute_supported_load(
     let source_port = source_connector(source)?;
     let destination_port = destination_connector(destination, definition.dataset.as_deref())?;
     destination_port.validate_mode(mode)?;
-    let directive =
-        resolve_schema_directive(definition.schema.as_ref(), definition.transform.as_ref())?;
+    let directive = resolve_schema_directive(
+        definition.schema.as_ref(),
+        definition.transform.as_ref(),
+        &resolved_source_format(&source.path, source.format.as_deref()),
+    )?;
 
     let reject_threshold = definition.reject_threshold.unwrap_or(0);
     let SourceRead {
@@ -667,14 +670,20 @@ fn execute_supported_load(
 /// overrides. The transform validates first — it precedes overrides and
 /// pinning in the meaning order — and, like override validation, before any
 /// pinned schema file is read, so a broken definition never silently
-/// bootstraps a pin (ADR-0040).
+/// bootstraps a pin (ADR-0040). `source_format` is the resolved source
+/// format, which transform validation checks against `transform.flatten`'s
+/// JSONL requirement (ADR-0041) — a config-time failure, before the pin or
+/// any file is read.
 fn resolve_schema_directive(
     schema_config: Option<&SchemaConfig>,
     transform_config: Option<&schema::TransformConfig>,
+    source_format: &str,
 ) -> Result<schema::SchemaDirective, LoadFailure> {
     let transform = match transform_config {
         None => schema::SchemaTransform::none(),
-        Some(transform_config) => schema::SchemaTransform::from_config(transform_config)?,
+        Some(transform_config) => {
+            schema::SchemaTransform::from_config(transform_config, source_format)?
+        }
     };
     let Some(schema_config) = schema_config else {
         return Ok(schema::SchemaDirective::Inferred {
@@ -1231,7 +1240,7 @@ mod tests {
     #[test]
     fn resolve_schema_directive_defaults_to_inference_without_a_schema_block() {
         assert!(matches!(
-            resolve_schema_directive(None, None),
+            resolve_schema_directive(None, None, "csv"),
             Ok(schema::SchemaDirective::Inferred { .. })
         ));
     }
@@ -1261,7 +1270,7 @@ mod tests {
                 "schema.overrides must declare at least one override",
             ),
         ] {
-            let error = resolve_schema_directive(Some(&config), None)
+            let error = resolve_schema_directive(Some(&config), None, "csv")
                 .err()
                 .expect("underspecified schema block rejected");
             assert_eq!(error.code, "invalid_schema_config");
@@ -1280,7 +1289,9 @@ mod tests {
         let mut config = schema_config(None, None);
         config.overrides = overrides_yaml("- name: id\n  type: int64\n");
 
-        match resolve_schema_directive(Some(&config), None).expect("standalone overrides resolve") {
+        match resolve_schema_directive(Some(&config), None, "csv")
+            .expect("standalone overrides resolve")
+        {
             schema::SchemaDirective::Inferred { overrides, .. } => assert!(!overrides.is_empty()),
             _ => panic!("expected the Inferred directive"),
         }
@@ -1294,7 +1305,7 @@ mod tests {
         config.overrides = overrides_yaml("- name: id\n  nullable: false\n");
 
         // Absent pin file: the bootstrap directive carries the overrides.
-        match resolve_schema_directive(Some(&config), None).expect("absent pin bootstraps") {
+        match resolve_schema_directive(Some(&config), None, "csv").expect("absent pin bootstraps") {
             schema::SchemaDirective::PinInferred { overrides, .. } => {
                 assert!(!overrides.is_empty())
             }
@@ -1307,7 +1318,7 @@ mod tests {
             "version: 1\nfields:\n- name: id\n  type: int64\n",
         )
         .expect("write pin");
-        match resolve_schema_directive(Some(&config), None).expect("existing pin loads") {
+        match resolve_schema_directive(Some(&config), None, "csv").expect("existing pin loads") {
             schema::SchemaDirective::Pinned { overrides, .. } => assert!(!overrides.is_empty()),
             _ => panic!("expected the Pinned directive"),
         }
@@ -1338,7 +1349,7 @@ mod tests {
         ] {
             let mut config = schema_config(Some("/does/not/exist.schema.yml"), None);
             config.overrides = overrides_yaml(overrides);
-            let error = resolve_schema_directive(Some(&config), None)
+            let error = resolve_schema_directive(Some(&config), None, "csv")
                 .err()
                 .expect("invalid overrides rejected");
             assert_eq!(error.code, expected_code, "code for {overrides:?}");
@@ -1363,6 +1374,8 @@ mod tests {
             "version: 1\ntransform:\n  select: [id, total]\n",
             "version: 1\ntransform:\n  rename:\n    id: customer_id\n",
             "version: 1\ntransform:\n  select: [id]\n  rename:\n    id: customer_id\n",
+            "version: 1\ntransform:\n  flatten:\n    customer.name: customer_name\n",
+            "version: 1\ntransform:\n  flatten:\n    customer.name: customer_name\n  select: [customer_name]\n",
             "version: 1\ntransform: {}\n",
         ] {
             let definition = serde_yaml::from_str::<LoadDefinition>(yaml)
@@ -1389,6 +1402,22 @@ mod tests {
     }
 
     #[test]
+    fn load_definition_rejects_duplicate_flatten_keys_at_parse_time() {
+        // A duplicate flatten path is a YAML parse failure, exactly like a
+        // duplicate rename key (ADR-0041).
+        let error = serde_yaml::from_str::<LoadDefinition>(
+            "version: 1\ntransform:\n  flatten:\n    customer.name: a\n    customer.name: b\n",
+        )
+        .expect_err("duplicate flatten keys rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate transform.flatten key \"customer.name\""),
+            "message {error:?} misses the duplicate key"
+        );
+    }
+
+    #[test]
     fn resolve_schema_directive_rejects_invalid_transform_configs_before_reading_the_pin() {
         // The transform config failure matrix (ADR-0039), one case each. The
         // pin path does not exist: transform validation must fail instead of
@@ -1396,7 +1425,7 @@ mod tests {
         for (transform, expected_message_part) in [
             (
                 "{}",
-                "a transform block must set transform.select or transform.rename",
+                "a transform block must set transform.flatten, transform.select, or transform.rename",
             ),
             (
                 "select: []",
@@ -1432,9 +1461,44 @@ mod tests {
                 "rename: {id: \"   \"}",
                 "transform.rename target for field \"id\" must not be empty",
             ),
+            ("flatten: {}", "transform.flatten must map at least one path"),
+            (
+                "flatten: {customer: name}",
+                "transform.flatten path \"customer\" must have at least two dot-separated segments",
+            ),
+            (
+                "flatten: {customer..name: contact}",
+                "transform.flatten path \"customer..name\" must not contain empty segments",
+            ),
+            (
+                "flatten: {.name: contact}",
+                "transform.flatten path \".name\" must not contain empty segments",
+            ),
+            (
+                "flatten: {customer.name: \"   \"}",
+                "transform.flatten output name for path \"customer.name\" must not be empty",
+            ),
+            (
+                "flatten: {customer.name: contact, customer.email: contact}",
+                "transform.flatten maps more than one path to \"contact\"",
+            ),
+            (
+                "flatten: {customer.name: contact}\nrename: {id: contact}",
+                "transform.flatten and transform.rename map more than one field \
+                 to the dataset name \"contact\"",
+            ),
+            (
+                "flatten: {customer.name: contact}\nselect: [id]",
+                "transform.flatten output \"contact\" is not in transform.select",
+            ),
+            (
+                "flatten: {customer.name: contact}\nselect: [id, contact]\nrename: {id: contact}",
+                "transform.select and transform.rename map more than one field \
+                 to the dataset name \"contact\"",
+            ),
         ] {
             let config = schema_config(Some("/does/not/exist.schema.yml"), None);
-            let error = resolve_schema_directive(Some(&config), Some(&transform_yaml(transform)))
+            let error = resolve_schema_directive(Some(&config), Some(&transform_yaml(transform)), "jsonl")
                 .err()
                 .expect("invalid transform rejected");
             assert_eq!(
@@ -1450,14 +1514,35 @@ mod tests {
     }
 
     #[test]
+    fn resolve_schema_directive_rejects_flatten_on_a_csv_source() {
+        // transform.flatten requires a JSONL source: CSV cells hold no
+        // addressable structure, so the declaration is a config-time failure
+        // before the pin or any file is read (ADR-0041). The same block
+        // resolves under the JSONL format.
+        let flatten = transform_yaml("flatten: {customer.name: contact}");
+        let error = resolve_schema_directive(None, Some(&flatten), "csv")
+            .err()
+            .expect("flatten on csv rejected");
+        assert_eq!(error.code, "invalid_transform_config");
+        assert_eq!(
+            error.message,
+            "transform.flatten requires a JSONL source format; \
+             the resolved source format is csv"
+        );
+
+        resolve_schema_directive(None, Some(&flatten), "jsonl").expect("flatten on jsonl resolves");
+    }
+
+    #[test]
     fn resolve_schema_directive_validates_the_transform_before_the_schema_block() {
         // Both blocks are broken: the transform precedes overrides and
         // pinning in the meaning order, so its config failure wins.
         let mut config = schema_config(None, None);
         config.overrides = Some(Vec::new());
-        let error = resolve_schema_directive(Some(&config), Some(&transform_yaml("select: []")))
-            .err()
-            .expect("invalid transform rejected");
+        let error =
+            resolve_schema_directive(Some(&config), Some(&transform_yaml("select: []")), "jsonl")
+                .err()
+                .expect("invalid transform rejected");
         assert_eq!(error.code, "invalid_transform_config");
     }
 
@@ -1468,14 +1553,16 @@ mod tests {
         let transform = transform_yaml("select: [id]");
 
         // No schema block: a plain inference directive with the transform.
-        match resolve_schema_directive(None, Some(&transform)).expect("transform-only resolves") {
+        match resolve_schema_directive(None, Some(&transform), "jsonl")
+            .expect("transform-only resolves")
+        {
             schema::SchemaDirective::Inferred { transform, .. } => assert!(!transform.is_empty()),
             _ => panic!("expected the Inferred directive"),
         }
 
         // Absent pin file: the bootstrap directive carries the transform.
         let config = schema_config(Some(pinned_path.to_str().expect("utf8 path")), None);
-        match resolve_schema_directive(Some(&config), Some(&transform))
+        match resolve_schema_directive(Some(&config), Some(&transform), "jsonl")
             .expect("absent pin bootstraps")
         {
             schema::SchemaDirective::PinInferred { transform, .. } => {
@@ -1490,7 +1577,8 @@ mod tests {
             "version: 1\nfields:\n- name: id\n  type: int64\n",
         )
         .expect("write pin");
-        match resolve_schema_directive(Some(&config), Some(&transform)).expect("existing pin loads")
+        match resolve_schema_directive(Some(&config), Some(&transform), "jsonl")
+            .expect("existing pin loads")
         {
             schema::SchemaDirective::Pinned { transform, .. } => assert!(!transform.is_empty()),
             _ => panic!("expected the Pinned directive"),
@@ -1502,7 +1590,7 @@ mod tests {
         // The pin path does not exist: an unknown policy must fail instead of
         // silently bootstrapping.
         let config = schema_config(Some("/does/not/exist.schema.yml"), Some("relaxed"));
-        let error = resolve_schema_directive(Some(&config), None)
+        let error = resolve_schema_directive(Some(&config), None, "csv")
             .err()
             .expect("unknown drift policy rejected");
         assert_eq!(error.code, "unsupported_drift_policy");
@@ -1512,7 +1600,7 @@ mod tests {
     #[test]
     fn resolve_schema_directive_bootstraps_when_the_pin_file_is_absent() {
         let config = schema_config(Some("/does/not/exist/customers.schema.yml"), Some("fail"));
-        match resolve_schema_directive(Some(&config), None).expect("absent pin bootstraps") {
+        match resolve_schema_directive(Some(&config), None, "csv").expect("absent pin bootstraps") {
             schema::SchemaDirective::PinInferred { pinned_path, .. } => {
                 assert_eq!(pinned_path, "/does/not/exist/customers.schema.yml");
             }
@@ -1561,7 +1649,7 @@ mod tests {
         .expect("write pin");
         let config = schema_config(Some(pinned_path.to_str().expect("utf8 path")), None);
 
-        let error = resolve_schema_directive(Some(&config), None)
+        let error = resolve_schema_directive(Some(&config), None, "csv")
             .err()
             .expect("invalid pin rejected");
         assert_eq!(error.code, "invalid_pinned_schema");
@@ -1584,7 +1672,7 @@ mod tests {
             Some("allow_additive_nullable"),
         );
 
-        match resolve_schema_directive(Some(&config), None).expect("existing pin loads") {
+        match resolve_schema_directive(Some(&config), None, "csv").expect("existing pin loads") {
             schema::SchemaDirective::Pinned {
                 pinned_path: reported_path,
                 drift_policy: schema::DriftPolicy::AllowAdditiveNullable,
