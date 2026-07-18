@@ -200,6 +200,22 @@ _Avoid_: Temp file, intermediate file, upload
 A dataset schema produced from observed source records.
 _Avoid_: Auto schema, detected schema
 
+**Declared Type**:
+A dataset field type that enters a schema only through explicit declaration, never through inference.
+_Avoid_: Logical type, manual type, special type
+
+**Wall-Clock Timestamp**:
+A datetime that states what a clock read, without identifying a timezone or an absolute moment.
+_Avoid_: Naive datetime, local timestamp, timestamp without time zone
+
+**Instant Timestamp**:
+A timestamp that identifies one absolute moment, normalized to UTC.
+_Avoid_: Zoned datetime, epoch time, absolute timestamp
+
+**Decimal**:
+An exact numeric value with a declared precision and scale that is never rounded during a load.
+_Avoid_: Float, numeric, money
+
 **Schema Override**:
 User-provided changes to an inferred schema before records are loaded.
 _Avoid_: Manual schema, schema mapping

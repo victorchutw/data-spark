@@ -21,6 +21,15 @@
 //! an existing pinned field fails it as `schema_override_conflict` before
 //! drift comparison. Overridden fields validate per record exactly like
 //! pinned fields.
+//! Three field types are declared-only ([`FieldType`], ADR-0042): the two
+//! timestamps split by offset discipline (ADR-0043) and the parameterized
+//! decimal (ADR-0044) enter a schema only through overrides and the pins a
+//! declared load bootstraps — never inference, whose lattice they extend
+//! without touching. Their per-value fit is parse-based instead of
+//! lattice-based, their rejections name the concrete cause, and a pinned
+//! declared-type field without its re-declaring override fails the load as
+//! `schema_drift`, because the load definition stays the declaration of
+//! record.
 //! A load definition may also declare a structural transform
 //! ([`SchemaTransform`], ADR-0039, ADR-0041): the flatten mapping evaluates
 //! first, against the observed source shape, adding one path-extracted
