@@ -48,8 +48,8 @@ use crate::connector::DestinationWriteFacts;
 use crate::rejection::{self, RejectedRecord};
 use crate::{ExecutionFailure, LoadFailure};
 use arrow_array::builder::{BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::{DataType, Field, Schema};
+use arrow_array::{ArrayRef, Decimal128Array, RecordBatch, TimestampMicrosecondArray};
+use arrow_schema::{DataType, Field, Schema, TimeUnit};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -163,6 +163,7 @@ impl SchemaDirective {
 /// The rule that decides whether a load may continue when schema drift is
 /// detected against a pinned schema: fail fast by default, or allow additive
 /// nullable drift when the load definition explicitly permits it (ADR-0007).
+#[derive(Clone, Copy)]
 pub(crate) enum DriftPolicy {
     Fail,
     AllowAdditiveNullable,
@@ -192,7 +193,7 @@ pub(crate) struct SchemaOverrides {
 /// replaces — at least one of them is set.
 struct FieldOverride {
     name: String,
-    field_type: Option<InferredType>,
+    field_type: Option<FieldType>,
     nullable: Option<bool>,
 }
 
@@ -736,6 +737,71 @@ enum InferredType {
     Utf8,
 }
 
+/// A dataset field type: the vocabulary schema overrides, pinned schema
+/// files, and schema decisions name, and the type a materialized column is
+/// built as. The four inference-reachable types mirror the observation
+/// lattice one-to-one; the declared-only logical types (ADR-0042) — the two
+/// timestamps split by offset discipline (ADR-0043) and the parameterized
+/// decimal (ADR-0044) — enter a schema only through explicit declaration,
+/// never inference, so they extend this vocabulary while [`InferredType`]
+/// and its merge lattice stay untouched.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FieldType {
+    Boolean,
+    Int64,
+    Float64,
+    Utf8,
+    Timestamp,
+    Timestamptz,
+    Decimal { precision: u8, scale: u8 },
+}
+
+impl FieldType {
+    fn data_type(self) -> DataType {
+        match self {
+            FieldType::Boolean => DataType::Boolean,
+            FieldType::Int64 => DataType::Int64,
+            FieldType::Float64 => DataType::Float64,
+            FieldType::Utf8 => DataType::Utf8,
+            FieldType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
+            FieldType::Timestamptz => {
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+            }
+            FieldType::Decimal { precision, scale } => DataType::Decimal128(precision, scale as i8),
+        }
+    }
+
+    /// The stable name this type carries in schema decisions, pinned schema
+    /// files, and failure messages: byte-identical to the accepted
+    /// declaration, so a report or pin file prints a declared type exactly as
+    /// it was written (ADR-0042).
+    fn name(self) -> String {
+        match self {
+            FieldType::Boolean => "boolean".to_string(),
+            FieldType::Int64 => "int64".to_string(),
+            FieldType::Float64 => "float64".to_string(),
+            FieldType::Utf8 => "utf8".to_string(),
+            FieldType::Timestamp => "timestamp".to_string(),
+            FieldType::Timestamptz => "timestamptz".to_string(),
+            FieldType::Decimal { precision, scale } => format!("decimal({precision},{scale})"),
+        }
+    }
+
+    /// The observation-lattice type this field type corresponds to, for the
+    /// four inference-reachable types. The declared-only types have no
+    /// lattice image — no widening involves them in either direction
+    /// (ADR-0042) — so their value-level fit is parse-based instead.
+    fn lattice_type(self) -> Option<InferredType> {
+        match self {
+            FieldType::Boolean => Some(InferredType::Boolean),
+            FieldType::Int64 => Some(InferredType::Int64),
+            FieldType::Float64 => Some(InferredType::Float64),
+            FieldType::Utf8 => Some(InferredType::Utf8),
+            FieldType::Timestamp | FieldType::Timestamptz | FieldType::Decimal { .. } => None,
+        }
+    }
+}
+
 /// A pinned schema: the dataset schema a load definition reuses across loads to
 /// keep a BI-ready dataset stable (ADR-0033). Parsed from and serialized to the
 /// versioned YAML pinned schema file named by `schema.pinned_path`.
@@ -749,7 +815,7 @@ pub(crate) struct PinnedSchema {
 #[derive(Debug, PartialEq)]
 struct PinnedField {
     name: String,
-    field_type: InferredType,
+    field_type: FieldType,
     nullable: bool,
 }
 
@@ -839,7 +905,7 @@ impl PinnedSchema {
                     .iter()
                     .map(|field| PinnedFieldFile {
                         name: field.name.clone(),
-                        field_type: data_type_name(&field.field_type.data_type()).to_string(),
+                        field_type: field.field_type.name(),
                         nullable: Some(field.nullable),
                     })
                     .collect(),
@@ -856,14 +922,44 @@ fn invalid_pinned_schema(message: String) -> LoadFailure {
     }
 }
 
-fn parse_type_name(name: &str) -> Option<InferredType> {
+fn parse_type_name(name: &str) -> Option<FieldType> {
     match name {
-        "boolean" => Some(InferredType::Boolean),
-        "int64" => Some(InferredType::Int64),
-        "float64" => Some(InferredType::Float64),
-        "utf8" => Some(InferredType::Utf8),
-        _ => None,
+        "boolean" => Some(FieldType::Boolean),
+        "int64" => Some(FieldType::Int64),
+        "float64" => Some(FieldType::Float64),
+        "utf8" => Some(FieldType::Utf8),
+        "timestamp" => Some(FieldType::Timestamp),
+        "timestamptz" => Some(FieldType::Timestamptz),
+        _ => parse_decimal_type_name(name),
     }
+}
+
+/// Parses the canonical `decimal(p,s)` spelling — both parameters mandatory,
+/// no spaces, no signs, no leading zeros — with `1 <= p <= 38` and
+/// `0 <= s <= p` (ADR-0044). Only the canonical spelling is accepted so the
+/// name a report or pin file prints back is byte-identical to the accepted
+/// declaration.
+fn parse_decimal_type_name(name: &str) -> Option<FieldType> {
+    let parameters = name.strip_prefix("decimal(")?.strip_suffix(')')?;
+    let (precision_text, scale_text) = parameters.split_once(',')?;
+    let precision = parse_canonical_u8(precision_text)?;
+    let scale = parse_canonical_u8(scale_text)?;
+    if !(1..=38).contains(&precision) || scale > precision {
+        return None;
+    }
+    Some(FieldType::Decimal { precision, scale })
+}
+
+/// Parses a `decimal(p,s)` parameter written canonically: ASCII digits only,
+/// with no leading zero unless the parameter is `0` itself.
+fn parse_canonical_u8(text: &str) -> Option<u8> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if text.len() > 1 && text.starts_with('0') {
+        return None;
+    }
+    text.parse().ok()
 }
 
 /// Materializes CSV columns, whose cells arrive untyped as text and are typed
@@ -947,6 +1043,9 @@ fn text_materialization(
             check_override_conflicts(pinned_path, pin, overrides)?;
             let ShapeMatch { matched, added } =
                 match_shape(pinned_path, pin, drift_policy, &columns)?;
+            check_declared_type_overrides(pinned_path, pin, &matched, overrides, || {
+                observe_text_types(field_names.len(), &records)
+            })?;
             let mut checks = pinned_checks(&matched);
             checks.extend(override_checks(overrides, added.iter()));
             let (survivors, rejected) = partition_text(records, &checks, &field_names);
@@ -992,6 +1091,9 @@ fn json_materialization(
             check_override_conflicts(pinned_path, pin, overrides)?;
             let ShapeMatch { matched, added } =
                 match_shape(pinned_path, pin, drift_policy, &columns)?;
+            check_declared_type_overrides(pinned_path, pin, &matched, overrides, || {
+                observe_json_types(&field_names, &columns, &records)
+            })?;
             let mut checks = pinned_checks(&matched);
             checks.extend(override_checks(overrides, added.iter()));
             let (survivors, rejected) = partition_json(records, &checks);
@@ -1418,7 +1520,7 @@ fn pre_materialization_failure(failure: LoadFailure, decision: Value) -> Executi
 struct PlannedField {
     name: String,
     source: SourceAddress,
-    materialized_type: InferredType,
+    materialized_type: FieldType,
     nullable: bool,
     observed_index: usize,
 }
@@ -1454,7 +1556,7 @@ fn inferred_plan(
                 source: column.source.clone(),
                 materialized_type: override_
                     .and_then(|override_| override_.field_type)
-                    .unwrap_or_else(|| default_null_to_text(observed_types[column.observed_index])),
+                    .unwrap_or_else(|| observed_types[column.observed_index].field_type()),
                 nullable: override_
                     .and_then(|override_| override_.nullable)
                     .unwrap_or(true),
@@ -1584,7 +1686,7 @@ struct FieldCheck {
     name: String,
     source: SourceAddress,
     observed_index: usize,
-    expected_type: Option<(InferredType, TypeOrigin)>,
+    expected_type: Option<(FieldType, TypeOrigin)>,
     required: bool,
 }
 
@@ -1718,13 +1820,14 @@ fn validate_text_record(
             }
             Some(value) => {
                 if let Some((expected_type, origin)) = check.expected_type {
-                    if !fits_expected_type(infer_text_type(value), expected_type) {
+                    if !text_value_fits(value, expected_type) {
                         return Some(type_rejection(
                             record.line,
                             check,
                             expected_type,
                             origin,
                             json!(value),
+                            text_misfit_cause(value, expected_type),
                             text_record_json(field_names, &record.cells),
                         ));
                     }
@@ -1753,13 +1856,14 @@ fn validate_json_record(record: &JsonRecord, checks: &[FieldCheck]) -> Option<Re
             }
             Some(value) => {
                 if let Some((expected_type, origin)) = check.expected_type {
-                    if !fits_expected_type(infer_json_type(value), expected_type) {
+                    if !json_value_fits(value, expected_type) {
                         return Some(type_rejection(
                             record.line,
                             check,
                             expected_type,
                             origin,
                             value.clone(),
+                            json_misfit_cause(value, expected_type),
                             Value::Object(record.object.clone()),
                         ));
                     }
@@ -1770,12 +1874,192 @@ fn validate_json_record(record: &JsonRecord, checks: &[FieldCheck]) -> Option<Re
     None
 }
 
-/// A value fits a pinned or overridden field iff its observed type widens to
-/// the expected type under the inference lattice — the per-cell restriction
-/// of the ADR-0034 column rule (ADR-0035, ADR-0038). Building a surviving
-/// record's cell with its expected type can then never fail per value.
-fn fits_expected_type(observed: InferredType, expected: InferredType) -> bool {
-    observed.merge(expected) == expected
+/// A value fits a pinned or overridden lattice-typed field iff its observed
+/// type widens to the expected type under the inference lattice — the
+/// per-cell restriction of the ADR-0034 column rule (ADR-0035, ADR-0038).
+/// The declared-only types have no lattice image, so no observation ever
+/// fits them here — their fit is parse-based on the value itself
+/// ([`text_value_fits`], [`json_value_fits`], ADR-0042). Building a
+/// surviving record's cell with its expected type can then never fail per
+/// value.
+fn fits_expected_type(observed: InferredType, expected: FieldType) -> bool {
+    match expected.lattice_type() {
+        Some(lattice_expected) => observed.merge(lattice_expected) == lattice_expected,
+        None => false,
+    }
+}
+
+/// Whether a CSV cell fits an expected type: lattice-typed fields by
+/// observation widening, declared-type fields by parsing the text itself
+/// under the strict menus (ADR-0043, ADR-0044).
+fn text_value_fits(value: &str, expected: FieldType) -> bool {
+    match expected {
+        FieldType::Timestamp => parse_timestamp_micros(value).is_some(),
+        FieldType::Timestamptz => parse_timestamptz_micros(value).is_some(),
+        FieldType::Decimal { precision, scale } => {
+            parse_decimal_scaled(value, precision, scale).is_some()
+        }
+        _ => fits_expected_type(infer_text_type(value), expected),
+    }
+}
+
+/// Whether a JSONL value fits an expected type. Only JSON strings can spell
+/// a timestamp — numbers would be epoch guessing (ADR-0043) — and a decimal
+/// takes strings and integers, whose exact digits survive, but never floats,
+/// whose digits were already lost to IEEE parsing (ADR-0044).
+fn json_value_fits(value: &Value, expected: FieldType) -> bool {
+    match expected {
+        FieldType::Timestamp => {
+            matches!(value, Value::String(text) if parse_timestamp_micros(text).is_some())
+        }
+        FieldType::Timestamptz => {
+            matches!(value, Value::String(text) if parse_timestamptz_micros(text).is_some())
+        }
+        FieldType::Decimal { precision, scale } => match value {
+            Value::String(text) => parse_decimal_scaled(text, precision, scale).is_some(),
+            Value::Number(number) => json_integer(number).is_some_and(|integer| {
+                rescale_decimal_integer(integer, precision, scale).is_some()
+            }),
+            _ => false,
+        },
+        _ => fits_expected_type(infer_json_type(value), expected),
+    }
+}
+
+/// The exact integer a JSON number spells, when it spells one: floats return
+/// `None` — their exact digits were already lost to IEEE parsing before this
+/// load saw them (ADR-0044).
+fn json_integer(number: &serde_json::Number) -> Option<i128> {
+    if let Some(value) = number.as_i64() {
+        Some(i128::from(value))
+    } else {
+        number.as_u64().map(i128::from)
+    }
+}
+
+/// Names the concrete cause a CSV cell missed a declared type, appended to
+/// its `type_coercion_failed` message (ADR-0043, ADR-0044). Lattice-typed
+/// misfits keep their established wording and carry no cause.
+fn text_misfit_cause(value: &str, expected: FieldType) -> Option<String> {
+    match expected {
+        FieldType::Timestamp => Some(if parse_timestamptz_micros(value).is_some() {
+            "the text carries a UTC offset, which wall-clock timestamp text must not".to_string()
+        } else {
+            clock_misfit_cause(value)
+        }),
+        FieldType::Timestamptz => Some(if parse_timestamp_micros(value).is_some() {
+            "the text is missing its mandatory UTC offset (Z or ±hh:mm)".to_string()
+        } else {
+            clock_misfit_cause(value)
+        }),
+        FieldType::Decimal { precision, scale } => {
+            Some(decimal_misfit_cause(value, precision, scale))
+        }
+        _ => None,
+    }
+}
+
+/// The clock-menu causes shared by both timestamp types, probed from the
+/// rejection menu of ADR-0043: epoch numbers, date-only text, an
+/// over-length fraction, then the generic menu wording.
+fn clock_misfit_cause(value: &str) -> String {
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return "epoch numbers are not accepted as timestamp text".to_string();
+    }
+    if parse_timestamp_micros(&format!("{value} 00:00:00")).is_some() {
+        return "date-only text has no time part".to_string();
+    }
+    let bytes = value.as_bytes();
+    if bytes.get(19) == Some(&b'.')
+        && bytes[20..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count()
+            > 6
+        && parse_timestamp_micros(&value[..19]).is_some()
+    {
+        return "the fraction has more than 6 digits, which never truncate".to_string();
+    }
+    "the text does not match YYYY-MM-DD HH:MM:SS with an optional fraction of 1 to 6 digits"
+        .to_string()
+}
+
+/// The decimal-text causes, probed from the rejection menu of ADR-0044:
+/// exponent notation, thousands separators, then — for text that is plain
+/// decimal syntax — the over-scale and precision-overflow rules.
+fn decimal_misfit_cause(value: &str, precision: u8, scale: u8) -> String {
+    if let Some((_, _, fraction_digits)) = split_plain_decimal(value) {
+        if fraction_digits.len() > usize::from(scale) {
+            return format!(
+                "the value has {} fractional digits, more than scale {scale} allows; \
+                 values are never rounded",
+                fraction_digits.len()
+            );
+        }
+        return decimal_overflow_cause(precision, scale);
+    }
+    if value.contains(['e', 'E']) && value.parse::<f64>().is_ok() {
+        return "exponent notation is not accepted as decimal text".to_string();
+    }
+    if value.contains(',') && split_plain_decimal(&value.replace(',', "")).is_some() {
+        return "thousands separators are not accepted as decimal text".to_string();
+    }
+    "the text is not plain decimal digits with an optional sign and decimal point".to_string()
+}
+
+fn decimal_overflow_cause(precision: u8, scale: u8) -> String {
+    format!(
+        "the value overflows decimal({precision},{scale}): \
+         the integer part allows at most {} digits",
+        precision - scale
+    )
+}
+
+/// Names the concrete cause a JSONL value missed a declared type; see
+/// [`text_misfit_cause`].
+fn json_misfit_cause(value: &Value, expected: FieldType) -> Option<String> {
+    match expected {
+        FieldType::Timestamp | FieldType::Timestamptz => Some(match value {
+            Value::String(text) => text_misfit_cause(text, expected)?,
+            Value::Number(_) => format!(
+                "JSON numbers do not fit a declared {} field: \
+                 epoch numbers are not accepted",
+                expected.name()
+            ),
+            other => format!(
+                "JSON {} values do not fit a declared {} field; \
+                 only JSON strings parse as timestamps",
+                json_kind(other),
+                expected.name()
+            ),
+        }),
+        FieldType::Decimal { precision, scale } => Some(match value {
+            Value::String(text) => decimal_misfit_cause(text, precision, scale),
+            Value::Number(number) => match json_integer(number) {
+                Some(_) => decimal_overflow_cause(precision, scale),
+                None => "JSON floats do not fit a declared decimal field: \
+                         their exact digits were already lost to IEEE parsing"
+                    .to_string(),
+            },
+            other => format!(
+                "JSON {} values do not fit a declared decimal field; \
+                 only JSON strings and integers fit",
+                json_kind(other)
+            ),
+        }),
+        _ => None,
+    }
+}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 fn required_field_rejection(line: u64, check: &FieldCheck, record: Value) -> RejectedRecord {
@@ -1792,18 +2076,20 @@ fn required_field_rejection(line: u64, check: &FieldCheck, record: Value) -> Rej
 fn type_rejection(
     line: u64,
     check: &FieldCheck,
-    expected_type: InferredType,
+    expected_type: FieldType,
     origin: TypeOrigin,
     value: Value,
+    cause: Option<String>,
     record: Value,
 ) -> RejectedRecord {
+    let cause_suffix = cause.map(|cause| format!(": {cause}")).unwrap_or_default();
     RejectedRecord {
         line,
         code: rejection::TYPE_COERCION_FAILED,
         field: Some(check.name.clone()),
         source_field: check.source_field(),
         message: format!(
-            "value {value} does not fit {} type {} for field {:?}",
+            "value {value} does not fit {} type {} for field {:?}{cause_suffix}",
             origin.wording(),
             expected_type.name(),
             check.name
@@ -1848,7 +2134,7 @@ fn planned_added_fields(
             PlannedField {
                 materialized_type: override_
                     .and_then(|override_| override_.field_type)
-                    .unwrap_or_else(|| default_null_to_text(survivor_types[column.observed_index])),
+                    .unwrap_or_else(|| survivor_types[column.observed_index].field_type()),
                 nullable: override_
                     .and_then(|override_| override_.nullable)
                     .unwrap_or(true),
@@ -1903,6 +2189,70 @@ fn assemble_pinned_plan(
         decision,
         pinned_schema_write,
     }
+}
+
+/// Fails a pinned load as `schema_drift` when a pinned declared-type field
+/// has no override re-declaring its type (ADR-0042): declared types enter a
+/// schema only through declaration, so the load definition stays the
+/// declaration of record and a pin alone cannot resurrect one. Without the
+/// override the field's effective type falls back to the observed type,
+/// which no lattice rule widens to a declared type — a definition-level
+/// omission, failed here as one drift, after shape matching (missing-field
+/// drift wins) and before per-record validation (never a flood of
+/// rejections). `observe` runs only on the failure path, over all records,
+/// to name the effective type a rejection-free inference would produce.
+fn check_declared_type_overrides(
+    pinned_path: &str,
+    pin: &PinnedSchema,
+    matched: &[PlannedField],
+    overrides: &SchemaOverrides,
+    observe: impl FnOnce() -> Vec<InferredType>,
+) -> Result<(), ExecutionFailure> {
+    let undeclared: Vec<&PlannedField> = matched
+        .iter()
+        .filter(|planned| planned.materialized_type.lattice_type().is_none())
+        .filter(|planned| {
+            overrides
+                .get(&planned.name)
+                .and_then(|override_| override_.field_type)
+                .is_none()
+        })
+        .collect();
+    if undeclared.is_empty() {
+        return Ok(());
+    }
+
+    let observed_types = observe();
+    let effective_name =
+        |planned: &PlannedField| observed_types[planned.observed_index].field_type().name();
+    let detail = format!(
+        "{}; declared types take effect only through schema.overrides — the override may be missing",
+        undeclared
+            .iter()
+            .map(|planned| {
+                format!(
+                    "field {:?} is pinned as {} but its effective type is {}",
+                    planned.name,
+                    planned.materialized_type.name(),
+                    effective_name(planned),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    let drift = json!({
+        "undeclared_fields": undeclared
+            .iter()
+            .map(|planned| {
+                json!({
+                    "name": planned.name,
+                    "pinned_type": planned.materialized_type.name(),
+                    "effective_type": effective_name(planned),
+                })
+            })
+            .collect::<Vec<_>>(),
+    });
+    Err(drift_failure(pinned_path, pin, detail, drift))
 }
 
 /// Builds the `schema_drift` failure whose report echoes the pinned expectation
@@ -2098,21 +2448,13 @@ fn observe_json_types(
     observed_types
 }
 
-fn default_null_to_text(inferred_type: InferredType) -> InferredType {
-    if inferred_type == InferredType::Null {
-        InferredType::Utf8
-    } else {
-        inferred_type
-    }
-}
-
 fn build_text_array(
-    inferred_type: InferredType,
+    field_type: FieldType,
     records: &[TextRecord],
     column_index: usize,
 ) -> Result<ArrayRef, LoadFailure> {
-    match inferred_type {
-        InferredType::Null | InferredType::Utf8 => {
+    match field_type {
+        FieldType::Utf8 => {
             let mut builder = StringBuilder::new();
             for record in records {
                 match &record.cells[column_index] {
@@ -2122,7 +2464,7 @@ fn build_text_array(
             }
             Ok(Arc::new(builder.finish()))
         }
-        InferredType::Boolean => {
+        FieldType::Boolean => {
             let mut builder = BooleanBuilder::new();
             for record in records {
                 match &record.cells[column_index] {
@@ -2135,7 +2477,7 @@ fn build_text_array(
             }
             Ok(Arc::new(builder.finish()))
         }
-        InferredType::Int64 => {
+        FieldType::Int64 => {
             let mut builder = Int64Builder::new();
             for record in records {
                 match &record.cells[column_index] {
@@ -2149,7 +2491,7 @@ fn build_text_array(
             }
             Ok(Arc::new(builder.finish()))
         }
-        InferredType::Float64 => {
+        FieldType::Float64 => {
             let mut builder = Float64Builder::new();
             for record in records {
                 match &record.cells[column_index] {
@@ -2163,7 +2505,77 @@ fn build_text_array(
             }
             Ok(Arc::new(builder.finish()))
         }
+        FieldType::Timestamp | FieldType::Timestamptz => {
+            let mut values: Vec<Option<i64>> = Vec::with_capacity(records.len());
+            for record in records {
+                values.push(match &record.cells[column_index] {
+                    Some(value) => Some(
+                        parse_declared_timestamp(value, field_type)
+                            .ok_or_else(|| coercion_failure(column_index, value, "timestamp"))?,
+                    ),
+                    None => None,
+                });
+            }
+            timestamp_array(values, field_type)
+        }
+        FieldType::Decimal { precision, scale } => {
+            let mut values: Vec<Option<i128>> = Vec::with_capacity(records.len());
+            for record in records {
+                values.push(match &record.cells[column_index] {
+                    Some(value) => Some(
+                        parse_decimal_scaled(value, precision, scale)
+                            .ok_or_else(|| coercion_failure(column_index, value, "decimal"))?,
+                    ),
+                    None => None,
+                });
+            }
+            decimal_array(values, precision, scale, column_index)
+        }
     }
+}
+
+/// The microseconds a declared-timestamp cell stores, under whichever of the
+/// two timestamp types the column declares (ADR-0043).
+fn parse_declared_timestamp(value: &str, field_type: FieldType) -> Option<i64> {
+    match field_type {
+        FieldType::Timestamp => parse_timestamp_micros(value),
+        FieldType::Timestamptz => parse_timestamptz_micros(value),
+        _ => None,
+    }
+}
+
+/// Assembles a microsecond-timestamp column, stamped UTC for the instant
+/// type so the Arrow schema matches [`FieldType::data_type`] (ADR-0043).
+fn timestamp_array(
+    values: Vec<Option<i64>>,
+    field_type: FieldType,
+) -> Result<ArrayRef, LoadFailure> {
+    let array = TimestampMicrosecondArray::from(values);
+    Ok(match field_type {
+        FieldType::Timestamptz => Arc::new(array.with_timezone("UTC")),
+        _ => Arc::new(array),
+    })
+}
+
+/// Assembles a `Decimal128(precision, scale)` column from pre-scaled values.
+/// The parameters were validated at declaration time, so Arrow rejecting
+/// them is an invariant breach reported as a clean failure.
+fn decimal_array(
+    values: Vec<Option<i128>>,
+    precision: u8,
+    scale: u8,
+    column_index: usize,
+) -> Result<ArrayRef, LoadFailure> {
+    Decimal128Array::from(values)
+        .with_precision_and_scale(precision, scale as i8)
+        .map(|array| Arc::new(array) as ArrayRef)
+        .map_err(|error| {
+            coercion_failure(
+                column_index,
+                &error.to_string(),
+                &FieldType::Decimal { precision, scale }.name(),
+            )
+        })
 }
 
 /// Materializes a JSONL column straight from the parsed [`Value`]s, healing the
@@ -2175,13 +2587,13 @@ fn build_text_array(
 /// to fit (ADR-0035, ADR-0038). They return a clean failure rather than
 /// panicking if that invariant is ever broken.
 fn build_json_array(
-    inferred_type: InferredType,
+    field_type: FieldType,
     records: &[JsonRecord],
     source: &SourceAddress,
     column_index: usize,
 ) -> Result<ArrayRef, LoadFailure> {
-    match inferred_type {
-        InferredType::Null | InferredType::Utf8 => {
+    match field_type {
+        FieldType::Utf8 => {
             let mut builder = StringBuilder::new();
             for record in records {
                 match json_scalar_to_string(source.json_value(&record.object)) {
@@ -2191,7 +2603,7 @@ fn build_json_array(
             }
             Ok(Arc::new(builder.finish()))
         }
-        InferredType::Boolean => {
+        FieldType::Boolean => {
             let mut builder = BooleanBuilder::new();
             for record in records {
                 match source.json_value(&record.object) {
@@ -2208,7 +2620,7 @@ fn build_json_array(
             }
             Ok(Arc::new(builder.finish()))
         }
-        InferredType::Int64 => {
+        FieldType::Int64 => {
             let mut builder = Int64Builder::new();
             for record in records {
                 match source.json_value(&record.object) {
@@ -2230,7 +2642,7 @@ fn build_json_array(
             }
             Ok(Arc::new(builder.finish()))
         }
-        InferredType::Float64 => {
+        FieldType::Float64 => {
             let mut builder = Float64Builder::new();
             for record in records {
                 match source.json_value(&record.object) {
@@ -2256,6 +2668,53 @@ fn build_json_array(
             }
             Ok(Arc::new(builder.finish()))
         }
+        FieldType::Timestamp | FieldType::Timestamptz => {
+            let mut values: Vec<Option<i64>> = Vec::with_capacity(records.len());
+            for record in records {
+                values.push(match source.json_value(&record.object) {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(text)) => Some(
+                        parse_declared_timestamp(text, field_type)
+                            .ok_or_else(|| coercion_failure(column_index, text, "timestamp"))?,
+                    ),
+                    Some(other) => {
+                        return Err(coercion_failure(
+                            column_index,
+                            &other.to_string(),
+                            "timestamp",
+                        ))
+                    }
+                });
+            }
+            timestamp_array(values, field_type)
+        }
+        FieldType::Decimal { precision, scale } => {
+            let mut values: Vec<Option<i128>> = Vec::with_capacity(records.len());
+            for record in records {
+                values.push(match source.json_value(&record.object) {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(text)) => Some(
+                        parse_decimal_scaled(text, precision, scale)
+                            .ok_or_else(|| coercion_failure(column_index, text, "decimal"))?,
+                    ),
+                    Some(Value::Number(number)) => Some(
+                        json_integer(number)
+                            .and_then(|integer| rescale_decimal_integer(integer, precision, scale))
+                            .ok_or_else(|| {
+                                coercion_failure(column_index, &number.to_string(), "decimal")
+                            })?,
+                    ),
+                    Some(other) => {
+                        return Err(coercion_failure(
+                            column_index,
+                            &other.to_string(),
+                            "decimal",
+                        ))
+                    }
+                });
+            }
+            decimal_array(values, precision, scale, column_index)
+        }
     }
 }
 
@@ -2269,16 +2728,6 @@ fn json_scalar_to_string(value: Option<&Value>) -> Option<String> {
         Some(Value::Bool(flag)) => Some(flag.to_string()),
         Some(Value::Number(number)) => Some(number.to_string()),
         Some(other) => Some(other.to_string()),
-    }
-}
-
-fn data_type_name(data_type: &DataType) -> &'static str {
-    match data_type {
-        DataType::Boolean => "boolean",
-        DataType::Int64 => "int64",
-        DataType::Float64 => "float64",
-        DataType::Utf8 => "utf8",
-        _ => "unsupported",
     }
 }
 
@@ -2311,19 +2760,17 @@ impl InferredType {
         }
     }
 
-    fn data_type(self) -> DataType {
+    /// The field type an observed column materializes as when no declaration
+    /// replaces it: the observation itself, with an all-null column
+    /// defaulting to text. Inference can only reach the four lattice types —
+    /// the declared-only types have no observation to come from (ADR-0042).
+    fn field_type(self) -> FieldType {
         match self {
-            InferredType::Null | InferredType::Utf8 => DataType::Utf8,
-            InferredType::Boolean => DataType::Boolean,
-            InferredType::Int64 => DataType::Int64,
-            InferredType::Float64 => DataType::Float64,
+            InferredType::Null | InferredType::Utf8 => FieldType::Utf8,
+            InferredType::Boolean => FieldType::Boolean,
+            InferredType::Int64 => FieldType::Int64,
+            InferredType::Float64 => FieldType::Float64,
         }
-    }
-
-    /// The stable name this type carries in schema decisions and pinned schema
-    /// files.
-    fn name(self) -> &'static str {
-        data_type_name(&self.data_type())
     }
 }
 
@@ -2381,10 +2828,186 @@ fn parse_bool(value: &str) -> Option<bool> {
     }
 }
 
+/// Parses wall-clock timestamp text (ADR-0043) into the microseconds an Arrow
+/// `Timestamp(Microsecond, None)` column stores: the strict
+/// `YYYY-MM-DD[ Tt]HH:MM:SS[.ffffff]` menu with nothing after it — wall-clock
+/// text carrying an offset contradicts its own type and rejects.
+fn parse_timestamp_micros(text: &str) -> Option<i64> {
+    let (micros, offset_text) = parse_datetime_prefix(text)?;
+    offset_text.is_empty().then_some(micros)
+}
+
+/// Parses instant timestamp text (ADR-0043): the same clock menu followed by
+/// a mandatory `Z`/`z` or `±hh:mm` offset, normalized to the microseconds of
+/// the UTC instant it spells.
+fn parse_timestamptz_micros(text: &str) -> Option<i64> {
+    let (micros, offset_text) = parse_datetime_prefix(text)?;
+    let offset_seconds = parse_offset_seconds(offset_text)?;
+    micros.checked_sub(offset_seconds.checked_mul(1_000_000)?)
+}
+
+/// Lexes the strict clock menu shared by both timestamp types —
+/// `YYYY-MM-DD`, one space or `T`/`t` separator, `HH:MM:SS`, an optional
+/// fraction of 1 to 6 digits — into epoch microseconds plus the unconsumed
+/// offset text. Fields are fixed-width zero-padded and the year is four
+/// digits, so nothing locale-dependent can parse. More than 6 fractional
+/// digits reject rather than truncate. Calendar validity (month lengths,
+/// leap years) and the 00-59 second range (leap-second text rejects) come
+/// from chrono's `Naive` types.
+fn parse_datetime_prefix(text: &str) -> Option<(i64, &str)> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let year = parse_fixed_digits(&bytes[0..4])?;
+    let month = parse_fixed_digits(&bytes[5..7])?;
+    let day = parse_fixed_digits(&bytes[8..10])?;
+    let hour = parse_fixed_digits(&bytes[11..13])?;
+    let minute = parse_fixed_digits(&bytes[14..16])?;
+    let second = parse_fixed_digits(&bytes[17..19])?;
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || !matches!(bytes[10], b' ' | b'T' | b't')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+
+    let (fraction_micros, offset_start) = if bytes.get(19) == Some(&b'.') {
+        let digit_count = bytes[20..]
+            .iter()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        if digit_count == 0 || digit_count > 6 {
+            return None;
+        }
+        let fraction = parse_fixed_digits(&bytes[20..20 + digit_count])?;
+        (
+            fraction * 10_u32.pow(6 - digit_count as u32),
+            20 + digit_count,
+        )
+    } else {
+        (0, 19)
+    };
+
+    let date = chrono::NaiveDate::from_ymd_opt(year as i32, month, day)?;
+    let time = chrono::NaiveTime::from_hms_micro_opt(hour, minute, second, fraction_micros)?;
+    Some((
+        date.and_time(time).and_utc().timestamp_micros(),
+        &text[offset_start..],
+    ))
+}
+
+/// Parses the mandatory instant-timestamp offset — `Z`/`z`, or `±hh:mm` with
+/// zero-padded fields — as signed seconds east of UTC.
+fn parse_offset_seconds(text: &str) -> Option<i64> {
+    if text == "Z" || text == "z" {
+        return Some(0);
+    }
+    let bytes = text.as_bytes();
+    if bytes.len() != 6 || bytes[3] != b':' {
+        return None;
+    }
+    let sign = match bytes[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let hours = parse_fixed_digits(&bytes[1..3])?;
+    let minutes = parse_fixed_digits(&bytes[4..6])?;
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    Some(sign * i64::from(hours * 3600 + minutes * 60))
+}
+
+/// Parses a fixed-width zero-padded clock field: every byte an ASCII digit.
+fn parse_fixed_digits(bytes: &[u8]) -> Option<u32> {
+    let mut value: u32 = 0;
+    for byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value * 10 + u32::from(byte - b'0');
+    }
+    Some(value)
+}
+
+/// Parses decimal text (ADR-0044) into the scaled integer a
+/// `Decimal128(precision, scale)` column stores: an optional sign, then plain
+/// base-10 digits with at most one decimal point — no exponent notation, no
+/// thousands separators, no whitespace. Fewer fractional digits than the
+/// scale rescale losslessly; more reject, because rounding never happens. A
+/// zero-padded integer part parses: ADR-0032 guards inference, not
+/// declared-type parsing.
+fn parse_decimal_scaled(text: &str, precision: u8, scale: u8) -> Option<i128> {
+    let (negative, integer_digits, fraction_digits) = split_plain_decimal(text)?;
+    if fraction_digits.len() > usize::from(scale) {
+        return None;
+    }
+
+    let mut scaled: i128 = 0;
+    for byte in integer_digits.bytes().chain(fraction_digits.bytes()) {
+        scaled = scaled
+            .checked_mul(10)?
+            .checked_add(i128::from(byte - b'0'))?;
+    }
+    for _ in fraction_digits.len()..usize::from(scale) {
+        scaled = scaled.checked_mul(10)?;
+    }
+    if negative {
+        scaled = -scaled;
+    }
+    bounded_decimal(scaled, precision)
+}
+
+/// Splits text into plain decimal syntax — an optional sign, then base-10
+/// digits with at most one decimal point carrying at least one digit on each
+/// side — or `None` for anything else (ADR-0044). Shared by the parser and
+/// the cause classifier so both agree on what "plain decimal text" means.
+fn split_plain_decimal(text: &str) -> Option<(bool, &str, &str)> {
+    let (negative, unsigned) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (integer_digits, fraction_digits) = match unsigned.split_once('.') {
+        Some((_, "")) => return None,
+        Some(split) => split,
+        None => (unsigned, ""),
+    };
+    if integer_digits.is_empty()
+        || !integer_digits.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction_digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((negative, integer_digits, fraction_digits))
+}
+
+/// Rescales a JSON integer into a declared decimal's scaled representation
+/// (ADR-0044). An integer's exact digits were never lost, so only the
+/// precision bound can reject it.
+fn rescale_decimal_integer(value: i128, precision: u8, scale: u8) -> Option<i128> {
+    let scaled = value.checked_mul(10_i128.checked_pow(u32::from(scale))?)?;
+    bounded_decimal(scaled, precision)
+}
+
+/// A scaled decimal value fits its declared precision iff its magnitude
+/// spells at most `precision` digits.
+fn bounded_decimal(scaled: i128, precision: u8) -> Option<i128> {
+    let bound = 10_i128.pow(u32::from(precision));
+    (-bound < scaled && scaled < bound).then_some(scaled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Array, BooleanArray, Float64Array, Int64Array, StringArray};
+    use arrow_array::{
+        Array, BooleanArray, Decimal128Array, Float64Array, Int64Array, StringArray,
+        TimestampMicrosecondArray,
+    };
 
     const ALL: [InferredType; 5] = [
         InferredType::Null,
@@ -2524,13 +3147,204 @@ mod tests {
     }
 
     #[test]
-    fn default_null_to_text_promotes_only_all_null_columns() {
+    fn observed_field_types_promote_only_all_null_columns_to_text() {
         use InferredType::*;
-        assert_eq!(default_null_to_text(Null), Utf8);
-        assert_eq!(default_null_to_text(Boolean), Boolean);
-        assert_eq!(default_null_to_text(Int64), Int64);
-        assert_eq!(default_null_to_text(Float64), Float64);
-        assert_eq!(default_null_to_text(Utf8), Utf8);
+        assert_eq!(Null.field_type(), FieldType::Utf8);
+        assert_eq!(Boolean.field_type(), FieldType::Boolean);
+        assert_eq!(Int64.field_type(), FieldType::Int64);
+        assert_eq!(Float64.field_type(), FieldType::Float64);
+        assert_eq!(Utf8.field_type(), FieldType::Utf8);
+    }
+
+    // ---- Declared-type value parsing (ADR-0043, ADR-0044) ----
+
+    #[test]
+    fn parse_timestamp_micros_reads_the_strict_wall_clock_menu() {
+        // Worked example: 2026-07-14 17:00:00 UTC is epoch second
+        // 1_784_048_400 (computed independently with `date -u`).
+        const BASE: i64 = 1_784_048_400_000_000;
+        assert_eq!(parse_timestamp_micros("2026-07-14 17:00:00"), Some(BASE));
+        assert_eq!(parse_timestamp_micros("2026-07-14T17:00:00"), Some(BASE));
+        assert_eq!(parse_timestamp_micros("2026-07-14t17:00:00"), Some(BASE));
+        // Fractions of 1 to 6 digits scale to microseconds.
+        assert_eq!(
+            parse_timestamp_micros("2026-07-14 17:00:00.5"),
+            Some(BASE + 500_000)
+        );
+        assert_eq!(
+            parse_timestamp_micros("2026-07-14 17:00:00.123456"),
+            Some(BASE + 123_456)
+        );
+        // The epoch and its pre-epoch side.
+        assert_eq!(parse_timestamp_micros("1970-01-01 00:00:00"), Some(0));
+        assert_eq!(
+            parse_timestamp_micros("1969-12-31 23:59:59"),
+            Some(-1_000_000)
+        );
+        // 2000 is a leap year (divisible by 400): Feb 29 is a real date.
+        assert_eq!(
+            parse_timestamp_micros("2000-02-29 12:30:45"),
+            Some(951_827_445_000_000)
+        );
+    }
+
+    #[test]
+    fn parse_timestamp_micros_rejects_offsets_and_non_menu_text() {
+        for text in [
+            "2026-07-14T17:00:00Z", // wall-clock text must not carry an offset
+            "2026-07-14T17:00:00+08:00",
+            "2026-07-14",                  // date-only text
+            "17:00:00",                    // time-only text
+            "2026-07-14 17:00:00.1234567", // more than 6 fractional digits
+            "2026-07-14 17:00:00.",        // a point needs digits
+            "2026-7-14 17:00:00",          // fields are fixed-width zero-padded
+            "26-07-14 17:00:00",           // year is four digits
+            "2026-07-14  17:00:00",        // exactly one separator
+            "2026-02-30 00:00:00",         // calendar validity
+            "2001-02-29 00:00:00",         // 2001 is not a leap year
+            "2026-13-01 00:00:00",
+            "2026-00-01 00:00:00",
+            "2026-07-14 24:00:00",
+            "2026-07-14 17:60:00",
+            "2026-07-14 23:59:60", // leap-second text parses strictly
+            "14/07/2026 17:00:00", // no locale-dependent forms
+            "July 14, 2026 17:00",
+            "1784048400", // no epoch numbers
+            " 2026-07-14 17:00:00",
+            "2026-07-14 17:00:00 ",
+            "",
+        ] {
+            assert_eq!(parse_timestamp_micros(text), None, "{text:?} should reject");
+        }
+    }
+
+    #[test]
+    fn parse_timestamptz_micros_requires_an_offset_and_normalizes_to_utc() {
+        const INSTANT: i64 = 1_784_048_400_000_000; // 2026-07-14T17:00:00Z
+        assert_eq!(
+            parse_timestamptz_micros("2026-07-14T17:00:00Z"),
+            Some(INSTANT)
+        );
+        assert_eq!(
+            parse_timestamptz_micros("2026-07-14t17:00:00z"),
+            Some(INSTANT)
+        );
+        // The same instant spelled from other offsets normalizes to it.
+        assert_eq!(
+            parse_timestamptz_micros("2026-07-15T01:00:00+08:00"),
+            Some(INSTANT)
+        );
+        assert_eq!(
+            parse_timestamptz_micros("2026-07-14 12:00:00-05:00"),
+            Some(INSTANT)
+        );
+        assert_eq!(
+            parse_timestamptz_micros("2026-07-14T17:00:00+00:00"),
+            Some(INSTANT)
+        );
+        assert_eq!(
+            parse_timestamptz_micros("2026-07-14T17:00:00.000001Z"),
+            Some(INSTANT + 1)
+        );
+    }
+
+    #[test]
+    fn parse_timestamptz_micros_rejects_missing_and_malformed_offsets() {
+        for text in [
+            "2026-07-14T17:00:00",      // an instant needs its offset
+            "2026-07-14T17:00:00+08",   // minutes are mandatory
+            "2026-07-14T17:00:00+8:00", // fixed-width zero-padded
+            "2026-07-14T17:00:00+08:0",
+            "2026-07-14T17:00:00+08:60",
+            "2026-07-14T17:00:00+24:00",
+            "2026-07-14T17:00:00 Z",
+            "2026-07-14T17:00:00ZZ",
+            "2026-07-14T17:00:00UTC",
+        ] {
+            assert_eq!(
+                parse_timestamptz_micros(text),
+                None,
+                "{text:?} should reject"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_decimal_scaled_rescales_losslessly_and_never_rounds() {
+        assert_eq!(parse_decimal_scaled("1.2", 10, 2), Some(120));
+        assert_eq!(parse_decimal_scaled("1.20", 10, 2), Some(120));
+        assert_eq!(parse_decimal_scaled("42", 10, 2), Some(4_200));
+        assert_eq!(parse_decimal_scaled("+42", 10, 2), Some(4_200));
+        assert_eq!(parse_decimal_scaled("-3.75", 10, 2), Some(-375));
+        assert_eq!(parse_decimal_scaled("0", 1, 0), Some(0));
+        // Zero-padded integer parts parse: ADR-0032 guards inference, not
+        // declared-type parsing.
+        assert_eq!(parse_decimal_scaled("007.50", 10, 2), Some(750));
+        // The full-precision boundary on both sides of zero.
+        assert_eq!(
+            parse_decimal_scaled("99999999.99", 10, 2),
+            Some(9_999_999_999)
+        );
+        assert_eq!(
+            parse_decimal_scaled("-99999999.99", 10, 2),
+            Some(-9_999_999_999)
+        );
+        assert_eq!(
+            parse_decimal_scaled("99999999999999999999999999999999999999", 38, 0),
+            Some(99_999_999_999_999_999_999_999_999_999_999_999_999)
+        );
+        // With scale equal to precision only magnitudes below one fit.
+        assert_eq!(parse_decimal_scaled("0.5", 1, 1), Some(5));
+        assert_eq!(parse_decimal_scaled("1.5", 1, 1), None);
+    }
+
+    #[test]
+    fn parse_decimal_scaled_rejects_over_scale_overflow_and_non_menu_text() {
+        for (text, precision, scale) in [
+            ("1.234", 10, 2),        // over-scale fractions reject, never round
+            ("0.001", 10, 2),        // even when rounding would reach zero
+            ("100000000.00", 10, 2), // integer digits beyond p - s overflow
+            ("1e3", 10, 2),          // no exponent notation
+            ("1E3", 10, 2),
+            ("1,000", 10, 2), // no thousands separators
+            ("1 000", 10, 2), // no whitespace
+            (" 1.2", 10, 2),
+            ("1.2 ", 10, 2),
+            ("1.", 10, 2),    // a point needs fraction digits
+            (".5", 10, 2),    // and an integer part
+            ("1.2.3", 10, 2), // at most one decimal point
+            ("--1", 10, 2),
+            ("+-1", 10, 2),
+            ("abc", 10, 2),
+            ("", 10, 2),
+            ("NaN", 10, 2),
+            ("0x10", 10, 2),
+        ] {
+            assert_eq!(
+                parse_decimal_scaled(text, precision, scale),
+                None,
+                "{text:?} under decimal({precision},{scale}) should reject"
+            );
+        }
+    }
+
+    #[test]
+    fn rescale_decimal_integer_scales_json_integers_into_the_precision_bound() {
+        assert_eq!(rescale_decimal_integer(42, 10, 2), Some(4_200));
+        assert_eq!(rescale_decimal_integer(-7, 10, 2), Some(-700));
+        assert_eq!(rescale_decimal_integer(0, 1, 0), Some(0));
+        assert_eq!(
+            rescale_decimal_integer(99_999_999, 10, 2),
+            Some(9_999_999_900)
+        );
+        // One more digit than p - s allows overflows.
+        assert_eq!(rescale_decimal_integer(100_000_000, 10, 2), None);
+        // A u64 beyond i64 still rescales exactly: its digits were never lost
+        // to IEEE parsing.
+        assert_eq!(
+            rescale_decimal_integer(18_446_744_073_709_551_615, 38, 0),
+            Some(18_446_744_073_709_551_615)
+        );
     }
 
     // ---- Materialization ----
@@ -2735,6 +3549,390 @@ mod tests {
         assert!(strings(batch, 0).is_null(1));
     }
 
+    // ---- Declared-type materialization (ADR-0042, ADR-0043, ADR-0044) ----
+
+    #[test]
+    fn from_text_columns_materializes_declared_types_under_overrides() {
+        let materialized = from_text_columns(
+            &overridden_inferred_directive(&[
+                ("created_at", Some("timestamp"), None),
+                ("settled_at", Some("timestamptz"), None),
+                ("amount", Some("decimal(10,2)"), None),
+            ]),
+            names(&["created_at", "settled_at", "amount"]),
+            vec![
+                record(
+                    2,
+                    &[
+                        Some("2026-07-14 17:00:00"),
+                        Some("2026-07-14T17:00:00Z"),
+                        Some("1.2"),
+                    ],
+                ),
+                record(
+                    3,
+                    &[
+                        Some("2026-07-14T17:00:00.5"),
+                        Some("2026-07-15t01:00:00+08:00"),
+                        Some("007.50"),
+                    ],
+                ),
+                record(4, &[None, None, None]),
+            ],
+        )
+        .expect("declared overrides materialize");
+        let batch = &materialized.batch;
+
+        const INSTANT: i64 = 1_784_048_400_000_000; // 2026-07-14T17:00:00Z
+        assert_eq!(
+            schema_types(batch),
+            vec![
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                DataType::Decimal128(10, 2),
+            ]
+        );
+        let created = timestamps(batch, 0);
+        assert_eq!(created.value(0), INSTANT);
+        assert_eq!(created.value(1), INSTANT + 500_000);
+        assert!(created.is_null(2));
+        // Different offset spellings of one instant store equal microseconds.
+        let settled = timestamps(batch, 1);
+        assert_eq!(settled.value(0), INSTANT);
+        assert_eq!(settled.value(1), INSTANT);
+        assert!(settled.is_null(2));
+        let amounts = decimals(batch, 2);
+        assert_eq!(amounts.value(0), 120); // "1.2" stores as 1.20
+        assert_eq!(amounts.value(1), 750); // zero-padded text parses
+        assert!(amounts.is_null(2));
+
+        assert!(materialized.rejected.is_empty());
+        assert_eq!(
+            materialized.schema_decision["fields"],
+            json!([
+                {"name": "created_at", "type": "timestamp", "nullable": true},
+                {"name": "settled_at", "type": "timestamptz", "nullable": true},
+                {"name": "amount", "type": "decimal(10,2)", "nullable": true}
+            ])
+        );
+    }
+
+    #[test]
+    fn from_text_columns_rejects_declared_type_misfits_naming_the_cause() {
+        for (field_type, value, cause_part) in [
+            ("timestamp", "2026-07-14T17:00:00Z", "carries a UTC offset"),
+            ("timestamp", "2026-07-14", "date-only"),
+            ("timestamp", "1784048400", "epoch numbers"),
+            ("timestamp", "2026-07-14 17:00:00.1234567", "more than 6"),
+            (
+                "timestamptz",
+                "2026-07-14T17:00:00",
+                "missing its mandatory UTC offset",
+            ),
+            ("decimal(10,2)", "1.234", "more than scale 2"),
+            ("decimal(10,2)", "100000000.00", "overflows decimal(10,2)"),
+            ("decimal(10,2)", "1e3", "exponent notation"),
+            ("decimal(10,2)", "1,000", "thousands separators"),
+        ] {
+            let materialized = from_text_columns(
+                &overridden_inferred_directive(&[("v", Some(field_type), None)]),
+                names(&["v"]),
+                vec![record(2, &[Some(value)])],
+            )
+            .expect("a misfit rejects the record, not the load");
+
+            assert_eq!(materialized.batch.num_rows(), 0, "{value:?} written");
+            assert_eq!(materialized.rejected.len(), 1, "{value:?} rejected");
+            let rejected = &materialized.rejected[0];
+            assert_eq!(rejected.code, "type_coercion_failed", "{value:?}");
+            assert_eq!(rejected.field.as_deref(), Some("v"));
+            assert!(
+                rejected
+                    .message
+                    .contains(&format!("does not fit overridden type {field_type}")),
+                "message {:?} misses the type {field_type:?}",
+                rejected.message
+            );
+            assert!(
+                rejected.message.contains(cause_part),
+                "message {:?} misses the cause {cause_part:?}",
+                rejected.message
+            );
+        }
+    }
+
+    #[test]
+    fn from_json_columns_materializes_declared_types_from_strings_and_integers() {
+        let materialized = from_json_columns(
+            &overridden_inferred_directive(&[
+                ("created_at", Some("timestamp"), None),
+                ("settled_at", Some("timestamptz"), None),
+                ("amount", Some("decimal(10,2)"), None),
+            ]),
+            names(&["created_at", "settled_at", "amount"]),
+            vec![
+                json_record(
+                    1,
+                    "{\"created_at\": \"2026-07-14T17:00:00\", \
+                      \"settled_at\": \"2026-07-15T01:00:00+08:00\", \
+                      \"amount\": \"1.2\"}",
+                ),
+                // A JSON integer rescales under decimal; JSON null stays null.
+                json_record(
+                    2,
+                    "{\"created_at\": null, \"settled_at\": null, \"amount\": 42}",
+                ),
+            ],
+        )
+        .expect("declared overrides materialize from json");
+        let batch = &materialized.batch;
+
+        const INSTANT: i64 = 1_784_048_400_000_000; // 2026-07-14T17:00:00Z
+        assert_eq!(
+            schema_types(batch),
+            vec![
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                DataType::Decimal128(10, 2),
+            ]
+        );
+        assert_eq!(timestamps(batch, 0).value(0), INSTANT);
+        assert!(timestamps(batch, 0).is_null(1));
+        assert_eq!(timestamps(batch, 1).value(0), INSTANT);
+        assert!(timestamps(batch, 1).is_null(1));
+        assert_eq!(decimals(batch, 2).value(0), 120);
+        assert_eq!(decimals(batch, 2).value(1), 4_200);
+        assert!(materialized.rejected.is_empty());
+    }
+
+    #[test]
+    fn from_json_columns_rejects_json_shapes_that_do_not_fit_declared_types() {
+        for (field_type, value_json, cause_part) in [
+            // Epoch numbers stay unaccepted in JSON exactly like in text.
+            ("timestamp", "1784048400", "epoch numbers"),
+            ("timestamp", "true", "only JSON strings"),
+            (
+                "timestamptz",
+                "\"2026-07-14T17:00:00\"",
+                "missing its mandatory UTC offset",
+            ),
+            // A JSON float's exact digits were already lost to IEEE parsing.
+            ("decimal(10,2)", "1.2", "JSON float"),
+            ("decimal(10,2)", "100000000", "overflows decimal(10,2)"),
+            ("decimal(10,2)", "[1]", "only JSON strings and integers"),
+        ] {
+            let materialized = from_json_columns(
+                &overridden_inferred_directive(&[("v", Some(field_type), None)]),
+                names(&["v"]),
+                vec![json_record(1, &format!("{{\"v\": {value_json}}}"))],
+            )
+            .expect("a misfit rejects the record, not the load");
+
+            assert_eq!(materialized.batch.num_rows(), 0, "{value_json:?} written");
+            assert_eq!(materialized.rejected.len(), 1, "{value_json:?} rejected");
+            let rejected = &materialized.rejected[0];
+            assert_eq!(rejected.code, "type_coercion_failed", "{value_json:?}");
+            assert!(
+                rejected.message.contains(cause_part),
+                "message {:?} misses the cause {cause_part:?}",
+                rejected.message
+            );
+        }
+    }
+
+    #[test]
+    fn a_pinned_declared_type_field_without_its_override_fails_as_drift() {
+        // ADR-0042: the load definition stays the declaration of record — a
+        // pin alone cannot resurrect a declared type. Omitting the override
+        // (or overriding only nullable) makes the effective type fall back
+        // to the observed type, and the load fails as drift under both
+        // policies, naming both types and the likely fix.
+        for drift_policy in [DriftPolicy::Fail, DriftPolicy::AllowAdditiveNullable] {
+            // The second configuration overrides only nullable — agreeing
+            // with the pin, so no conflict fires — and still omits the type.
+            for overrides_config in [
+                SchemaOverrides::none(),
+                overrides(&[("created_at", None, Some(true))]),
+            ] {
+                let error = from_text_columns(
+                    &overridden_pinned_directive(
+                        "version: 1\nfields:\n- name: created_at\n  type: timestamp\n",
+                        drift_policy,
+                        overrides_config,
+                    ),
+                    names(&["created_at"]),
+                    vec![record(2, &[Some("2026-07-14 17:00:00")])],
+                )
+                .err()
+                .expect("a pinned declared type without its override is drift");
+
+                assert_eq!(error.failure.code, "schema_drift");
+                assert!(
+                    error.failure.message.contains("pinned as timestamp"),
+                    "message {:?} misses the pinned type",
+                    error.failure.message
+                );
+                assert!(
+                    error.failure.message.contains("effective type is utf8"),
+                    "message {:?} misses the effective type",
+                    error.failure.message
+                );
+                assert!(
+                    error.failure.message.contains("override may be missing"),
+                    "message {:?} misses the hint",
+                    error.failure.message
+                );
+                let decision = error.schema_decision.expect("decision echoed");
+                assert_eq!(decision["drift_status"], "failed_on_drift");
+                assert_eq!(
+                    decision["drift"]["undeclared_fields"],
+                    json!([{
+                        "name": "created_at",
+                        "pinned_type": "timestamp",
+                        "effective_type": "utf8"
+                    }])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_pinned_declared_type_field_without_its_override_fails_as_drift_for_json() {
+        // The JSONL leg of the rule above: the effective type names what the
+        // batch's JSON values observe — an integer column here.
+        let error = from_json_columns(
+            &pinned_directive(
+                "version: 1\nfields:\n- name: amount\n  type: decimal(10,2)\n",
+                DriftPolicy::Fail,
+            ),
+            names(&["amount"]),
+            vec![json_record(1, "{\"amount\": 42}")],
+        )
+        .err()
+        .expect("a pinned declared type without its override is drift");
+
+        assert_eq!(error.failure.code, "schema_drift");
+        assert!(
+            error.failure.message.contains("pinned as decimal(10,2)"),
+            "message {:?} misses the pinned type",
+            error.failure.message
+        );
+        assert!(
+            error.failure.message.contains("effective type is int64"),
+            "message {:?} misses the effective type",
+            error.failure.message
+        );
+    }
+
+    #[test]
+    fn pinned_declared_types_with_their_overrides_validate_per_record() {
+        // The declaration of record is present on both sides: the pin and the
+        // overrides agree, records validate parse-based per record, and the
+        // misfit rejects without disturbing the drift-free load.
+        let materialized = from_text_columns(
+            &overridden_pinned_directive(
+                "version: 1\n\
+                 fields:\n\
+                 - name: created_at\n\
+                 \x20 type: timestamp\n\
+                 - name: note\n\
+                 \x20 type: utf8\n",
+                DriftPolicy::Fail,
+                overrides(&[("created_at", Some("timestamp"), None)]),
+            ),
+            names(&["created_at", "note"]),
+            vec![
+                record(2, &[Some("2026-07-14 17:00:00"), Some("a")]),
+                record(3, &[Some("2026-07-14T17:00:00Z"), Some("b")]),
+            ],
+        )
+        .expect("declared pin with its override materializes");
+
+        assert_eq!(
+            schema_types(&materialized.batch),
+            vec![
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Utf8,
+            ]
+        );
+        assert_eq!(materialized.batch.num_rows(), 1);
+        assert_eq!(materialized.rejected.len(), 1);
+        assert_eq!(materialized.rejected[0].line, 3);
+        assert_eq!(materialized.rejected[0].code, "type_coercion_failed");
+        assert_eq!(materialized.schema_decision["drift_status"], "none");
+    }
+
+    #[test]
+    fn declared_type_parameter_disagreements_fail_as_override_conflicts() {
+        // ADR-0042: pin comparison treats declared types as exactly equal or
+        // different — decimal(10,2) vs decimal(12,2) is a contradiction, not
+        // widening, and surfaces through the established conflict check
+        // before any drift comparison, under either policy.
+        for (pin_type, override_type) in [
+            ("decimal(10,2)", "decimal(12,2)"),
+            ("timestamp", "timestamptz"),
+            ("utf8", "timestamp"),
+        ] {
+            let error = from_text_columns(
+                &overridden_pinned_directive(
+                    &format!("version: 1\nfields:\n- name: v\n  type: {pin_type}\n"),
+                    DriftPolicy::AllowAdditiveNullable,
+                    overrides(&[("v", Some(override_type), None)]),
+                ),
+                names(&["v"]),
+                vec![record(2, &[Some("x")])],
+            )
+            .err()
+            .expect("a declared-type contradiction fails");
+
+            assert_eq!(error.failure.code, "schema_override_conflict");
+            assert!(
+                error.failure.message.contains(&format!(
+                    "pinned type {pin_type}, override type {override_type}"
+                )),
+                "message {:?} misses the contradiction",
+                error.failure.message
+            );
+        }
+    }
+
+    #[test]
+    fn an_added_declared_type_field_extends_the_pin_under_the_additive_policy() {
+        // ADR-0042: a newly added nullable declared-type field is legal
+        // additive drift — the override shapes it and the rewritten pin
+        // records the declared name.
+        let materialized = from_text_columns(
+            &overridden_pinned_directive(
+                "version: 1\nfields:\n- name: id\n  type: int64\n",
+                DriftPolicy::AllowAdditiveNullable,
+                overrides(&[("settled_at", Some("timestamptz"), None)]),
+            ),
+            names(&["id", "settled_at"]),
+            vec![record(2, &[Some("1"), Some("2026-07-14T17:00:00Z")])],
+        )
+        .expect("an added declared-type field is additive drift");
+
+        assert_eq!(
+            schema_types(&materialized.batch),
+            vec![
+                DataType::Int64,
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+            ]
+        );
+        assert_eq!(
+            materialized.schema_decision["drift_status"],
+            "additive_fields_added"
+        );
+        let pin_write = materialized
+            .pinned_schema_write
+            .expect("additive drift rewrites the pin");
+        assert!(
+            pin_write.yaml.contains("timestamptz"),
+            "rewritten pin {:?} carries the declared type",
+            pin_write.yaml
+        );
+    }
+
     // ---- Pinned schema contract (ADR-0033) ----
 
     const PIN_YAML: &str = "version: 1\n\
@@ -2756,12 +3954,12 @@ mod tests {
                 fields: vec![
                     PinnedField {
                         name: "customer_id".to_string(),
-                        field_type: InferredType::Int64,
+                        field_type: FieldType::Int64,
                         nullable: true,
                     },
                     PinnedField {
                         name: "name".to_string(),
-                        field_type: InferredType::Utf8,
+                        field_type: FieldType::Utf8,
                         nullable: true,
                     },
                 ],
@@ -2776,7 +3974,7 @@ mod tests {
         let pin = PinnedSchema::from_yaml("version: 1\nfields:\n- name: id\n  type: int64\n")
             .expect("parse pinned schema without nullable");
         assert_eq!(pin.fields[0].name, "id");
-        assert_eq!(pin.fields[0].field_type, InferredType::Int64);
+        assert_eq!(pin.fields[0].field_type, FieldType::Int64);
         assert!(pin.fields[0].nullable);
     }
 
@@ -2798,6 +3996,83 @@ mod tests {
         assert!(!pin.fields[0].nullable);
         assert!(pin.fields[1].nullable);
         assert_eq!(pin.to_yaml(), yaml);
+    }
+
+    #[test]
+    fn pinned_schema_accepts_declared_logical_types_and_round_trips_them() {
+        // ADR-0042: the declared-only types are pin vocabulary like any other
+        // field type, and the persisted YAML prints them exactly as declared.
+        let yaml = "version: 1\n\
+                    fields:\n\
+                    - name: created_at\n\
+                    \x20 type: timestamp\n\
+                    \x20 nullable: true\n\
+                    - name: settled_at\n\
+                    \x20 type: timestamptz\n\
+                    \x20 nullable: false\n\
+                    - name: amount\n\
+                    \x20 type: decimal(10,2)\n\
+                    \x20 nullable: true\n";
+        let pin = PinnedSchema::from_yaml(yaml).expect("declared-type pin parses");
+        assert_eq!(pin.fields[0].field_type, FieldType::Timestamp);
+        assert_eq!(pin.fields[1].field_type, FieldType::Timestamptz);
+        assert_eq!(
+            pin.fields[2].field_type,
+            FieldType::Decimal {
+                precision: 10,
+                scale: 2
+            }
+        );
+
+        let round_tripped = pin.to_yaml();
+        assert!(
+            round_tripped.contains("decimal(10,2)"),
+            "persisted pin {round_tripped:?} prints the decimal exactly as declared"
+        );
+        assert_eq!(
+            PinnedSchema::from_yaml(&round_tripped).expect("round-tripped pin parses"),
+            pin
+        );
+    }
+
+    #[test]
+    fn pinned_schema_rejects_malformed_declared_type_strings() {
+        // ADR-0042/0044: a malformed declaration is a broken contract file
+        // failing in the existing invalid-declaration style. `decimal` needs
+        // the canonical `decimal(p,s)` spelling — both parameters, no spaces,
+        // no leading zeros — with 1 <= p <= 38 and 0 <= s <= p.
+        for type_name in [
+            "decimal",
+            "decimal()",
+            "decimal(10)",
+            "decimal(10,)",
+            "decimal(,2)",
+            "decimal(0,0)",
+            "decimal(39,2)",
+            "decimal(10,11)",
+            "decimal(10, 2)",
+            "decimal(010,2)",
+            "decimal(+10,2)",
+            "timestamp(3)",
+            "timestamptz(utc)",
+            "date",
+        ] {
+            let yaml = format!("version: 1\nfields:\n- name: v\n  type: \"{type_name}\"\n");
+            let error = PinnedSchema::from_yaml(&yaml)
+                .err()
+                .unwrap_or_else(|| panic!("pinned schema type {type_name:?} accepted"));
+            assert_eq!(
+                error.code, "invalid_pinned_schema",
+                "code for {type_name:?}"
+            );
+            assert!(
+                error.message.contains(&format!(
+                    "unsupported pinned schema field type: {type_name}"
+                )),
+                "message {:?} misses {type_name:?}",
+                error.message
+            );
+        }
     }
 
     #[test]
@@ -3582,6 +4857,61 @@ mod tests {
     }
 
     // ---- Schema overrides (ADR-0038) ----
+
+    #[test]
+    fn schema_overrides_accept_the_declared_type_vocabulary() {
+        // ADR-0042: overrides share the pin's type vocabulary, so the three
+        // declared-only names — decimal across its whole parameter range —
+        // validate like any existing type name.
+        for (type_name, expected) in [
+            ("timestamp", FieldType::Timestamp),
+            ("timestamptz", FieldType::Timestamptz),
+            (
+                "decimal(1,0)",
+                FieldType::Decimal {
+                    precision: 1,
+                    scale: 0,
+                },
+            ),
+            (
+                "decimal(38,38)",
+                FieldType::Decimal {
+                    precision: 38,
+                    scale: 38,
+                },
+            ),
+        ] {
+            let validated = overrides(&[("v", Some(type_name), None)]);
+            assert_eq!(
+                validated
+                    .get("v")
+                    .and_then(|override_| override_.field_type),
+                Some(expected),
+                "override type {type_name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_overrides_reject_malformed_declared_type_strings() {
+        // Same invalid-declaration style as any unsupported override type:
+        // the load fails before any data is read (ADR-0042).
+        for type_name in ["decimal", "decimal(39,2)", "decimal(2,3)", "decimal(10, 2)"] {
+            let error = SchemaOverrides::from_entries(&[OverrideEntry {
+                name: "v".to_string(),
+                field_type: Some(type_name.to_string()),
+                nullable: None,
+            }])
+            .err()
+            .unwrap_or_else(|| panic!("override type {type_name:?} accepted"));
+            assert_eq!(error.code, "unsupported_override_type");
+            assert!(
+                error.message.contains(type_name),
+                "message {:?} misses {type_name:?}",
+                error.message
+            );
+        }
+    }
 
     #[test]
     fn from_text_columns_applies_overrides_to_inferred_fields_and_rejects_misfits() {
@@ -4995,5 +6325,21 @@ mod tests {
             .as_any()
             .downcast_ref::<BooleanArray>()
             .expect("boolean column")
+    }
+
+    fn timestamps(batch: &RecordBatch, index: usize) -> &TimestampMicrosecondArray {
+        batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .expect("microsecond timestamp column")
+    }
+
+    fn decimals(batch: &RecordBatch, index: usize) -> &Decimal128Array {
+        batch
+            .column(index)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("decimal128 column")
     }
 }
