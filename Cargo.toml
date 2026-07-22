@@ -2,6 +2,9 @@
 name = "data-spark"
 version = "0.2.0"
 edition = "2021"
+description = "Portable data movement CLI for turning operational data into BI-ready datasets"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/victorchutw/data-spark"
 
 [dependencies]
 # The Arrow stack tracks the `duckdb` crate's `arrow ^58` pin (ADR-0030).
