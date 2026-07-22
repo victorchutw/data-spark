@@ -16,6 +16,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Free runner disk space
+        # The bundled DuckDB engine plus per-target debug info makes the
+        # build tree large enough to exhaust the default runner disk while
+        # linking the integration-test binaries (ENOSPC, then ld bus
+        # errors). Dropping preinstalled toolchains this job never uses
+        # frees ~20 GiB without touching the Rust build cache or any
+        # fingerprint.
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - name: Install Rust stable
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt,clippy
