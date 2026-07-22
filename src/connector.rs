@@ -116,8 +116,8 @@ pub(crate) struct DestinationWrite {
 }
 
 /// The originator-owned retry classification of a destination write failure
-/// (ADR-0048): only the connector that raised a failure may class it, and a
-/// failure may be transient only when the failed attempt provably committed
+/// (ADR-0048): only the connector that raised a failure may classify it, and
+/// a failure may be transient only when the failed attempt provably committed
 /// nothing to the destination and the session can accept a re-attempt of
 /// the same retry unit — any uncertainty keeps it terminal. Every
 /// construction path defaults to terminal; marking a failure transient
