@@ -1742,6 +1742,7 @@ fn pre_materialization_failure(failure: LoadFailure, decision: Value) -> Executi
         written_records: 0,
         rejected_count: 0,
         committed_execution: None,
+        retry: None,
         destination_write: Box::new(DestinationWriteFacts::not_applicable()),
     }
 }

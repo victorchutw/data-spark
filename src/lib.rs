@@ -11,12 +11,13 @@ use uuid::Uuid;
 
 mod connector;
 mod rejection;
+mod retry;
 mod schema;
 
 use arrow_array::RecordBatch;
 use connector::{
     destination_connector, resolved_source_format, source_connector, Destination,
-    DestinationWriteFacts, DestinationWriteFailure, LoadMode, SourceRead,
+    DestinationWriteFacts, DestinationWriteFailure, LoadMode, SourceRead, Transience,
 };
 
 const LOAD_REPORT_VERSION: u8 = 1;
@@ -102,7 +103,10 @@ impl LoadReport {
     /// except the rejection facts, which report the records already rejected
     /// (and their artifact) when the failure happened, and — once the load
     /// entered the write phase — the execution posture, which reports the
-    /// chunks the destination had committed (ADR-0047).
+    /// chunks the destination had committed (ADR-0047) and the retry story
+    /// (ADR-0050). The `not_started` posture states a retry story only when
+    /// attempts were actually recorded, so every never-retried failure
+    /// report keeps its established shape.
     fn from_failure(
         load_id: String,
         artifact_dir: String,
@@ -110,15 +114,23 @@ impl LoadReport {
         failure: ReportableFailure,
     ) -> Self {
         let rejected_records = RejectedRecordFacts::facts(failure.rejected_count, &artifact_dir);
-        let execution = match &failure.committed_execution {
-            None => json!({
-                "record_format": "not_started",
-                "batch_count": 0
-            }),
+        let execution = match failure.committed_execution {
+            None => match failure.retry {
+                None => json!({
+                    "record_format": "not_started",
+                    "batch_count": 0
+                }),
+                Some(retry) => json!({
+                    "record_format": "not_started",
+                    "batch_count": 0,
+                    "retry": *retry
+                }),
+            },
             Some(committed) => json!({
                 "record_format": "arrow_record_batch",
                 "batch_count": committed.committed_chunks,
-                "chunk_rows": committed.chunk_rows
+                "chunk_rows": committed.chunk_rows,
+                "retry": *committed.retry
             }),
         };
         LoadReport {
@@ -217,9 +229,9 @@ struct LoadDefinition {
     transform: Option<schema::TransformConfig>,
     schema: Option<SchemaConfig>,
     artifacts: Option<ArtifactsConfig>,
-    /// The execution-behavior settings of the load (ADR-0046): today only
-    /// the chunk bound lives here; retry and parallelism settings will join
-    /// it.
+    /// The execution-behavior settings of the load (ADR-0046): the chunk
+    /// bound and the retry policy (ADR-0049); parallelism settings will
+    /// join them.
     execution: Option<ExecutionConfig>,
     /// The number of rejected records this load tolerates before failing.
     /// Defaults to `0`: any rejected record fails the load unless the
@@ -234,11 +246,28 @@ struct LoadDefinition {
 /// non-integer bounds fail YAML parsing (`NonZeroU64`), so every invalid
 /// bound is a definition failure under the existing code and no new
 /// execution failure code exists. Unknown keys are rejected recursively
-/// (ADR-0037).
+/// (ADR-0037). `retry` holds the load's retry policy (ADR-0049);
+/// parallelism settings will join these.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ExecutionConfig {
     chunk_rows: Option<std::num::NonZeroU64>,
+    retry: Option<RetryConfig>,
+}
+
+/// The `execution.retry` block of a load definition (ADR-0049): the total
+/// attempts each retry unit is allowed — including the first, nonzero so
+/// `max_attempts: 1` is the disable form and `0` fails YAML parsing like an
+/// invalid `chunk_rows` — and the fixed exponential backoff bounds in
+/// milliseconds. All keys are optional and `retry: {}` equals an absent
+/// block: absent knobs default to 3/200/5000. Unknown keys are rejected
+/// recursively (ADR-0037).
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RetryConfig {
+    max_attempts: Option<std::num::NonZeroU64>,
+    initial_delay_ms: Option<u64>,
+    max_delay_ms: Option<u64>,
 }
 
 /// The `artifacts` block of a load definition: the root under which this load's
@@ -311,6 +340,9 @@ struct ReportableFailure {
     written_records: u64,
     rejected_count: u64,
     committed_execution: Option<CommittedExecution>,
+    /// The `not_started` posture's conditional retry story (ADR-0050); see
+    /// [`ExecutionFailure`].
+    retry: Option<Box<Value>>,
     destination_write: DestinationWriteFacts,
     code: &'static str,
     message: String,
@@ -331,6 +363,7 @@ impl ReportableFailure {
             written_records: 0,
             rejected_count: 0,
             committed_execution: None,
+            retry: None,
             destination_write: DestinationWriteFacts::not_applicable(),
             code,
             message,
@@ -341,12 +374,17 @@ impl ReportableFailure {
 /// The execution posture of a failure that happened after the load entered
 /// the write phase (ADR-0047): the chunks the destination had committed —
 /// `0` for a full refresh before its terminal commit, the prefix for
-/// append — and the effective chunk bound the report echoes. Failures
+/// append — and the effective chunk bound the report echoes, joined by the
+/// load's retry story (ADR-0050) — the policy echo plus the attempts array,
+/// always present in this posture even when nothing was retried. Failures
 /// before the write phase carry `None` and keep the `not_started` posture.
 #[derive(Debug)]
 struct CommittedExecution {
     committed_chunks: u64,
     chunk_rows: u64,
+    // Boxed so the failure types carrying this posture stay small enough to
+    // return by value.
+    retry: Box<Value>,
 }
 
 /// The schema decision a report carries when the load failed before any schema
@@ -378,6 +416,13 @@ struct ExecutionFailure {
     written_records: u64,
     rejected_count: u64,
     committed_execution: Option<CommittedExecution>,
+    /// The retry story of a failure that kept the pre-write `not_started`
+    /// posture: present exactly when wrapped `begin` attempts were recorded
+    /// (ADR-0050's conditional presence rule) — provably never in the
+    /// shipped connector matrix, where no failure is transient. In-session
+    /// failures carry theirs on [`CommittedExecution`] instead. Boxed like
+    /// the schema decision.
+    retry: Option<Box<Value>>,
     destination_write: Box<DestinationWriteFacts>,
 }
 
@@ -413,6 +458,7 @@ impl From<LoadFailure> for ExecutionFailure {
             written_records: 0,
             rejected_count: 0,
             committed_execution: None,
+            retry: None,
             destination_write: Box::new(DestinationWriteFacts::not_applicable()),
         }
     }
@@ -556,6 +602,7 @@ fn execute_load_definition(
                 written_records: 0,
                 rejected_count: 0,
                 committed_execution: None,
+                retry: None,
                 destination_write: DestinationWriteFacts::not_applicable(),
                 code: "unsupported_load_definition_version",
                 message: format!("unsupported load definition version: {version}"),
@@ -572,6 +619,7 @@ fn execute_load_definition(
                 written_records: 0,
                 rejected_count: 0,
                 committed_execution: None,
+                retry: None,
                 destination_write: DestinationWriteFacts::not_applicable(),
                 code: "missing_load_definition_version",
                 message: "load definition version is required".to_string(),
@@ -592,6 +640,7 @@ fn execute_load_definition(
         written_records: execution_failure.written_records,
         rejected_count: execution_failure.rejected_count,
         committed_execution: execution_failure.committed_execution,
+        retry: execution_failure.retry,
         destination_write: *execution_failure.destination_write,
         code: execution_failure.failure.code,
         message: execution_failure.failure.message,
@@ -647,6 +696,7 @@ fn execute_supported_load(
         &resolved_source_format(&source.path, source.format.as_deref()),
     )?;
     let chunk_rows = resolve_chunk_rows(definition.execution.as_ref());
+    let retry_policy = resolve_retry_policy(definition.execution.as_ref());
 
     let reject_threshold = definition.reject_threshold.unwrap_or(0);
     let SourceRead {
@@ -694,12 +744,23 @@ fn execute_supported_load(
         }
     }
 
-    let outcome = match run_write_phase(chunks, destination_port.as_ref(), mode) {
+    let mut sleeper = retry::ThreadSleeper;
+    let mut retry_attempts = Vec::new();
+    let outcome = match run_write_phase(
+        chunks,
+        destination_port.as_ref(),
+        mode,
+        &retry_policy,
+        &mut sleeper,
+        &mut retry_attempts,
+    ) {
         Ok(outcome) => outcome,
         // A failure opening the session keeps the pre-write posture: no
         // record batch was ever exchanged, so the report stays at
         // `not_started` exactly as it did before sessions existed
-        // (ADR-0047).
+        // (ADR-0047), stating a retry story only when `begin` attempts were
+        // actually recorded (ADR-0050) — never in the shipped connector
+        // matrix, where no failure is transient.
         Err(WritePhaseFailure::BeforeSession(write_failure)) => {
             return Err(ExecutionFailure {
                 failure: write_failure.failure,
@@ -708,6 +769,7 @@ fn execute_supported_load(
                 written_records: write_failure.written_records,
                 rejected_count,
                 committed_execution: None,
+                retry: retry::report_when_attempted(&retry_policy, &retry_attempts),
                 destination_write: Box::new(write_failure.facts),
             })
         }
@@ -721,7 +783,9 @@ fn execute_supported_load(
                 committed_execution: Some(CommittedExecution {
                     committed_chunks: write_failure.committed_chunks,
                     chunk_rows,
+                    retry: Box::new(retry::report_value(&retry_policy, &retry_attempts)),
                 }),
+                retry: None,
                 destination_write: Box::new(write_failure.facts),
             })
         }
@@ -747,7 +811,8 @@ fn execute_supported_load(
         execution: json!({
             "record_format": "arrow_record_batch",
             "batch_count": outcome.chunk_count,
-            "chunk_rows": chunk_rows
+            "chunk_rows": chunk_rows,
+            "retry": retry::report_value(&retry_policy, &retry_attempts)
         }),
     })
 }
@@ -761,6 +826,22 @@ fn resolve_chunk_rows(execution: Option<&ExecutionConfig>) -> u64 {
         .and_then(|execution| execution.chunk_rows)
         .map(std::num::NonZeroU64::get)
         .unwrap_or(DEFAULT_CHUNK_ROWS)
+}
+
+/// Resolves the effective retry policy from the definition's `execution.retry`
+/// block (ADR-0049): each declared knob, with 3/200/5000 wherever the block
+/// or a key is absent. Never a failure — a zero or non-integer
+/// `max_attempts` was already rejected at YAML parse time.
+fn resolve_retry_policy(execution: Option<&ExecutionConfig>) -> retry::RetryPolicy {
+    let defaults = retry::RetryPolicy::default();
+    let Some(config) = execution.and_then(|execution| execution.retry.as_ref()) else {
+        return defaults;
+    };
+    retry::RetryPolicy {
+        max_attempts: config.max_attempts.unwrap_or(defaults.max_attempts),
+        initial_delay_ms: config.initial_delay_ms.unwrap_or(defaults.initial_delay_ms),
+        max_delay_ms: config.max_delay_ms.unwrap_or(defaults.max_delay_ms),
+    }
 }
 
 /// An execution failure raised after the read resolved the load but before
@@ -780,6 +861,7 @@ fn resolved_pre_write_failure(
         written_records: 0,
         rejected_count,
         committed_execution: None,
+        retry: None,
         destination_write: Box::new(DestinationWriteFacts::not_applicable()),
     }
 }
@@ -804,26 +886,47 @@ enum WritePhaseFailure {
 }
 
 /// Streams the source chunks into one destination write session (ADR-0046):
-/// begin, one `write_chunk` per source chunk, then the terminal commit. A
-/// destination failure carries its own committed-state facts; a source
-/// failure mid-stream — the mutation guard, or a chunk that fails to build
-/// — abandons the session and reports the destination state at abandonment,
-/// so append's committed chunk prefix stays honestly visible (ADR-0047).
+/// begin, one `write_chunk` per source chunk, then the terminal commit. The
+/// retry engine wraps `begin` and each `write_chunk` — the two retry units
+/// (ADR-0048) — re-attempting transient failures under the policy through
+/// the sleeper, with failed attempts of retried units accumulating onto the
+/// orchestrator-held `retry_attempts` log; the terminal `commit` is never
+/// engine-retried, structurally: committing consumes the writer, so nothing
+/// remains to re-call. A destination failure carries its own
+/// committed-state facts; a source failure mid-stream — the mutation guard,
+/// or a chunk that fails to build — abandons the session and reports the
+/// destination state at abandonment, so append's committed chunk prefix
+/// stays honestly visible (ADR-0047).
 fn run_write_phase(
     chunks: impl Iterator<Item = Result<RecordBatch, LoadFailure>>,
     destination: &dyn Destination,
     mode: LoadMode,
+    retry_policy: &retry::RetryPolicy,
+    sleeper: &mut dyn retry::Sleeper,
+    retry_attempts: &mut Vec<retry::RetryAttempt>,
 ) -> Result<WritePhaseOutcome, WritePhaseFailure> {
-    let mut writer = destination
-        .begin(mode)
-        .map_err(WritePhaseFailure::BeforeSession)?;
+    let mut writer = retry::run_unit(
+        retry_policy,
+        retry::RetryUnit::Begin,
+        retry_attempts,
+        sleeper,
+        || destination.begin(mode),
+    )
+    .map_err(WritePhaseFailure::BeforeSession)?;
     let mut chunk_count = 0_u64;
     for chunk in chunks {
         match chunk {
             Ok(batch) => {
-                writer
-                    .write_chunk(&batch)
-                    .map_err(WritePhaseFailure::InSession)?;
+                retry::run_unit(
+                    retry_policy,
+                    retry::RetryUnit::WriteChunk {
+                        chunk_index: chunk_count,
+                    },
+                    retry_attempts,
+                    sleeper,
+                    || writer.write_chunk(&batch),
+                )
+                .map_err(WritePhaseFailure::InSession)?;
                 chunk_count += 1;
             }
             Err(source_failure) => {
@@ -833,6 +936,7 @@ fn run_write_phase(
                     facts: abandoned.facts,
                     written_records: abandoned.written_records,
                     committed_chunks: abandoned.committed_chunks,
+                    transience: Transience::Terminal,
                 }));
             }
         }
@@ -1156,6 +1260,7 @@ mod tests {
             written_records: 0,
             rejected_count: 0,
             committed_execution: None,
+            retry: None,
             destination_write: DestinationWriteFacts::not_applicable(),
             code: "missing_source",
             message: "load definition source is required".to_string(),
@@ -1221,6 +1326,7 @@ mod tests {
             written_records: 0,
             rejected_count: 2,
             committed_execution: None,
+            retry: None,
             destination_write: DestinationWriteFacts::not_applicable(),
             code: "reject_threshold_exceeded",
             message: "rejected 2 of 3 records, exceeding the reject threshold of 0".to_string(),
@@ -1353,8 +1459,16 @@ mod tests {
     #[test]
     fn from_failure_reports_the_committed_write_phase_posture() {
         // A failure after the load entered the write phase reports the
-        // chunked execution posture: the committed chunk count and the
-        // effective chunk bound (ADR-0047).
+        // chunked execution posture: the committed chunk count, the
+        // effective chunk bound (ADR-0047), and the retry story — the
+        // policy echo with its attempts array, empty when nothing was
+        // retried (ADR-0050).
+        let retry_story = json!({
+            "max_attempts": 3,
+            "initial_delay_ms": 200,
+            "max_delay_ms": 5000,
+            "attempts": []
+        });
         let failure = ReportableFailure {
             source_summary: json!({ "connector": "local_file" }),
             destination_summary: json!({ "connector": "parquet" }),
@@ -1367,7 +1481,9 @@ mod tests {
             committed_execution: Some(CommittedExecution {
                 committed_chunks: 2,
                 chunk_rows: 1,
+                retry: Box::new(retry_story.clone()),
             }),
+            retry: None,
             destination_write: DestinationWriteFacts::best_effort("staged_part_append"),
             code: "source_changed_during_load",
             message: "source changed during the load".to_string(),
@@ -1385,10 +1501,64 @@ mod tests {
             json!({
                 "record_format": "arrow_record_batch",
                 "batch_count": 2,
-                "chunk_rows": 1
+                "chunk_rows": 1,
+                "retry": retry_story
             })
         );
         assert_eq!(report.row_counts.written, 2);
+    }
+
+    #[test]
+    fn from_failure_states_a_not_started_retry_story_only_when_attempts_exist() {
+        // The `not_started` posture carries `retry` exactly when the load
+        // recorded attempts — a future connector's exhausted transient
+        // `begin` — and keeps its established two-field shape otherwise
+        // (ADR-0050): every never-retried failure report stays
+        // byte-identical to today's.
+        let retry_story = json!({
+            "max_attempts": 3,
+            "initial_delay_ms": 200,
+            "max_delay_ms": 5000,
+            "attempts": [{
+                "operation": "begin",
+                "attempt": 1,
+                "error": {
+                    "code": "destination_write_failed",
+                    "message": "connection shortage"
+                }
+            }]
+        });
+        let failure = ReportableFailure {
+            source_summary: json!({}),
+            destination_summary: json!({}),
+            dataset: None,
+            load_mode: "append".to_string(),
+            schema_decision: json!({ "mode": "inferred" }),
+            source_rows: 1,
+            written_records: 0,
+            rejected_count: 0,
+            committed_execution: None,
+            retry: Some(Box::new(retry_story.clone())),
+            destination_write: DestinationWriteFacts::not_applicable(),
+            code: "destination_write_failed",
+            message: "connection shortage".to_string(),
+        };
+
+        let report = LoadReport::from_failure(
+            "load-under-test".to_string(),
+            "artifacts/load-under-test".to_string(),
+            timings(),
+            failure,
+        );
+
+        assert_eq!(
+            report.execution,
+            json!({
+                "record_format": "not_started",
+                "batch_count": 0,
+                "retry": retry_story
+            })
+        );
     }
 
     // ---- Source-mutation guard across the write phase (ADR-0045, ADR-0047) ----
@@ -1441,7 +1611,37 @@ mod tests {
         let seed_path = work.path().join("seed.csv");
         fs::write(&seed_path, "id,name\n7,Seed\n8,Kept\n").expect("write seed csv");
         let read = read_csv_chunks(work, &seed_path, usize::MAX);
-        run_write_phase(read.chunks, destination, LoadMode::FullRefresh).expect("seed destination");
+        write_phase_without_retries(read.chunks, destination, LoadMode::FullRefresh)
+            .expect("seed destination");
+    }
+
+    /// Drives the write phase under the default retry policy for tests that
+    /// exercise no transient failure, asserting afterward that the engine
+    /// stayed idle: no sleep, no recorded attempt.
+    fn write_phase_without_retries(
+        chunks: connector::SourceChunks,
+        destination: &dyn connector::Destination,
+        mode: LoadMode,
+    ) -> Result<WritePhaseOutcome, WritePhaseFailure> {
+        let mut sleeper = retry::RecordingSleeper::new();
+        let mut retry_attempts = Vec::new();
+        let outcome = run_write_phase(
+            chunks,
+            destination,
+            mode,
+            &retry::RetryPolicy::default(),
+            &mut sleeper,
+            &mut retry_attempts,
+        );
+        assert!(
+            sleeper.slept_ms.is_empty(),
+            "no local failure is transient, so the engine never sleeps"
+        );
+        assert!(
+            retry_attempts.is_empty(),
+            "no local failure is transient, so no attempt is recorded"
+        );
+        outcome
     }
 
     fn duckdb_rows(work: &tempfile::TempDir) -> usize {
@@ -1472,9 +1672,11 @@ mod tests {
             let read = read_csv_chunks(&work, &source_path, 1);
             fs::write(&source_path, "id,name\n1,Bob\n2,Grace\n3,Cara\n").expect("mutate csv");
 
-            let Err(failure) =
-                run_write_phase(read.chunks, destination.as_ref(), LoadMode::FullRefresh)
-            else {
+            let Err(failure) = write_phase_without_retries(
+                read.chunks,
+                destination.as_ref(),
+                LoadMode::FullRefresh,
+            ) else {
                 panic!("source change fails the load")
             };
             let WritePhaseFailure::InSession(failure) = failure else {
@@ -1524,7 +1726,8 @@ mod tests {
             let read = read_csv_chunks(&work, &source_path, 1);
             fs::write(&source_path, "id,name\n1,Ada\n2,Grace\n3,Cara,extra\n").expect("mutate csv");
 
-            let Err(failure) = run_write_phase(read.chunks, destination.as_ref(), LoadMode::Append)
+            let Err(failure) =
+                write_phase_without_retries(read.chunks, destination.as_ref(), LoadMode::Append)
             else {
                 panic!("source change fails the load")
             };
@@ -1564,6 +1767,344 @@ mod tests {
         }
     }
 
+    // ---- Write-phase retry engine (issue #51: ADR-0048, ADR-0049, ADR-0050) ----
+
+    use crate::connector::{AbandonedWrite, DestinationWrite, DestinationWriter};
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    fn int64_batch(values: &[i64]) -> RecordBatch {
+        let field = arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false);
+        let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![field]));
+        RecordBatch::try_new(
+            schema,
+            vec![std::sync::Arc::new(arrow_array::Int64Array::from(
+                values.to_vec(),
+            ))],
+        )
+        .expect("test batch")
+    }
+
+    fn batch_values(batch: &RecordBatch) -> Vec<i64> {
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::Int64Array>()
+            .expect("int64 column")
+            .values()
+            .to_vec()
+    }
+
+    fn chunk_stream(chunks: &[&[i64]]) -> connector::SourceChunks {
+        let batches: Vec<Result<RecordBatch, LoadFailure>> = chunks
+            .iter()
+            .map(|values| Ok(int64_batch(values)))
+            .collect();
+        Box::new(batches.into_iter())
+    }
+
+    enum ScriptedWriteOutcome {
+        Succeed,
+        Fail {
+            message: &'static str,
+            transience: Transience,
+        },
+    }
+
+    fn scripted_transient(message: &'static str) -> ScriptedWriteOutcome {
+        ScriptedWriteOutcome::Fail {
+            message,
+            transience: Transience::Transient,
+        }
+    }
+
+    /// The scripted in-crate destination of the write-phase retry tests
+    /// (ADR-0048): models per-chunk commits like an append session, scripts
+    /// each `begin` and `write_chunk` call's outcome in call order — an
+    /// exhausted script succeeds — and observes every write invocation, so
+    /// tests prove the engine re-submits the same chunk batch and the
+    /// committed prefix stays honest. Transient failures are constructed
+    /// here and nowhere else: no shipped connector classifies any failure
+    /// transient.
+    struct ScriptedDestination {
+        begin_outcomes: RefCell<VecDeque<ScriptedWriteOutcome>>,
+        write_outcomes: Rc<RefCell<VecDeque<ScriptedWriteOutcome>>>,
+        begin_calls: Cell<u64>,
+        observed_writes: Rc<RefCell<Vec<Vec<i64>>>>,
+    }
+
+    impl ScriptedDestination {
+        fn new(
+            begin_outcomes: Vec<ScriptedWriteOutcome>,
+            write_outcomes: Vec<ScriptedWriteOutcome>,
+        ) -> Self {
+            ScriptedDestination {
+                begin_outcomes: RefCell::new(begin_outcomes.into()),
+                write_outcomes: Rc::new(RefCell::new(write_outcomes.into())),
+                begin_calls: Cell::new(0),
+                observed_writes: Rc::new(RefCell::new(Vec::new())),
+            }
+        }
+
+        fn observed_writes(&self) -> Vec<Vec<i64>> {
+            self.observed_writes.borrow().clone()
+        }
+    }
+
+    impl connector::Destination for ScriptedDestination {
+        fn supported_load_modes(&self) -> &'static [LoadMode] {
+            &[LoadMode::Append]
+        }
+
+        fn begin(
+            &self,
+            _mode: LoadMode,
+        ) -> Result<Box<dyn DestinationWriter>, DestinationWriteFailure> {
+            self.begin_calls.set(self.begin_calls.get() + 1);
+            match self.begin_outcomes.borrow_mut().pop_front() {
+                None | Some(ScriptedWriteOutcome::Succeed) => Ok(Box::new(ScriptedWriter {
+                    write_outcomes: Rc::clone(&self.write_outcomes),
+                    observed_writes: Rc::clone(&self.observed_writes),
+                    committed_chunks: 0,
+                    written_records: 0,
+                })),
+                Some(ScriptedWriteOutcome::Fail {
+                    message,
+                    transience,
+                }) => Err(DestinationWriteFailure {
+                    failure: LoadFailure {
+                        code: "destination_write_failed",
+                        message: message.to_string(),
+                    },
+                    facts: DestinationWriteFacts::not_applicable(),
+                    written_records: 0,
+                    committed_chunks: 0,
+                    transience,
+                }),
+            }
+        }
+    }
+
+    struct ScriptedWriter {
+        write_outcomes: Rc<RefCell<VecDeque<ScriptedWriteOutcome>>>,
+        observed_writes: Rc<RefCell<Vec<Vec<i64>>>>,
+        committed_chunks: u64,
+        written_records: u64,
+    }
+
+    impl DestinationWriter for ScriptedWriter {
+        fn write_chunk(&mut self, batch: &RecordBatch) -> Result<(), DestinationWriteFailure> {
+            self.observed_writes.borrow_mut().push(batch_values(batch));
+            match self.write_outcomes.borrow_mut().pop_front() {
+                None | Some(ScriptedWriteOutcome::Succeed) => {
+                    self.committed_chunks += 1;
+                    self.written_records += batch.num_rows() as u64;
+                    Ok(())
+                }
+                Some(ScriptedWriteOutcome::Fail {
+                    message,
+                    transience,
+                }) => Err(DestinationWriteFailure {
+                    failure: LoadFailure {
+                        code: "destination_write_failed",
+                        message: message.to_string(),
+                    },
+                    facts: DestinationWriteFacts::best_effort("scripted_append"),
+                    written_records: self.written_records,
+                    committed_chunks: self.committed_chunks,
+                    transience,
+                }),
+            }
+        }
+
+        fn commit(self: Box<Self>) -> Result<DestinationWrite, DestinationWriteFailure> {
+            Ok(DestinationWrite {
+                bytes_written: None,
+                facts: DestinationWriteFacts::best_effort("scripted_append"),
+            })
+        }
+
+        fn abandon(self: Box<Self>) -> AbandonedWrite {
+            AbandonedWrite {
+                committed_chunks: self.committed_chunks,
+                written_records: self.written_records,
+                facts: DestinationWriteFacts::best_effort("scripted_append"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_transient_write_chunk_failure_resubmits_the_same_chunk_batch() {
+        // Chunk 0 fails transiently once: the engine re-invokes write_chunk
+        // with the identical batch — the retry unit's same-input rule
+        // (ADR-0048) — and the load completes with one recorded attempt.
+        let destination =
+            ScriptedDestination::new(Vec::new(), vec![scripted_transient("first chunk shortage")]);
+        let mut sleeper = retry::RecordingSleeper::new();
+        let mut retry_attempts = Vec::new();
+
+        let outcome = run_write_phase(
+            chunk_stream(&[&[1, 2], &[3, 4]]),
+            &destination,
+            LoadMode::Append,
+            &retry::RetryPolicy::default(),
+            &mut sleeper,
+            &mut retry_attempts,
+        )
+        .expect("the retried chunk commits");
+
+        assert_eq!(outcome.chunk_count, 2);
+        assert_eq!(
+            destination.observed_writes(),
+            vec![vec![1, 2], vec![1, 2], vec![3, 4]],
+            "the failed chunk is re-submitted with the same records"
+        );
+        assert_eq!(sleeper.slept_ms, vec![200]);
+        let entries: Vec<Value> = retry_attempts
+            .iter()
+            .map(retry::RetryAttempt::report_value)
+            .collect();
+        assert_eq!(
+            entries,
+            vec![json!({
+                "operation": "write_chunk",
+                "chunk_index": 0,
+                "attempt": 1,
+                "error": {
+                    "code": "destination_write_failed",
+                    "message": "first chunk shortage"
+                },
+                "delay_before_retry_ms": 200
+            })]
+        );
+    }
+
+    #[test]
+    fn a_transient_begin_failure_reopens_the_session() {
+        // begin is its own retry unit: a transient session-open failure is
+        // re-attempted, and the chunks stream into the second session.
+        let destination =
+            ScriptedDestination::new(vec![scripted_transient("connection shortage")], Vec::new());
+        let mut sleeper = retry::RecordingSleeper::new();
+        let mut retry_attempts = Vec::new();
+
+        let outcome = run_write_phase(
+            chunk_stream(&[&[1]]),
+            &destination,
+            LoadMode::Append,
+            &retry::RetryPolicy::default(),
+            &mut sleeper,
+            &mut retry_attempts,
+        )
+        .expect("the retried begin opens the session");
+
+        assert_eq!(destination.begin_calls.get(), 2);
+        assert_eq!(outcome.chunk_count, 1);
+        assert_eq!(destination.observed_writes(), vec![vec![1]]);
+        assert_eq!(sleeper.slept_ms, vec![200]);
+        let entries: Vec<Value> = retry_attempts
+            .iter()
+            .map(retry::RetryAttempt::report_value)
+            .collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["operation"], "begin");
+        assert!(entries[0].get("chunk_index").is_none());
+    }
+
+    #[test]
+    fn an_exhausted_chunk_unit_keeps_the_committed_prefix_and_the_full_history() {
+        // Chunk 0 commits; chunk 1 exhausts its three-attempt budget. The
+        // in-session failure carries the honest committed prefix and the
+        // last failure unchanged, and the log holds every failed attempt of
+        // the exhausted unit (ADR-0050).
+        let destination = ScriptedDestination::new(
+            Vec::new(),
+            vec![
+                ScriptedWriteOutcome::Succeed,
+                scripted_transient("first shortage"),
+                scripted_transient("second shortage"),
+                scripted_transient("third shortage"),
+            ],
+        );
+        let mut sleeper = retry::RecordingSleeper::new();
+        let mut retry_attempts = Vec::new();
+
+        let Err(WritePhaseFailure::InSession(failure)) = run_write_phase(
+            chunk_stream(&[&[1], &[2], &[3]]),
+            &destination,
+            LoadMode::Append,
+            &retry::RetryPolicy::default(),
+            &mut sleeper,
+            &mut retry_attempts,
+        ) else {
+            panic!("an exhausted chunk unit fails in session")
+        };
+
+        assert_eq!(failure.failure.code, "destination_write_failed");
+        assert_eq!(failure.failure.message, "third shortage");
+        assert_eq!(failure.committed_chunks, 1);
+        assert_eq!(failure.written_records, 1);
+        assert_eq!(
+            destination.observed_writes(),
+            vec![vec![1], vec![2], vec![2], vec![2]],
+            "every re-attempt of the exhausted unit re-submitted the same batch"
+        );
+        assert_eq!(sleeper.slept_ms, vec![200, 400]);
+        let entries: Vec<Value> = retry_attempts
+            .iter()
+            .map(retry::RetryAttempt::report_value)
+            .collect();
+        assert_eq!(entries.len(), 3);
+        for (index, entry) in entries.iter().enumerate() {
+            assert_eq!(entry["operation"], "write_chunk");
+            assert_eq!(entry["chunk_index"], 1);
+            assert_eq!(entry["attempt"], index as u64 + 1);
+        }
+        assert_eq!(entries[0]["delay_before_retry_ms"], 200);
+        assert_eq!(entries[1]["delay_before_retry_ms"], 400);
+        assert!(entries[2].get("delay_before_retry_ms").is_none());
+    }
+
+    #[test]
+    fn an_exhausted_begin_unit_fails_before_the_session_with_its_history() {
+        // begin never opens: the failure stays before the session — the
+        // not_started report posture — while the attempt log still tells
+        // the whole retry story (ADR-0050's conditional presence rule).
+        let destination = ScriptedDestination::new(
+            vec![
+                scripted_transient("first shortage"),
+                scripted_transient("second shortage"),
+                scripted_transient("third shortage"),
+            ],
+            Vec::new(),
+        );
+        let mut sleeper = retry::RecordingSleeper::new();
+        let mut retry_attempts = Vec::new();
+
+        let Err(WritePhaseFailure::BeforeSession(failure)) = run_write_phase(
+            chunk_stream(&[&[1]]),
+            &destination,
+            LoadMode::Append,
+            &retry::RetryPolicy::default(),
+            &mut sleeper,
+            &mut retry_attempts,
+        ) else {
+            panic!("an exhausted begin unit fails before the session")
+        };
+
+        assert_eq!(failure.failure.message, "third shortage");
+        assert_eq!(destination.begin_calls.get(), 3);
+        assert!(destination.observed_writes().is_empty());
+        assert_eq!(sleeper.slept_ms, vec![200, 400]);
+        let entries: Vec<Value> = retry_attempts
+            .iter()
+            .map(retry::RetryAttempt::report_value)
+            .collect();
+        assert_eq!(entries.len(), 3);
+        assert!(entries.iter().all(|entry| entry["operation"] == "begin"));
+    }
+
     #[test]
     fn load_definition_parses_the_reject_threshold() {
         let definition =
@@ -1580,6 +2121,85 @@ mod tests {
         assert!(
             serde_yaml::from_str::<LoadDefinition>("version: 1\nreject_threshold: -1\n").is_err()
         );
+    }
+
+    #[test]
+    fn load_definition_parses_the_retry_block() {
+        // All keys optional: a full block, a partial block, and `retry: {}`
+        // all parse; the zero and non-integer forms fail YAML parsing, so
+        // every invalid knob surfaces as invalid_load_definition_yaml at the
+        // load boundary (ADR-0049).
+        let definition = serde_yaml::from_str::<LoadDefinition>(
+            "version: 1\n\
+             execution:\n\
+             \x20 retry:\n\
+             \x20   max_attempts: 5\n\
+             \x20   initial_delay_ms: 50\n\
+             \x20   max_delay_ms: 900\n",
+        )
+        .expect("definition with a full retry block parses");
+        let retry_config = definition
+            .execution
+            .expect("execution block")
+            .retry
+            .expect("retry block");
+        assert_eq!(
+            retry_config.max_attempts.map(std::num::NonZeroU64::get),
+            Some(5)
+        );
+        assert_eq!(retry_config.initial_delay_ms, Some(50));
+        assert_eq!(retry_config.max_delay_ms, Some(900));
+
+        let definition =
+            serde_yaml::from_str::<LoadDefinition>("version: 1\nexecution:\n  retry: {}\n")
+                .expect("an empty retry block parses");
+        let retry_config = definition
+            .execution
+            .expect("execution block")
+            .retry
+            .expect("retry block");
+        assert!(retry_config.max_attempts.is_none());
+        assert!(retry_config.initial_delay_ms.is_none());
+        assert!(retry_config.max_delay_ms.is_none());
+
+        for yaml in [
+            "version: 1\nexecution:\n  retry:\n    max_attempts: 0\n",
+            "version: 1\nexecution:\n  retry:\n    max_attempts: 2.5\n",
+            "version: 1\nexecution:\n  retry:\n    initial_delay_ms: -1\n",
+        ] {
+            assert!(
+                serde_yaml::from_str::<LoadDefinition>(yaml).is_err(),
+                "invalid retry knob accepted: {yaml:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_retry_policy_defaults_and_echoes_declared_knobs() {
+        // Absent block, absent key, and `retry: {}` are all the defaults;
+        // declared knobs win individually, so a partial block keeps the
+        // remaining defaults (ADR-0049).
+        for yaml in [
+            "version: 1\n",
+            "version: 1\nexecution: {}\n",
+            "version: 1\nexecution:\n  retry: {}\n",
+        ] {
+            let definition =
+                serde_yaml::from_str::<LoadDefinition>(yaml).expect("definition parses");
+            let policy = resolve_retry_policy(definition.execution.as_ref());
+            assert_eq!(policy.max_attempts.get(), 3, "for {yaml:?}");
+            assert_eq!(policy.initial_delay_ms, 200, "for {yaml:?}");
+            assert_eq!(policy.max_delay_ms, 5000, "for {yaml:?}");
+        }
+
+        let definition = serde_yaml::from_str::<LoadDefinition>(
+            "version: 1\nexecution:\n  retry:\n    max_attempts: 5\n",
+        )
+        .expect("definition parses");
+        let policy = resolve_retry_policy(definition.execution.as_ref());
+        assert_eq!(policy.max_attempts.get(), 5);
+        assert_eq!(policy.initial_delay_ms, 200);
+        assert_eq!(policy.max_delay_ms, 5000);
     }
 
     #[test]
@@ -1611,6 +2231,10 @@ mod tests {
             (
                 "version: 1\nartifacts:\n  dir: runs\n  retention_days: 7\n",
                 "retention_days",
+            ),
+            (
+                "version: 1\nexecution:\n  retry:\n    jitter: true\n",
+                "jitter",
             ),
         ] {
             let error = serde_yaml::from_str::<LoadDefinition>(yaml)

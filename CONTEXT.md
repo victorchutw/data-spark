@@ -141,8 +141,12 @@ A destination write where partial destination changes can occur if the load fail
 _Avoid_: Partial write, non-atomic write
 
 **Transient Failure**:
-A failure that is expected to be temporary and safe to retry without changing load semantics.
+A failure that is expected to be temporary and provably left no committed destination change, so the failed unit is safe to attempt again.
 _Avoid_: Temporary error, retryable error
+
+**Terminal Failure**:
+A failure that must not be automatically retried, including every failure whose commit outcome is uncertain.
+_Avoid_: Permanent error, fatal error
 
 **Commit Boundary**:
 The point after which a destination write may have become visible.
@@ -151,6 +155,14 @@ _Avoid_: Commit phase, point of no return
 **Retry Attempt**:
 A repeated attempt of a failed operation within the same load.
 _Avoid_: Retry, rerun
+
+**Retry Unit**:
+The bounded operation a load re-attempts as a whole after a transient failure, with the same input.
+_Avoid_: Retryable operation, work item
+
+**Retry Policy**:
+The configured rule for how many attempts a retry unit is allowed and how long a load waits between them.
+_Avoid_: Retry config, backoff settings
 
 **Load Parallelism**:
 The amount of concurrent work allowed within a load.

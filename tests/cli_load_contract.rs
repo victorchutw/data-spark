@@ -7762,6 +7762,321 @@ fn chunk_split_is_deterministic_across_identical_runs() {
     assert_eq!(observed_splits[0], observed_splits[1]);
 }
 
+// ---- Retry policy and attempt metadata (issue #51: ADR-0048, ADR-0049, ADR-0050) ----
+
+/// The `execution.retry` echo of an all-defaults load: 3/200/5000 around the
+/// always-present empty attempts array (ADR-0050).
+fn default_retry_echo() -> Value {
+    serde_json::json!({
+        "max_attempts": 3,
+        "initial_delay_ms": 200,
+        "max_delay_ms": 5000,
+        "attempts": []
+    })
+}
+
+/// Writes a load definition whose `execution` block is appended verbatim —
+/// empty for an absent block — so retry knobs vary per test.
+fn write_retry_definition(
+    definition_path: &Path,
+    source_path: &Path,
+    destination_connector: &str,
+    destination_path: &Path,
+    load_mode: &str,
+    execution_block: &str,
+) {
+    fs::write(
+        definition_path,
+        format!(
+            "version: 1\n\
+             source:\n\
+             \x20 connector: local_file\n\
+             \x20 path: {}\n\
+             \x20 format: csv\n\
+             destination:\n\
+             \x20 connector: {destination_connector}\n\
+             \x20 path: {}\n\
+             dataset: customers\n\
+             load_mode: {load_mode}\n\
+             {execution_block}",
+            source_path.display(),
+            destination_path.display(),
+        ),
+    )
+    .expect("write load definition");
+}
+
+#[test]
+fn success_reports_state_the_default_retry_policy_across_the_connector_matrix() {
+    // Every write-phase report carries `execution.retry` (ADR-0050): the
+    // effective policy echo — the 3/200/5000 defaults here — around an
+    // always-present empty attempts array, across all four connector × mode
+    // cells. No shipped failure is classified transient (ADR-0048), so the
+    // attempts array is empty everywhere and the engine stays provably idle.
+    for (destination_connector, load_mode) in [
+        ("parquet", "full_refresh"),
+        ("parquet", "append"),
+        ("duckdb", "full_refresh"),
+        ("duckdb", "append"),
+    ] {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.csv");
+        fs::write(&source_path, "customer_id,name\n1,Ada\n").expect("write source csv");
+        let destination_path = match destination_connector {
+            "parquet" => work.path().join("customers_dataset"),
+            _ => work.path().join("customers.duckdb"),
+        };
+        // A DuckDB append needs the destination table to exist.
+        if destination_connector == "duckdb" && load_mode == "append" {
+            let connection =
+                duckdb::Connection::open(&destination_path).expect("open DuckDB destination");
+            connection
+                .execute_batch("CREATE TABLE customers (customer_id BIGINT, name VARCHAR)")
+                .expect("seed DuckDB destination");
+        }
+        let definition_path = work.path().join("load.yml");
+        write_retry_definition(
+            &definition_path,
+            &source_path,
+            destination_connector,
+            &destination_path,
+            load_mode,
+            "",
+        );
+
+        let load = run_cli_load(
+            work.path(),
+            &work.path().join("artifacts"),
+            &definition_path,
+            true,
+        );
+        let report = &load.report;
+
+        assert_eq!(
+            report["exit_status"], "succeeded",
+            "{destination_connector}/{load_mode}"
+        );
+        assert_eq!(report["report_version"], 1);
+        assert_eq!(report["execution"]["record_format"], "arrow_record_batch");
+        assert_eq!(
+            report["execution"]["retry"],
+            default_retry_echo(),
+            "{destination_connector}/{load_mode}"
+        );
+    }
+}
+
+#[test]
+fn declared_retry_knobs_echo_faithfully_and_partial_blocks_keep_the_defaults() {
+    // The report echoes the effective policy (ADR-0049): declared knobs win
+    // individually, `retry: {}` equals an absent block, and `max_attempts: 1`
+    // — the disable form — is a legal declaration echoed like any other.
+    for (execution_block, expected_max_attempts, expected_initial, expected_max_delay) in [
+        (
+            "execution:\n\
+             \x20 retry:\n\
+             \x20   max_attempts: 5\n\
+             \x20   initial_delay_ms: 50\n\
+             \x20   max_delay_ms: 900\n",
+            5,
+            50,
+            900,
+        ),
+        ("execution:\n  retry: {}\n", 3, 200, 5000),
+        ("execution:\n  retry:\n    max_attempts: 1\n", 1, 200, 5000),
+    ] {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.csv");
+        fs::write(&source_path, "customer_id\n1\n").expect("write source csv");
+        let destination_path = work.path().join("customers_dataset");
+        let definition_path = work.path().join("load.yml");
+        write_retry_definition(
+            &definition_path,
+            &source_path,
+            "parquet",
+            &destination_path,
+            "full_refresh",
+            execution_block,
+        );
+
+        let load = run_cli_load(
+            work.path(),
+            &work.path().join("artifacts"),
+            &definition_path,
+            true,
+        );
+
+        assert_eq!(
+            load.report["execution"]["retry"],
+            serde_json::json!({
+                "max_attempts": expected_max_attempts,
+                "initial_delay_ms": expected_initial,
+                "max_delay_ms": expected_max_delay,
+                "attempts": []
+            }),
+            "{execution_block:?}"
+        );
+    }
+}
+
+#[test]
+fn invalid_retry_blocks_fail_before_source_or_destination_work() {
+    // The retry block is part of the strict contract (ADR-0049): a zero or
+    // non-integer `max_attempts`, a negative delay, and an unknown key all
+    // fail YAML parsing under the existing definition failure code, before
+    // any source read or destination write — and the failed report keeps
+    // the exact two-field `not_started` posture, with no retry object.
+    for (execution_block, expected_message_part) in [
+        (
+            "execution:\n  retry:\n    max_attempts: 0\n",
+            "expected a nonzero u64",
+        ),
+        (
+            "execution:\n  retry:\n    max_attempts: 2.5\n",
+            "max_attempts",
+        ),
+        (
+            "execution:\n  retry:\n    initial_delay_ms: -1\n",
+            "initial_delay_ms",
+        ),
+        (
+            "execution:\n  retry:\n    jitter: true\n",
+            "unknown field `jitter`",
+        ),
+    ] {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.csv");
+        fs::write(&source_path, "customer_id\n1\n").expect("write source csv");
+        let destination_path = work.path().join("customers_dataset");
+        let definition_path = work.path().join("load.yml");
+        write_retry_definition(
+            &definition_path,
+            &source_path,
+            "parquet",
+            &destination_path,
+            "full_refresh",
+            execution_block,
+        );
+
+        let load = run_cli_load(
+            work.path(),
+            &work.path().join("artifacts"),
+            &definition_path,
+            false,
+        );
+        let report = &load.report;
+
+        assert_eq!(
+            report["error_summary"]["code"], "invalid_load_definition_yaml",
+            "{execution_block:?}"
+        );
+        let message = report["error_summary"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            message.contains(expected_message_part),
+            "message {message:?} misses {expected_message_part:?}"
+        );
+        assert_eq!(
+            report["execution"],
+            serde_json::json!({
+                "record_format": "not_started",
+                "batch_count": 0
+            }),
+            "a never-retried failure report carries no retry object"
+        );
+        assert!(
+            !destination_path.exists(),
+            "an invalid retry block must not reach the destination"
+        );
+    }
+}
+
+#[test]
+fn an_in_session_append_mismatch_carries_the_retry_object_with_zero_attempts() {
+    // A schema-mismatched DuckDB append fails inside the open session: the
+    // write-phase posture always carries `execution.retry` (ADR-0050), and
+    // the local mismatch is terminal (ADR-0048), so the load retried
+    // nothing and the attempts array is empty.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    {
+        let connection = duckdb::Connection::open(&database_path).expect("open DuckDB destination");
+        connection
+            .execute_batch("CREATE TABLE customers (id BIGINT); INSERT INTO customers VALUES (1)")
+            .expect("seed DuckDB destination");
+    }
+
+    fs::write(&source_path, "id\n2.9\n").expect("write lossy append csv");
+    write_retry_definition(
+        &definition_path,
+        &source_path,
+        "duckdb",
+        &database_path,
+        "append",
+        "",
+    );
+
+    let load = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts"),
+        &definition_path,
+        false,
+    );
+    let report = &load.report;
+
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert_eq!(report["execution"]["record_format"], "arrow_record_batch");
+    assert_eq!(report["execution"]["batch_count"], 0);
+    assert_eq!(report["execution"]["retry"], default_retry_echo());
+}
+
+#[test]
+fn a_failed_begin_keeps_the_exact_not_started_posture_without_a_retry_object() {
+    // A DuckDB append against a missing table fails opening the session:
+    // the report keeps the pre-write posture exactly as before — two fields,
+    // no retry object — because a never-retried `not_started` failure tells
+    // no retry story (ADR-0050's conditional presence rule).
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+    fs::write(&source_path, "customer_id\n1\n").expect("write source csv");
+    write_retry_definition(
+        &definition_path,
+        &source_path,
+        "duckdb",
+        &database_path,
+        "append",
+        "",
+    );
+
+    let load = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts"),
+        &definition_path,
+        false,
+    );
+    let report = &load.report;
+
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("before append"));
+    assert_eq!(
+        report["execution"],
+        serde_json::json!({
+            "record_format": "not_started",
+            "batch_count": 0
+        })
+    );
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+}
+
 fn write_load_definition(
     definition_path: &Path,
     source_path: &Path,

@@ -1,0 +1,11 @@
+---
+status: accepted
+---
+
+# Configure Retry as Per-Unit Attempts with Fixed Exponential Backoff
+
+The retry policy (ADR-0048) is load-definition configuration in the `execution` block ADR-0046 designated for it: a strict nested `retry` block with exactly three knobs — `max_attempts` (default 3), `initial_delay_ms` (default 200), and `max_delay_ms` (default 5000). All keys are optional and `retry: {}` equals an absent block, matching the `execution: {}` precedent; unknown keys inside `retry` are rejected recursively (ADR-0037). `max_attempts` counts the **total attempts per retry unit, including the first**, budgeted per unit — each `begin` and each chunk gets its own budget — so `max_attempts: 1` is the disable form and no separate enabled flag exists. It deserializes as a nonzero integer (the `chunk_rows` precedent), so `max_attempts: 0` and non-integer values fail YAML parsing under the existing `invalid_load_definition_yaml` code.
+
+Backoff is **fixed exponential ×2 with a clamp and no jitter**: the wait before attempt `n` (`n >= 2`) is `min(initial_delay_ms * 2^(n-2), max_delay_ms)`. The clamp keeps the formula well-defined even when `max_delay_ms < initial_delay_ms`, so no cross-field validation exists. Jitter's purpose is decorrelating concurrent clients against a shared throttled service; a local single-process tool has none, so jitter is deferred with an explicit revisit condition: reconsider when the first cloud connector lands. There is no total-time knob — attempts × capped delay already bounds the wait, and a second budget dimension would let the two knobs contradict each other. Retry is on by default: under the zero-transient shipped matrix (ADR-0048) the default changes no local behavior, while future connectors get correct out-of-the-box behavior instead of a flag nobody remembers to set.
+
+Alternatives rejected: jitter now (dead code with no decorrelation problem to solve, and a nondeterministic delay would complicate the deterministic test story for nothing); multiplier or total-time knobs (more surface, no current consumer — the fixed ×2 curve with a cap covers the local reality and the first cloud connectors alike); an `enabled` flag (a boolean that duplicates what `max_attempts: 1` already states, and two switches for one behavior invite contradiction).

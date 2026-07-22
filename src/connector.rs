@@ -115,6 +115,27 @@ pub(crate) struct DestinationWrite {
     pub(crate) facts: DestinationWriteFacts,
 }
 
+/// The originator-owned retry classification of a destination write failure
+/// (ADR-0048): only the connector that raised a failure may classify it, and
+/// a failure may be transient only when the failed attempt provably committed
+/// nothing to the destination and the session can accept a re-attempt of
+/// the same retry unit — any uncertainty keeps it terminal. Every
+/// construction path defaults to terminal; marking a failure transient
+/// takes an explicit `Transience::Transient` at the raising site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Transience {
+    /// Safe for the retry engine to re-attempt with the same input.
+    // No shipped connector classifies any failure transient (ADR-0048's
+    // zero-local-transient invariant): the variant is constructed only by
+    // the scripted test connectors, so the retry engine is provably idle in
+    // the current matrix. Drop the attribute with the first connector that
+    // marks a failure transient.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Transient,
+    /// Never engine-retried: terminal by classification or by uncertainty.
+    Terminal,
+}
+
 /// A destination failure plus the write facts the report can state honestly.
 /// Failures before any destination-visible change use `not_applicable`; a
 /// connector that crosses a best-effort write boundary attaches its strategy
@@ -122,13 +143,15 @@ pub(crate) struct DestinationWrite {
 /// (ADR-0021). `committed_chunks` and `written_records` count what the
 /// destination had already committed when the failure happened — `0` for a
 /// full refresh before its terminal commit, the chunk prefix for append
-/// (ADR-0047).
+/// (ADR-0047). `transience` is the originator's retry classification
+/// (ADR-0048), terminal on every existing path.
 #[derive(Debug)]
 pub(crate) struct DestinationWriteFailure {
     pub(crate) failure: LoadFailure,
     pub(crate) facts: DestinationWriteFacts,
     pub(crate) written_records: u64,
     pub(crate) committed_chunks: u64,
+    pub(crate) transience: Transience,
 }
 
 impl DestinationWriteFailure {
@@ -138,6 +161,7 @@ impl DestinationWriteFailure {
             facts: DestinationWriteFacts::atomic(strategy),
             written_records,
             committed_chunks: 0,
+            transience: Transience::Terminal,
         }
     }
 
@@ -147,6 +171,7 @@ impl DestinationWriteFailure {
             facts: DestinationWriteFacts::best_effort(strategy),
             written_records,
             committed_chunks: 0,
+            transience: Transience::Terminal,
         }
     }
 }
@@ -158,6 +183,7 @@ impl From<LoadFailure> for DestinationWriteFailure {
             facts: DestinationWriteFacts::not_applicable(),
             written_records: 0,
             committed_chunks: 0,
+            transience: Transience::Terminal,
         }
     }
 }
@@ -479,6 +505,7 @@ impl LocalFileSource {
                         written_records: 0,
                         rejected_count: sink.count(),
                         committed_execution: None,
+                        retry: None,
                         destination_write: Box::new(DestinationWriteFacts::not_applicable()),
                     });
                 }
@@ -526,6 +553,7 @@ impl LocalFileSource {
                 written_records: 0,
                 rejected_count: sink.count(),
                 committed_execution: None,
+                retry: None,
                 destination_write: Box::new(DestinationWriteFacts::not_applicable()),
             });
         }
@@ -781,6 +809,7 @@ impl ParquetAppendWriter {
                 facts: DestinationWriteFacts::best_effort("staged_part_append"),
                 written_records: self.written_records,
                 committed_chunks: self.committed_chunks,
+                transience: Transience::Terminal,
             }
         } else {
             failure.into()
@@ -827,6 +856,7 @@ impl DestinationWriter for ParquetAppendWriter {
                 facts: DestinationWriteFacts::best_effort("staged_part_append"),
                 written_records: self.written_records,
                 committed_chunks: self.committed_chunks,
+                transience: Transience::Terminal,
             });
         }
         self.committed_chunks += 1;
@@ -1175,6 +1205,7 @@ impl DestinationWriter for DuckDbFullRefreshWriter {
                 facts: DestinationWriteFacts::atomic("transactional_replace"),
                 written_records: self.written_records,
                 committed_chunks: self.written_chunks,
+                transience: Transience::Terminal,
             }
         })?;
 
@@ -1246,6 +1277,7 @@ impl DuckDbAppendWriter {
                 facts: DestinationWriteFacts::best_effort("insert"),
                 written_records: self.written_records,
                 committed_chunks: self.committed_chunks,
+                transience: Transience::Terminal,
             }
         } else {
             failure.into()
@@ -1281,6 +1313,7 @@ impl DestinationWriter for DuckDbAppendWriter {
                 facts: DestinationWriteFacts::best_effort("insert"),
                 written_records: self.written_records,
                 committed_chunks: self.committed_chunks,
+                transience: Transience::Terminal,
             })?;
         self.committed_chunks += 1;
         self.written_records += append_batch.num_rows() as u64;
@@ -1296,6 +1329,7 @@ impl DestinationWriter for DuckDbAppendWriter {
                 facts: DestinationWriteFacts::best_effort("insert"),
                 written_records: self.written_records,
                 committed_chunks: self.committed_chunks,
+                transience: Transience::Terminal,
             })?;
 
         Ok(DestinationWrite {
