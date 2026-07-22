@@ -175,8 +175,16 @@ impl RejectionSink {
         }
         if let Err(error) = self.merge_spill_file(&mut render) {
             self.io_error = Some(error);
+            // A failed merge must not leave its half-written scratch file in
+            // the artifact directory; the load aborts on the stored error.
+            let _ = fs::remove_file(self.merged_path());
         }
         let _ = fs::remove_file(&self.spill_path);
+    }
+
+    fn merged_path(&self) -> PathBuf {
+        self.artifact_path
+            .with_file_name(".rejected-records.merged")
     }
 
     fn merge_spill_file(
@@ -187,9 +195,7 @@ impl RejectionSink {
             writer.flush()?;
         }
 
-        let merged_path = self
-            .artifact_path
-            .with_file_name(".rejected-records.merged");
+        let merged_path = self.merged_path();
         let mut merged_lines = Vec::new();
         let mut merged_count = 0_u64;
         {
