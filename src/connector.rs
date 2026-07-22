@@ -416,9 +416,11 @@ impl LocalFileSource {
             checks,
             field_names,
             chunk_rows,
-            rejected_lines: sink.rejected_lines().iter().copied().collect(),
-            expected_records: source_rows,
-            expected_hash: hash.value(),
+            expectations: PassOneExpectations {
+                rejected_lines: sink.rejected_lines().iter().copied().collect(),
+                records: source_rows,
+                hash: hash.value(),
+            },
             reading: None,
             phase: ChunkPhase::NotStarted,
         };
@@ -554,9 +556,11 @@ impl LocalFileSource {
             checks,
             resolved_shape: seen_fields,
             chunk_rows,
-            rejected_lines: sink.rejected_lines().iter().copied().collect(),
-            expected_records: source_rows,
-            expected_hash: hash.value(),
+            expectations: PassOneExpectations {
+                rejected_lines: sink.rejected_lines().iter().copied().collect(),
+                records: source_rows,
+                hash: hash.value(),
+            },
             reading: None,
             phase: ChunkPhase::NotStarted,
         };
@@ -841,15 +845,30 @@ impl DestinationWriter for ParquetAppendWriter {
     }
 
     fn abandon(self: Box<Self>) -> AbandonedWrite {
-        AbandonedWrite {
-            facts: if self.committed_chunks > 0 {
-                DestinationWriteFacts::best_effort("staged_part_append")
-            } else {
-                DestinationWriteFacts::not_applicable()
-            },
-            committed_chunks: self.committed_chunks,
-            written_records: self.written_records,
-        }
+        append_abandoned(
+            "staged_part_append",
+            self.committed_chunks,
+            self.written_records,
+        )
+    }
+}
+
+/// The abandonment state shared by the per-chunk-commit (append) sessions:
+/// once any chunk committed the destination changed, so the facts state the
+/// mode's strategy; a session that committed nothing stays `not_applicable`.
+fn append_abandoned(
+    strategy: &'static str,
+    committed_chunks: u64,
+    written_records: u64,
+) -> AbandonedWrite {
+    AbandonedWrite {
+        facts: if committed_chunks > 0 {
+            DestinationWriteFacts::best_effort(strategy)
+        } else {
+            DestinationWriteFacts::not_applicable()
+        },
+        committed_chunks,
+        written_records,
     }
 }
 
@@ -1065,7 +1084,9 @@ impl Destination for DuckDbDestination {
 struct DuckDbFullRefreshWriter {
     table: DuckDbTable,
     connection: Option<Connection>,
-    committed_chunks: u64,
+    // Chunks written inside the still-open transaction: nothing is committed
+    // before COMMIT, which is why abandon reports zero regardless.
+    written_chunks: u64,
     written_records: u64,
 }
 
@@ -1084,7 +1105,7 @@ impl DuckDbFullRefreshWriter {
         Ok(DuckDbFullRefreshWriter {
             table,
             connection: Some(connection),
-            committed_chunks: 0,
+            written_chunks: 0,
             written_records: 0,
         })
     }
@@ -1111,7 +1132,7 @@ impl DestinationWriter for DuckDbFullRefreshWriter {
         // The first chunk replaces the table; the remaining chunks extend it
         // inside the same transaction, so every statement shares the replace
         // wording and the atomic posture.
-        let statement = if self.committed_chunks == 0 {
+        let statement = if self.written_chunks == 0 {
             format!(
                 "CREATE OR REPLACE TABLE {} AS SELECT * FROM arrow(?, ?)",
                 self.table.quoted_dataset()
@@ -1125,7 +1146,7 @@ impl DestinationWriter for DuckDbFullRefreshWriter {
         connection
             .execute(&statement, arrow_recordbatch_to_query_params(batch.clone()))
             .map_err(|error| self.replace_failure(error))?;
-        self.committed_chunks += 1;
+        self.written_chunks += 1;
         self.written_records += batch.num_rows() as u64;
         Ok(())
     }
@@ -1153,7 +1174,7 @@ impl DestinationWriter for DuckDbFullRefreshWriter {
                 failure: self.table.close_failure(error),
                 facts: DestinationWriteFacts::atomic("transactional_replace"),
                 written_records: self.written_records,
-                committed_chunks: self.committed_chunks,
+                committed_chunks: self.written_chunks,
             }
         })?;
 
@@ -1284,15 +1305,7 @@ impl DestinationWriter for DuckDbAppendWriter {
     }
 
     fn abandon(self: Box<Self>) -> AbandonedWrite {
-        AbandonedWrite {
-            facts: if self.committed_chunks > 0 {
-                DestinationWriteFacts::best_effort("insert")
-            } else {
-                DestinationWriteFacts::not_applicable()
-            },
-            committed_chunks: self.committed_chunks,
-            written_records: self.written_records,
-        }
+        append_abandoned("insert", self.committed_chunks, self.written_records)
     }
 }
 
@@ -1599,19 +1612,50 @@ enum RecordDisposition {
     Skips,
 }
 
-fn cross_check_outcome(
-    path: &Path,
-    rejected_lines: &HashSet<u64>,
-    line: u64,
-    rejected_now: bool,
-) -> Result<RecordDisposition, LoadFailure> {
-    match (rejected_now, rejected_lines.contains(&line)) {
-        (true, true) => Ok(RecordDisposition::Skips),
-        (false, false) => Ok(RecordDisposition::Survives),
-        _ => Err(source_changed(
-            path,
-            format!("the record at line {line} no longer matches its first-pass outcome"),
-        )),
+/// What pass 1 established and pass 2 must reproduce (ADR-0045): the
+/// rejected records' source lines, the full-input record count, and the
+/// byte hash — the whole divergence contract of a chunk stream, shared by
+/// both formats.
+struct PassOneExpectations {
+    rejected_lines: HashSet<u64>,
+    records: u64,
+    hash: u64,
+}
+
+impl PassOneExpectations {
+    fn cross_check(
+        &self,
+        path: &Path,
+        line: u64,
+        rejected_now: bool,
+    ) -> Result<RecordDisposition, LoadFailure> {
+        match (rejected_now, self.rejected_lines.contains(&line)) {
+            (true, true) => Ok(RecordDisposition::Skips),
+            (false, false) => Ok(RecordDisposition::Survives),
+            _ => Err(source_changed(
+                path,
+                format!("the record at line {line} no longer matches its first-pass outcome"),
+            )),
+        }
+    }
+
+    /// The end-of-input divergence checks, run on the pull after the final
+    /// chunk: the record count first — it names the change — then the byte
+    /// hash, which catches everything else.
+    fn verify_end_of_input(&self, path: &Path, seen: u64, hash: u64) -> Result<(), LoadFailure> {
+        if seen != self.records {
+            return Err(source_changed(
+                path,
+                format!("it now has {seen} records instead of {}", self.records),
+            ));
+        }
+        if hash != self.hash {
+            return Err(source_changed(
+                path,
+                "its bytes no longer match the first pass".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1630,9 +1674,7 @@ struct CsvChunks {
     checks: Vec<schema::FieldCheck>,
     field_names: Vec<String>,
     chunk_rows: usize,
-    rejected_lines: HashSet<u64>,
-    expected_records: u64,
-    expected_hash: u64,
+    expectations: PassOneExpectations,
     reading: Option<CsvReading>,
     phase: ChunkPhase,
 }
@@ -1678,21 +1720,11 @@ impl CsvChunks {
                 ChunkPhase::FinalCheck => {
                     self.phase = ChunkPhase::Done;
                     let reading = self.reading.take().expect("final check follows streaming");
-                    if reading.seen != self.expected_records {
-                        return Err(source_changed(
-                            &self.path,
-                            format!(
-                                "it now has {} records instead of {}",
-                                reading.seen, self.expected_records
-                            ),
-                        ));
-                    }
-                    if reading.hash.value() != self.expected_hash {
-                        return Err(source_changed(
-                            &self.path,
-                            "its bytes no longer match the first pass".to_string(),
-                        ));
-                    }
+                    self.expectations.verify_end_of_input(
+                        &self.path,
+                        reading.seen,
+                        reading.hash.value(),
+                    )?;
                     return Ok(None);
                 }
                 ChunkPhase::Streaming => {
@@ -1712,12 +1744,8 @@ impl CsvChunks {
                         reading.seen += 1;
                         match csv_item(record, self.field_names.len()) {
                             CsvItem::Rejected(rejection) => {
-                                cross_check_outcome(
-                                    &self.path,
-                                    &self.rejected_lines,
-                                    rejection.line,
-                                    true,
-                                )?;
+                                self.expectations
+                                    .cross_check(&self.path, rejection.line, true)?;
                             }
                             CsvItem::Record(text_record) => {
                                 let rejected_now = schema::validate_text_record(
@@ -1726,9 +1754,8 @@ impl CsvChunks {
                                     &self.field_names,
                                 )
                                 .is_some();
-                                match cross_check_outcome(
+                                match self.expectations.cross_check(
                                     &self.path,
-                                    &self.rejected_lines,
                                     text_record.line,
                                     rejected_now,
                                 )? {
@@ -1773,9 +1800,7 @@ struct JsonlChunks {
     checks: Vec<schema::FieldCheck>,
     resolved_shape: HashSet<String>,
     chunk_rows: usize,
-    rejected_lines: HashSet<u64>,
-    expected_records: u64,
-    expected_hash: u64,
+    expectations: PassOneExpectations,
     reading: Option<JsonlReading>,
     phase: ChunkPhase,
 }
@@ -1813,21 +1838,11 @@ impl JsonlChunks {
                 ChunkPhase::FinalCheck => {
                     self.phase = ChunkPhase::Done;
                     let reading = self.reading.take().expect("final check follows streaming");
-                    if reading.seen != self.expected_records {
-                        return Err(source_changed(
-                            &self.path,
-                            format!(
-                                "it now has {} records instead of {}",
-                                reading.seen, self.expected_records
-                            ),
-                        ));
-                    }
-                    if reading.hash.value() != self.expected_hash {
-                        return Err(source_changed(
-                            &self.path,
-                            "its bytes no longer match the first pass".to_string(),
-                        ));
-                    }
+                    self.expectations.verify_end_of_input(
+                        &self.path,
+                        reading.seen,
+                        reading.hash.value(),
+                    )?;
                     return Ok(None);
                 }
                 ChunkPhase::Streaming => {
@@ -1861,12 +1876,8 @@ impl JsonlChunks {
                             JsonlLine::Blank => {}
                             JsonlLine::Rejected(rejection) => {
                                 reading.seen += 1;
-                                cross_check_outcome(
-                                    &self.path,
-                                    &self.rejected_lines,
-                                    rejection.line,
-                                    true,
-                                )?;
+                                self.expectations
+                                    .cross_check(&self.path, rejection.line, true)?;
                             }
                             JsonlLine::Record(record) => {
                                 reading.seen += 1;
@@ -1884,9 +1895,8 @@ impl JsonlChunks {
                                 }
                                 let rejected_now =
                                     schema::json_record_violates(&record, &self.checks);
-                                match cross_check_outcome(
+                                match self.expectations.cross_check(
                                     &self.path,
-                                    &self.rejected_lines,
                                     record.line,
                                     rejected_now,
                                 )? {

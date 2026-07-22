@@ -229,12 +229,16 @@ struct LoadDefinition {
 
 /// The `execution` block of a load definition (ADR-0046): how the load
 /// executes, as opposed to what it moves. `chunk_rows` bounds each
-/// materialized `RecordBatch` chunk to that many surviving records
-/// (default 65536). Unknown keys are rejected recursively (ADR-0037).
+/// materialized `RecordBatch` chunk to that many surviving records; absent —
+/// the block or the key — it defaults to 65536. Zero, negative, and
+/// non-integer bounds fail YAML parsing (`NonZeroU64`), so every invalid
+/// bound is a definition failure under the existing code and no new
+/// execution failure code exists. Unknown keys are rejected recursively
+/// (ADR-0037).
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ExecutionConfig {
-    chunk_rows: Option<u64>,
+    chunk_rows: Option<std::num::NonZeroU64>,
 }
 
 /// The `artifacts` block of a load definition: the root under which this load's
@@ -642,7 +646,7 @@ fn execute_supported_load(
         definition.transform.as_ref(),
         &resolved_source_format(&source.path, source.format.as_deref()),
     )?;
-    let chunk_rows = resolve_chunk_rows(definition.execution.as_ref())?;
+    let chunk_rows = resolve_chunk_rows(definition.execution.as_ref());
 
     let reject_threshold = definition.reject_threshold.unwrap_or(0);
     let SourceRead {
@@ -665,15 +669,12 @@ fn execute_supported_load(
     // chunk is written (ADR-0045), so a breach anywhere in the source stops
     // the load here, before any destination write can happen.
     if rejected_count > reject_threshold {
-        return Err(ExecutionFailure {
-            failure: reject_threshold_failure(rejected_count, source_rows, reject_threshold),
-            schema_decision: Some(Box::new(schema_decision)),
-            source_rows: Some(source_rows),
-            written_records: 0,
+        return Err(resolved_pre_write_failure(
+            reject_threshold_failure(rejected_count, source_rows, reject_threshold),
+            schema_decision,
+            source_rows,
             rejected_count,
-            committed_execution: None,
-            destination_write: Box::new(DestinationWriteFacts::not_applicable()),
-        });
+        ));
     }
 
     // Persist the produced or extended pin after the threshold gate and
@@ -684,21 +685,33 @@ fn execute_supported_load(
     // so they carry both for the report.
     if let Some(pinned_schema_write) = &pinned_schema_write {
         if let Err(failure) = persist_pinned_schema(pinned_schema_write) {
-            return Err(ExecutionFailure {
+            return Err(resolved_pre_write_failure(
                 failure,
-                schema_decision: Some(Box::new(schema_decision)),
-                source_rows: Some(source_rows),
-                written_records: 0,
+                schema_decision,
+                source_rows,
                 rejected_count,
-                committed_execution: None,
-                destination_write: Box::new(DestinationWriteFacts::not_applicable()),
-            });
+            ));
         }
     }
 
     let outcome = match run_write_phase(chunks, destination_port.as_ref(), mode) {
         Ok(outcome) => outcome,
-        Err(write_failure) => {
+        // A failure opening the session keeps the pre-write posture: no
+        // record batch was ever exchanged, so the report stays at
+        // `not_started` exactly as it did before sessions existed
+        // (ADR-0047).
+        Err(WritePhaseFailure::BeforeSession(write_failure)) => {
+            return Err(ExecutionFailure {
+                failure: write_failure.failure,
+                schema_decision: Some(Box::new(schema_decision)),
+                source_rows: Some(source_rows),
+                written_records: write_failure.written_records,
+                rejected_count,
+                committed_execution: None,
+                destination_write: Box::new(write_failure.facts),
+            })
+        }
+        Err(WritePhaseFailure::InSession(write_failure)) => {
             return Err(ExecutionFailure {
                 failure: write_failure.failure,
                 schema_decision: Some(Box::new(schema_decision)),
@@ -740,21 +753,34 @@ fn execute_supported_load(
 }
 
 /// Resolves the effective chunk bound from the definition's `execution`
-/// block (ADR-0046): absent means the default, a declared block must set
-/// `chunk_rows`, and `0` is a definition failure — a chunk that can hold no
-/// record is no bound at all.
-fn resolve_chunk_rows(execution: Option<&ExecutionConfig>) -> Result<u64, LoadFailure> {
-    let Some(execution) = execution else {
-        return Ok(DEFAULT_CHUNK_ROWS);
-    };
-    let invalid = |message: &str| LoadFailure {
-        code: "invalid_execution_config",
-        message: message.to_string(),
-    };
-    match execution.chunk_rows {
-        None => Err(invalid("an execution block must set execution.chunk_rows")),
-        Some(0) => Err(invalid("execution.chunk_rows must be at least 1")),
-        Some(chunk_rows) => Ok(chunk_rows),
+/// block (ADR-0046): the declared `chunk_rows`, or the default wherever the
+/// block or the key is absent. Never a failure — every invalid bound was
+/// already rejected at YAML parse time.
+fn resolve_chunk_rows(execution: Option<&ExecutionConfig>) -> u64 {
+    execution
+        .and_then(|execution| execution.chunk_rows)
+        .map(std::num::NonZeroU64::get)
+        .unwrap_or(DEFAULT_CHUNK_ROWS)
+}
+
+/// An execution failure raised after the read resolved the load but before
+/// the destination session opened — the threshold gate, the pin write, the
+/// session open itself: the schema decision, counts, and already-streamed
+/// rejections travel, and the execution posture stays pre-write.
+fn resolved_pre_write_failure(
+    failure: LoadFailure,
+    schema_decision: Value,
+    source_rows: u64,
+    rejected_count: u64,
+) -> ExecutionFailure {
+    ExecutionFailure {
+        failure,
+        schema_decision: Some(Box::new(schema_decision)),
+        source_rows: Some(source_rows),
+        written_records: 0,
+        rejected_count,
+        committed_execution: None,
+        destination_write: Box::new(DestinationWriteFacts::not_applicable()),
     }
 }
 
@@ -767,6 +793,16 @@ struct WritePhaseOutcome {
     chunk_count: u64,
 }
 
+/// A write-phase failure, split at the session boundary (ADR-0047): before
+/// the destination session opened no record batch was ever exchanged, so
+/// the load keeps the pre-write report posture; once it opened, failures
+/// report the committed execution posture.
+#[derive(Debug)]
+enum WritePhaseFailure {
+    BeforeSession(DestinationWriteFailure),
+    InSession(DestinationWriteFailure),
+}
+
 /// Streams the source chunks into one destination write session (ADR-0046):
 /// begin, one `write_chunk` per source chunk, then the terminal commit. A
 /// destination failure carries its own committed-state facts; a source
@@ -777,27 +813,31 @@ fn run_write_phase(
     chunks: impl Iterator<Item = Result<RecordBatch, LoadFailure>>,
     destination: &dyn Destination,
     mode: LoadMode,
-) -> Result<WritePhaseOutcome, DestinationWriteFailure> {
-    let mut writer = destination.begin(mode)?;
+) -> Result<WritePhaseOutcome, WritePhaseFailure> {
+    let mut writer = destination
+        .begin(mode)
+        .map_err(WritePhaseFailure::BeforeSession)?;
     let mut chunk_count = 0_u64;
     for chunk in chunks {
         match chunk {
             Ok(batch) => {
-                writer.write_chunk(&batch)?;
+                writer
+                    .write_chunk(&batch)
+                    .map_err(WritePhaseFailure::InSession)?;
                 chunk_count += 1;
             }
             Err(source_failure) => {
                 let abandoned = writer.abandon();
-                return Err(DestinationWriteFailure {
+                return Err(WritePhaseFailure::InSession(DestinationWriteFailure {
                     failure: source_failure,
                     facts: abandoned.facts,
                     written_records: abandoned.written_records,
                     committed_chunks: abandoned.committed_chunks,
-                });
+                }));
             }
         }
     }
-    let write = writer.commit()?;
+    let write = writer.commit().map_err(WritePhaseFailure::InSession)?;
     Ok(WritePhaseOutcome {
         bytes_written: write.bytes_written,
         facts: write.facts,
@@ -1432,9 +1472,14 @@ mod tests {
             let read = read_csv_chunks(&work, &source_path, 1);
             fs::write(&source_path, "id,name\n1,Bob\n2,Grace\n3,Cara\n").expect("mutate csv");
 
-            let failure = run_write_phase(read.chunks, destination.as_ref(), LoadMode::FullRefresh)
-                .err()
-                .expect("source change fails the load");
+            let Err(failure) =
+                run_write_phase(read.chunks, destination.as_ref(), LoadMode::FullRefresh)
+            else {
+                panic!("source change fails the load")
+            };
+            let WritePhaseFailure::InSession(failure) = failure else {
+                panic!("the mutation guard fires inside the open session")
+            };
             assert_eq!(failure.failure.code, "source_changed_during_load");
             assert_eq!(failure.committed_chunks, 0, "{connector_name}");
             assert_eq!(failure.written_records, 0, "{connector_name}");
@@ -1479,9 +1524,13 @@ mod tests {
             let read = read_csv_chunks(&work, &source_path, 1);
             fs::write(&source_path, "id,name\n1,Ada\n2,Grace\n3,Cara,extra\n").expect("mutate csv");
 
-            let failure = run_write_phase(read.chunks, destination.as_ref(), LoadMode::Append)
-                .err()
-                .expect("source change fails the load");
+            let Err(failure) = run_write_phase(read.chunks, destination.as_ref(), LoadMode::Append)
+            else {
+                panic!("source change fails the load")
+            };
+            let WritePhaseFailure::InSession(failure) = failure else {
+                panic!("the mutation guard fires inside the open session")
+            };
             assert_eq!(failure.failure.code, "source_changed_during_load");
             assert_eq!(failure.committed_chunks, 2, "{connector_name}");
             assert_eq!(failure.written_records, 2, "{connector_name}");

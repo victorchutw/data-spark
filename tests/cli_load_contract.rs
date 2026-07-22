@@ -5846,6 +5846,10 @@ reject_threshold: 1
     assert_eq!(report["row_counts"]["rejected"], 1);
     assert_eq!(report["rejected_records"]["count"], 1);
     assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+    // The destination session never opened (the parent path blocks it), so
+    // the execution posture stays pre-write (ADR-0047).
+    assert_eq!(report["execution"]["record_format"], "not_started");
+    assert_eq!(report["execution"]["batch_count"], 0);
 
     let artifact_path = PathBuf::from(
         report["rejected_records"]["artifact"]
@@ -7157,21 +7161,57 @@ fn multi_chunk_append_commits_one_chunk_at_a_time_for_both_connectors() {
 }
 
 #[test]
+fn an_empty_execution_block_defaults_the_chunk_bound() {
+    // `execution: {}` declares nothing, so the bound defaults to 65536
+    // exactly as an absent block does (ADR-0046) — no new failure code
+    // exists for the execution block.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "customer_id\n1\n").expect("write source csv");
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            "version: 1\n\
+             source:\n\
+             \x20 connector: local_file\n\
+             \x20 path: {}\n\
+             \x20 format: csv\n\
+             destination:\n\
+             \x20 connector: parquet\n\
+             \x20 path: {}\n\
+             dataset: customers\n\
+             load_mode: full_refresh\n\
+             execution: {{}}\n",
+            source_path.display(),
+            destination_path.display(),
+        ),
+    )
+    .expect("write load definition");
+
+    let load = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts"),
+        &definition_path,
+        true,
+    );
+    assert_eq!(load.report["exit_status"], "succeeded");
+    assert_eq!(load.report["execution"]["chunk_rows"], 65536);
+}
+
+#[test]
 fn invalid_execution_blocks_fail_before_source_or_destination_work() {
-    // The execution block is part of the strict contract: a zero bound and
-    // an underspecified block are definition failures
-    // (`invalid_execution_config`), and an unknown key is a YAML parse
-    // failure (ADR-0037) — all before any source read or destination write.
+    // The execution block is part of the strict contract: a zero, negative,
+    // or non-integer bound fails YAML parsing (`chunk_rows` is a nonzero
+    // integer), and an unknown key is rejected recursively (ADR-0037) — all
+    // before any source read or destination write, and all under the
+    // existing definition failure code.
     for (execution_block, expected_code, expected_message_part) in [
         (
             "execution:\n  chunk_rows: 0\n",
-            "invalid_execution_config",
-            "execution.chunk_rows must be at least 1",
-        ),
-        (
-            "execution: {}\n",
-            "invalid_execution_config",
-            "an execution block must set execution.chunk_rows",
+            "invalid_load_definition_yaml",
+            "expected a nonzero u64",
         ),
         (
             "execution:\n  workers: 4\n",
@@ -7181,7 +7221,7 @@ fn invalid_execution_blocks_fail_before_source_or_destination_work() {
         (
             "execution:\n  chunk_rows: -1\n",
             "invalid_load_definition_yaml",
-            "expected u64",
+            "expected a nonzero u64",
         ),
     ] {
         let work = TempDir::new().expect("tempdir");
@@ -7550,6 +7590,123 @@ fn multi_chunk_artifacts_interleave_parse_and_validation_rejections_byte_identic
             "source_field": null,
             "message": "required field \"name\" is null",
             "record": {"id": 3, "name": null}
+        })
+    );
+    assert_eq!(jsonl_artifact, jsonl_expected);
+}
+
+#[test]
+fn multi_chunk_artifacts_stay_byte_identical_for_inferred_csv_and_pinned_jsonl() {
+    // The remaining two directive cells of the artifact matrix: CSV under an
+    // inference-driven override, and JSONL under a pin — each interleaving a
+    // parse and a validation rejection across single-record chunks.
+    let work = TempDir::new().expect("tempdir");
+
+    // CSV, inferred directive with an override: the override supplies the
+    // per-record check inference alone would not impose.
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "id\n1\n2,extra\nabc\n5\n").expect("write source csv");
+    let definition_path = work.path().join("load.yml");
+    write_chunked_definition(
+        &definition_path,
+        &source_path,
+        "parquet",
+        &work.path().join("customers_dataset"),
+        "full_refresh",
+        1,
+        "schema:\n  overrides:\n  - name: id\n    type: int64\nreject_threshold: 2\n",
+    );
+
+    let load = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts"),
+        &definition_path,
+        true,
+    );
+    let artifact_path = PathBuf::from(
+        load.report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let artifact = fs::read_to_string(&artifact_path).expect("artifact");
+    let expected = format!(
+        "{}\n{}\n",
+        serde_json::json!({
+            "line": 3,
+            "code": "malformed_csv_record",
+            "field": null,
+            "source_field": null,
+            "message": "expected 1 fields, found 2",
+            "record": ["2", "extra"]
+        }),
+        serde_json::json!({
+            "line": 4,
+            "code": "type_coercion_failed",
+            "field": "id",
+            "source_field": null,
+            "message": "value \"abc\" does not fit overridden type int64 for field \"id\"",
+            "record": {"id": "abc"}
+        })
+    );
+    assert_eq!(artifact, expected);
+
+    // JSONL under a pin: the validation rejection spills until the shape
+    // verdict passes and merges back in line order.
+    let jsonl_path = work.path().join("customers.jsonl");
+    fs::write(
+        &jsonl_path,
+        "{\"id\": 1}\n[1]\n{\"id\": \"abc\"}\n{\"id\": 4}\n",
+    )
+    .expect("write source jsonl");
+    let pinned_path = work.path().join("customers.schema.yml");
+    fs::write(
+        &pinned_path,
+        "version: 1\nfields:\n- name: id\n  type: int64\n",
+    )
+    .expect("write pinned schema");
+    let jsonl_definition_path = work.path().join("load-jsonl.yml");
+    write_chunked_definition(
+        &jsonl_definition_path,
+        &jsonl_path,
+        "parquet",
+        &work.path().join("customers_jsonl_dataset"),
+        "full_refresh",
+        1,
+        &format!(
+            "schema:\n  pinned_path: {}\nreject_threshold: 2\n",
+            pinned_path.display()
+        ),
+    );
+
+    let jsonl_load = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-jsonl"),
+        &jsonl_definition_path,
+        true,
+    );
+    let jsonl_artifact_path = PathBuf::from(
+        jsonl_load.report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let jsonl_artifact = fs::read_to_string(&jsonl_artifact_path).expect("artifact");
+    let jsonl_expected = format!(
+        "{}\n{}\n",
+        serde_json::json!({
+            "line": 2,
+            "code": "malformed_jsonl_record",
+            "field": null,
+            "source_field": null,
+            "message": "each JSONL record must be a JSON object",
+            "record": "[1]"
+        }),
+        serde_json::json!({
+            "line": 3,
+            "code": "type_coercion_failed",
+            "field": "id",
+            "source_field": null,
+            "message": "value \"abc\" does not fit pinned type int64 for field \"id\"",
+            "record": {"id": "abc"}
         })
     );
     assert_eq!(jsonl_artifact, jsonl_expected);
