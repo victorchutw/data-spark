@@ -113,14 +113,7 @@ fn run_serial_write_phase(
                 chunk_count += 1;
             }
             Err(source_failure) => {
-                let abandoned = writer.abandon();
-                return Err(WritePhaseFailure::InSession(DestinationWriteFailure {
-                    failure: source_failure,
-                    facts: abandoned.facts,
-                    written_records: abandoned.written_records,
-                    committed_chunks: abandoned.committed_chunks,
-                    transience: Transience::Terminal,
-                }));
+                return Err(abandon_in_session(writer, source_failure));
             }
         }
     }
@@ -132,13 +125,41 @@ fn run_serial_write_phase(
     })
 }
 
+/// Ends a halted session and surfaces the given failure — code and message
+/// unchanged, no wrapper — joined with the destination-owned committed
+/// state at abandonment (ADR-0047), so append's committed prefix stays
+/// honestly visible whichever path halted the load.
+fn abandon_in_session(
+    writer: Box<dyn DestinationWriter>,
+    failure: LoadFailure,
+) -> WritePhaseFailure {
+    let abandoned = writer.abandon();
+    WritePhaseFailure::InSession(DestinationWriteFailure {
+        failure,
+        facts: abandoned.facts,
+        written_records: abandoned.written_records,
+        committed_chunks: abandoned.committed_chunks,
+        transience: Transience::Terminal,
+    })
+}
+
 /// What one write slot reports back to the dispatcher when its unit
 /// completes: the unit's chunk index, the failed attempts its retries
-/// recorded, and the terminal outcome after those retries.
+/// recorded, and the terminal outcome after those retries — or the panic
+/// a misbehaving writer escaped with, which the dispatcher re-raises on
+/// the dispatching thread after the drain instead of hanging on a
+/// completion that would never arrive.
 struct SlotCompletion {
     chunk_index: u64,
     attempts: Vec<retry::RetryAttempt>,
-    outcome: Result<(), DestinationWriteFailure>,
+    outcome: Result<(), SlotFailure>,
+}
+
+/// How a write slot's unit ended short of success: the unit's terminal
+/// write failure, or a writer panic caught at the slot boundary.
+enum SlotFailure {
+    Write(DestinationWriteFailure),
+    Panicked(Box<dyn std::any::Any + Send>),
 }
 
 /// The bounded-window write phase (ADR-0051) — effective parallelism above
@@ -164,6 +185,7 @@ fn run_windowed_write_phase(
     let window = usize::try_from(parallelism.get()).unwrap_or(usize::MAX);
     let mut write_failures: Vec<(u64, DestinationWriteFailure)> = Vec::new();
     let mut source_failure: Option<LoadFailure> = None;
+    let mut writer_panic: Option<Box<dyn std::any::Any + Send>> = None;
     let mut dispatched = 0_u64;
 
     std::thread::scope(|scope| {
@@ -186,14 +208,27 @@ fn run_windowed_write_phase(
                         let completion_sender = completion_sender.clone();
                         scope.spawn(move || {
                             let mut attempts = Vec::new();
-                            let outcome = retry::run_unit(
-                                retry_policy,
-                                retry::RetryUnit::WriteChunk { chunk_index },
-                                &mut attempts,
-                                sleeper,
-                                || writer.write_chunk(&batch),
-                            )
-                            .map(drop);
+                            // A panicking writer is a connector-contract
+                            // violation; catching it at the slot boundary
+                            // keeps the completion protocol whole — one
+                            // send per dispatched unit — so the dispatcher
+                            // drains and re-raises instead of waiting
+                            // forever on a completion that died.
+                            let outcome =
+                                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                    retry::run_unit(
+                                        retry_policy,
+                                        retry::RetryUnit::WriteChunk { chunk_index },
+                                        &mut attempts,
+                                        sleeper,
+                                        || writer.write_chunk(&batch),
+                                    )
+                                    .map(drop)
+                                }));
+                            let outcome = match outcome {
+                                Ok(unit_outcome) => unit_outcome.map_err(SlotFailure::Write),
+                                Err(payload) => Err(SlotFailure::Panicked(payload)),
+                            };
                             // The dispatcher receives once per dispatched
                             // unit, so the receiver outlives every send.
                             let _ = completion_sender.send(SlotCompletion {
@@ -217,12 +252,28 @@ fn run_windowed_write_phase(
                 .expect("every dispatched unit completes");
             in_flight -= 1;
             retry_attempts.extend(completion.attempts);
-            if let Err(failure) = completion.outcome {
-                write_failures.push((completion.chunk_index, failure));
-                halted = true;
+            match completion.outcome {
+                Ok(()) => {}
+                Err(SlotFailure::Write(failure)) => {
+                    write_failures.push((completion.chunk_index, failure));
+                    halted = true;
+                }
+                Err(SlotFailure::Panicked(payload)) => {
+                    if writer_panic.is_none() {
+                        writer_panic = Some(payload);
+                    }
+                    halted = true;
+                }
             }
         }
     });
+
+    // Re-raise a caught writer panic on the dispatching thread once the
+    // drain is done, before touching the writer again — its state is
+    // suspect, and unwinding drops it through the session's own cleanup.
+    if let Some(payload) = writer_panic {
+        std::panic::resume_unwind(payload);
+    }
 
     if write_failures.is_empty() && source_failure.is_none() {
         let write = writer.commit().map_err(WritePhaseFailure::InSession)?;
@@ -240,20 +291,13 @@ fn run_windowed_write_phase(
     // halted at, so taking the lowest-indexed write failure — and the
     // source failure only when no write failed — is the lowest-chunk-index
     // rule.
-    let abandoned = writer.abandon();
     let failure = write_failures
         .into_iter()
         .min_by_key(|(chunk_index, _)| *chunk_index)
         .map(|(_, failure)| failure.failure)
         .or(source_failure)
         .expect("a halted window holds a failure");
-    Err(WritePhaseFailure::InSession(DestinationWriteFailure {
-        failure,
-        facts: abandoned.facts,
-        written_records: abandoned.written_records,
-        committed_chunks: abandoned.committed_chunks,
-        transience: Transience::Terminal,
-    }))
+    Err(abandon_in_session(writer, failure))
 }
 
 #[cfg(test)]
@@ -300,6 +344,11 @@ mod tests {
         Fail {
             message: &'static str,
             transience: Transience,
+        },
+        /// A writer panic mid-write: the connector-contract violation the
+        /// dispatcher must drain and re-raise rather than hang on.
+        Panic {
+            message: &'static str,
         },
     }
 
@@ -358,6 +407,7 @@ mod tests {
         ) -> Result<Box<dyn DestinationWriter>, DestinationWriteFailure> {
             self.begin_calls.fetch_add(1, Ordering::SeqCst);
             match self.begin_outcomes.lock().expect("script lock").pop_front() {
+                Some(ScriptedWriteOutcome::Panic { message }) => panic!("{message}"),
                 None | Some(ScriptedWriteOutcome::Succeed) => Ok(Box::new(ScriptedWriter {
                     write_outcomes: Arc::clone(&self.write_outcomes),
                     observed_writes: Arc::clone(&self.observed_writes),
@@ -402,6 +452,7 @@ mod tests {
                 .push(batch_values(batch));
             let mut progress = self.progress.lock().expect("progress lock");
             match self.write_outcomes.lock().expect("script lock").pop_front() {
+                Some(ScriptedWriteOutcome::Panic { message }) => panic!("{message}"),
                 None | Some(ScriptedWriteOutcome::Succeed) => {
                     progress.committed_chunks += 1;
                     progress.written_records += batch.num_rows() as u64;
@@ -483,20 +534,28 @@ mod tests {
         )
     }
 
+    /// What a rendezvous wave does after its members meet: release
+    /// immediately, or hold every member at a second barrier until each
+    /// has recorded the pull count — frozen, because no completion can
+    /// reach the dispatcher while the wave holds every slot open.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum WaveObservation {
+        MeetAndRelease,
+        RecordFrozenPulls,
+    }
+
     /// The rendezvous destination of the window-bound tests: `write_chunk`
     /// tracks the in-flight count, then meets its wave at a barrier sized
     /// to the window. Reaching the barrier requires the full wave to be in
     /// flight simultaneously, and the tracked maximum proves the window
-    /// never exceeded it. The second barrier phase holds a wave open until
-    /// every member recorded its observation, so no completion can free a
-    /// slot — and no pull can happen — while a wave is being observed.
+    /// never exceeded it.
     struct RendezvousProbe {
         rendezvous: std::sync::Barrier,
         in_flight: AtomicU64,
         max_in_flight: AtomicU64,
         pulled: Arc<AtomicU64>,
         observed_pulls: Mutex<Vec<u64>>,
-        two_phase: bool,
+        observation: WaveObservation,
     }
 
     struct RendezvousDestination {
@@ -505,7 +564,7 @@ mod tests {
     }
 
     impl RendezvousDestination {
-        fn new(wave: usize, pulled: Arc<AtomicU64>, two_phase: bool) -> Self {
+        fn new(wave: usize, pulled: Arc<AtomicU64>, observation: WaveObservation) -> Self {
             RendezvousDestination {
                 limit: window(wave as u64),
                 probe: Arc::new(RendezvousProbe {
@@ -514,7 +573,7 @@ mod tests {
                     max_in_flight: AtomicU64::new(0),
                     pulled,
                     observed_pulls: Mutex::new(Vec::new()),
-                    two_phase,
+                    observation,
                 }),
             }
         }
@@ -550,7 +609,7 @@ mod tests {
             let now = self.probe.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             self.probe.max_in_flight.fetch_max(now, Ordering::SeqCst);
             self.probe.rendezvous.wait();
-            if self.probe.two_phase {
+            if self.probe.observation == WaveObservation::RecordFrozenPulls {
                 self.probe
                     .observed_pulls
                     .lock()
@@ -588,7 +647,11 @@ mod tests {
         // passing — and the tracked maximum proves the window never held
         // more than 2 writes in flight.
         let (chunks, _pulled) = counted_chunks(&[&[1], &[2], &[3], &[4]]);
-        let destination = RendezvousDestination::new(2, Arc::clone(&chunks.pulled), false);
+        let destination = RendezvousDestination::new(
+            2,
+            Arc::clone(&chunks.pulled),
+            WaveObservation::MeetAndRelease,
+        );
         let sleeper = retry::RecordingSleeper::new();
         let mut retry_attempts = Vec::new();
 
@@ -622,7 +685,8 @@ mod tests {
         // occupies the slot that freed, so the observation is also the
         // materialization bound: never more than window-many chunks exist.
         let (chunks, pulled) = counted_chunks(&[&[1], &[2], &[3], &[4]]);
-        let destination = RendezvousDestination::new(2, Arc::clone(&pulled), true);
+        let destination =
+            RendezvousDestination::new(2, Arc::clone(&pulled), WaveObservation::RecordFrozenPulls);
         let sleeper = retry::RecordingSleeper::new();
         let mut retry_attempts = Vec::new();
 
@@ -657,10 +721,29 @@ mod tests {
         outcome: ScriptedWriteOutcome,
     }
 
-    fn gated(wait_for_gate: bool, release_gate: bool, outcome: ScriptedWriteOutcome) -> GatedStep {
+    /// A plain ungated step.
+    fn step(outcome: ScriptedWriteOutcome) -> GatedStep {
         GatedStep {
-            wait_for_gate,
-            release_gate,
+            wait_for_gate: false,
+            release_gate: false,
+            outcome,
+        }
+    }
+
+    /// A step that acts only once the gate has been released.
+    fn wait_then(outcome: ScriptedWriteOutcome) -> GatedStep {
+        GatedStep {
+            wait_for_gate: true,
+            release_gate: false,
+            outcome,
+        }
+    }
+
+    /// A step that releases the gate on its way out.
+    fn release_after(outcome: ScriptedWriteOutcome) -> GatedStep {
+        GatedStep {
+            wait_for_gate: false,
+            release_gate: true,
             outcome,
         }
     }
@@ -755,7 +838,7 @@ mod tests {
                 .expect("steps lock")
                 .get_mut(&value)
                 .and_then(VecDeque::pop_front)
-                .unwrap_or_else(|| gated(false, false, ScriptedWriteOutcome::Succeed));
+                .unwrap_or_else(|| step(ScriptedWriteOutcome::Succeed));
             if step.wait_for_gate {
                 let receiver = state
                     .gate_receiver
@@ -766,6 +849,7 @@ mod tests {
                 receiver.recv().expect("the gate is released");
             }
             let result = match step.outcome {
+                ScriptedWriteOutcome::Panic { message } => panic!("{message}"),
                 ScriptedWriteOutcome::Succeed => {
                     state.committed_chunks.fetch_add(1, Ordering::SeqCst);
                     state
@@ -846,8 +930,8 @@ mod tests {
         // failing write saw zero at raise time — and abandon happens only
         // after every in-flight write exited.
         let destination = GatedDestination::new(vec![
-            (10, vec![gated(true, false, ScriptedWriteOutcome::Succeed)]),
-            (20, vec![gated(false, true, terminal("value 20 detached"))]),
+            (10, vec![wait_then(ScriptedWriteOutcome::Succeed)]),
+            (20, vec![release_after(terminal("value 20 detached"))]),
         ]);
         let (chunks, pulled) = counted_chunks(&[&[10], &[20]]);
         let sleeper = retry::RecordingSleeper::new();
@@ -896,8 +980,8 @@ mod tests {
         // first received failure also halts dispatch, so chunk 2 is never
         // pulled or written.
         let destination = GatedDestination::new(vec![
-            (10, vec![gated(true, false, terminal("value 10 detached"))]),
-            (20, vec![gated(false, true, terminal("value 20 detached"))]),
+            (10, vec![wait_then(terminal("value 10 detached"))]),
+            (20, vec![release_after(terminal("value 20 detached"))]),
         ]);
         let (chunks, pulled) = counted_chunks(&[&[10], &[20], &[30]]);
         let sleeper = retry::RecordingSleeper::new();
@@ -945,6 +1029,86 @@ mod tests {
     }
 
     #[test]
+    fn a_source_pull_failure_mid_stream_drains_and_abandons_the_windowed_session() {
+        // The pull of the third chunk fails while both slots are occupied:
+        // the dispatcher stops pulling, lets both dispatched writes run to
+        // completion, then abandons — the committed writes stay
+        // destination-owned through the abandon path and the source
+        // failure surfaces unchanged, no write unit having failed.
+        let destination = GatedDestination::new(Vec::new());
+        let chunks: crate::connector::SourceChunks = Box::new(
+            vec![
+                Ok(int64_batch(&[10])),
+                Ok(int64_batch(&[20])),
+                Err(LoadFailure {
+                    code: "source_changed_during_load",
+                    message: "source changed during the load".to_string(),
+                }),
+            ]
+            .into_iter(),
+        );
+        let sleeper = retry::RecordingSleeper::new();
+        let mut retry_attempts = Vec::new();
+
+        let Err(WritePhaseFailure::InSession(failure)) = run_write_phase(
+            chunks,
+            &destination,
+            LoadMode::Append,
+            window(2),
+            &retry::RetryPolicy::default(),
+            &sleeper,
+            &mut retry_attempts,
+        ) else {
+            panic!("a mid-stream pull failure fails the load in session")
+        };
+
+        assert_eq!(failure.failure.code, "source_changed_during_load");
+        assert_eq!(failure.failure.message, "source changed during the load");
+        assert_eq!(
+            failure.committed_chunks, 2,
+            "both dispatched writes drained to completion before the abandon"
+        );
+        assert_eq!(failure.written_records, 2);
+        let events = destination.events();
+        assert_eq!(events.last(), Some(&GatedEvent::Abandoned));
+        assert!(events.contains(&GatedEvent::Exited(10)));
+        assert!(events.contains(&GatedEvent::Exited(20)));
+        assert!(retry_attempts.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "value 10 writer panic")]
+    fn a_panicking_writer_drains_the_window_and_re_raises_on_the_dispatching_thread() {
+        // A writer panic is a connector-contract violation, not a failure
+        // the engine can report: the slot boundary catches it, the
+        // dispatcher stops dispatching, drains the sibling write, and
+        // re-raises the panic on the dispatching thread — deterministically,
+        // instead of hanging on a completion that would never arrive.
+        let destination = GatedDestination::new(vec![
+            (
+                10,
+                vec![wait_then(ScriptedWriteOutcome::Panic {
+                    message: "value 10 writer panic",
+                })],
+            ),
+            (20, vec![release_after(ScriptedWriteOutcome::Succeed)]),
+        ]);
+        let (chunks, _pulled) = counted_chunks(&[&[10], &[20]]);
+        let sleeper = retry::RecordingSleeper::new();
+        let mut retry_attempts = Vec::new();
+
+        let _ = run_write_phase(
+            chunks,
+            &destination,
+            LoadMode::Append,
+            window(2),
+            &retry::RetryPolicy::default(),
+            &sleeper,
+            &mut retry_attempts,
+        );
+    }
+
+    #[test]
     fn concurrent_slots_retry_independently_and_the_report_orders_their_attempts() {
         // Two chunks in flight together: chunk 0's first attempt waits on
         // the gate until chunk 1 has already failed twice, slept its own
@@ -959,17 +1123,17 @@ mod tests {
             (
                 10,
                 vec![
-                    gated(true, false, scripted_transient("value 10 first shortage")),
-                    gated(false, false, scripted_transient("value 10 second shortage")),
-                    gated(false, false, ScriptedWriteOutcome::Succeed),
+                    wait_then(scripted_transient("value 10 first shortage")),
+                    step(scripted_transient("value 10 second shortage")),
+                    step(ScriptedWriteOutcome::Succeed),
                 ],
             ),
             (
                 20,
                 vec![
-                    gated(false, false, scripted_transient("value 20 first shortage")),
-                    gated(false, false, scripted_transient("value 20 second shortage")),
-                    gated(false, true, ScriptedWriteOutcome::Succeed),
+                    step(scripted_transient("value 20 first shortage")),
+                    step(scripted_transient("value 20 second shortage")),
+                    release_after(ScriptedWriteOutcome::Succeed),
                 ],
             ),
         ]);
