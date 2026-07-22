@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -12,14 +13,18 @@ mod connector;
 mod rejection;
 mod schema;
 
+use arrow_array::RecordBatch;
 use connector::{
-    destination_connector, resolved_source_format, source_connector, DestinationWrite,
-    DestinationWriteFacts, LoadMode, SourceRead,
+    destination_connector, resolved_source_format, source_connector, Destination,
+    DestinationWriteFacts, DestinationWriteFailure, LoadMode, SourceRead,
 };
 
 const LOAD_REPORT_VERSION: u8 = 1;
 const LOAD_REPORT_FILENAME: &str = "load-report.json";
 const SUPPORTED_LOAD_DEFINITION_VERSION: u64 = 1;
+/// The default chunk bound of `execution.chunk_rows` (ADR-0046): loads
+/// materialize `RecordBatch` chunks of at most this many surviving records.
+const DEFAULT_CHUNK_ROWS: u64 = 65536;
 
 #[derive(Parser)]
 #[command(name = "data-spark")]
@@ -70,8 +75,7 @@ impl LoadReport {
         timings: Timings,
         details: ExecutionDetails,
     ) -> Self {
-        let rejected_records =
-            RejectedRecordFacts::facts(details.rejected.len() as u64, &artifact_dir);
+        let rejected_records = RejectedRecordFacts::facts(details.rejected_count, &artifact_dir);
         LoadReport {
             report_version: LOAD_REPORT_VERSION,
             load_id,
@@ -96,15 +100,27 @@ impl LoadReport {
     /// Assemble the report for a load that failed: the definition context is
     /// echoed back and every execution field takes its not-run posture,
     /// except the rejection facts, which report the records already rejected
-    /// (and their artifact) when the failure happened.
+    /// (and their artifact) when the failure happened, and — once the load
+    /// entered the write phase — the execution posture, which reports the
+    /// chunks the destination had committed (ADR-0047).
     fn from_failure(
         load_id: String,
         artifact_dir: String,
         timings: Timings,
         failure: ReportableFailure,
     ) -> Self {
-        let rejected_count = failure.rejected.len() as u64;
-        let rejected_records = RejectedRecordFacts::facts(rejected_count, &artifact_dir);
+        let rejected_records = RejectedRecordFacts::facts(failure.rejected_count, &artifact_dir);
+        let execution = match &failure.committed_execution {
+            None => json!({
+                "record_format": "not_started",
+                "batch_count": 0
+            }),
+            Some(committed) => json!({
+                "record_format": "arrow_record_batch",
+                "batch_count": committed.committed_chunks,
+                "chunk_rows": committed.chunk_rows
+            }),
+        };
         LoadReport {
             report_version: LOAD_REPORT_VERSION,
             load_id,
@@ -117,7 +133,7 @@ impl LoadReport {
             row_counts: RowCounts {
                 source: failure.source_rows,
                 written: failure.written_records,
-                rejected: rejected_count,
+                rejected: failure.rejected_count,
             },
             byte_counts: ByteCounts {
                 source: None,
@@ -125,10 +141,7 @@ impl LoadReport {
             },
             rejected_records,
             destination_write: failure.destination_write.report_value(),
-            execution: json!({
-                "record_format": "not_started",
-                "batch_count": 0
-            }),
+            execution,
             timings,
             exit_status: "failed",
             process_exit_code: 1,
@@ -204,10 +217,28 @@ struct LoadDefinition {
     transform: Option<schema::TransformConfig>,
     schema: Option<SchemaConfig>,
     artifacts: Option<ArtifactsConfig>,
+    /// The execution-behavior settings of the load (ADR-0046): today only
+    /// the chunk bound lives here; retry and parallelism settings will join
+    /// it.
+    execution: Option<ExecutionConfig>,
     /// The number of rejected records this load tolerates before failing.
     /// Defaults to `0`: any rejected record fails the load unless the
     /// definition explicitly allows more (ADR-0020).
     reject_threshold: Option<u64>,
+}
+
+/// The `execution` block of a load definition (ADR-0046): how the load
+/// executes, as opposed to what it moves. `chunk_rows` bounds each
+/// materialized `RecordBatch` chunk to that many surviving records; absent —
+/// the block or the key — it defaults to 65536. Zero, negative, and
+/// non-integer bounds fail YAML parsing (`NonZeroU64`), so every invalid
+/// bound is a definition failure under the existing code and no new
+/// execution failure code exists. Unknown keys are rejected recursively
+/// (ADR-0037).
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ExecutionConfig {
+    chunk_rows: Option<std::num::NonZeroU64>,
 }
 
 /// The `artifacts` block of a load definition: the root under which this load's
@@ -248,9 +279,8 @@ struct DestinationDefinition {
 }
 
 /// The execution facts of a load that succeeded. Failures travel as
-/// [`ReportableFailure`] instead. `rejected` carries the rejected records
-/// themselves — within the configured reject threshold, or the load would
-/// have failed — so the orchestrator can write their artifact.
+/// [`ReportableFailure`] instead. Rejected records were already streamed to
+/// their artifact during the read (ADR-0045), so only their count travels.
 struct ExecutionDetails {
     source_summary: Value,
     destination_summary: Value,
@@ -259,7 +289,7 @@ struct ExecutionDetails {
     schema_decision: Value,
     row_counts: RowCounts,
     byte_counts: ByteCounts,
-    rejected: Vec<rejection::RejectedRecord>,
+    rejected_count: u64,
     destination_write: DestinationWriteFacts,
     execution: Value,
 }
@@ -268,8 +298,9 @@ struct ExecutionDetails {
 /// dataset, load mode) that a load report echoes back, plus the facts the
 /// load had already established when it failed: the schema decision if one
 /// had been made (`not_evaluated` otherwise), the source records counted
-/// once the read completed (`0` otherwise), and the records rejected before
-/// failure, whose artifact is still written.
+/// once the read completed (`0` otherwise), the count of records rejected
+/// before failure — their artifact was already streamed — and, once the
+/// load entered the write phase, the committed execution posture.
 struct ReportableFailure {
     source_summary: Value,
     destination_summary: Value,
@@ -278,7 +309,8 @@ struct ReportableFailure {
     schema_decision: Value,
     source_rows: u64,
     written_records: u64,
-    rejected: Vec<rejection::RejectedRecord>,
+    rejected_count: u64,
+    committed_execution: Option<CommittedExecution>,
     destination_write: DestinationWriteFacts,
     code: &'static str,
     message: String,
@@ -297,12 +329,24 @@ impl ReportableFailure {
             schema_decision: not_evaluated_schema_decision(),
             source_rows: 0,
             written_records: 0,
-            rejected: Vec::new(),
+            rejected_count: 0,
+            committed_execution: None,
             destination_write: DestinationWriteFacts::not_applicable(),
             code,
             message,
         }
     }
+}
+
+/// The execution posture of a failure that happened after the load entered
+/// the write phase (ADR-0047): the chunks the destination had committed —
+/// `0` for a full refresh before its terminal commit, the prefix for
+/// append — and the effective chunk bound the report echoes. Failures
+/// before the write phase carry `None` and keep the `not_started` posture.
+#[derive(Debug)]
+struct CommittedExecution {
+    committed_chunks: u64,
+    chunk_rows: u64,
 }
 
 /// The schema decision a report carries when the load failed before any schema
@@ -320,9 +364,11 @@ struct LoadFailure {
 /// A load failure joined with the facts the load had already established when
 /// the failure happened, so the report can echo them: the schema decision if
 /// one had been made (a failure before any decision reports `not_evaluated`),
-/// the source records counted once the read completed, and the records
-/// rejected before the failure, whose artifact the orchestrator still writes. Failures raised
-/// before or without those facts lift via `From` with none of them.
+/// the source records counted once the read completed, the count of records
+/// rejected before the failure — already streamed to their artifact — and,
+/// once the load entered the write phase, the committed execution posture.
+/// Failures raised before or without those facts lift via `From` with none
+/// of them.
 #[derive(Debug)]
 struct ExecutionFailure {
     failure: LoadFailure,
@@ -330,7 +376,8 @@ struct ExecutionFailure {
     schema_decision: Option<Box<Value>>,
     source_rows: Option<u64>,
     written_records: u64,
-    rejected: Vec<rejection::RejectedRecord>,
+    rejected_count: u64,
+    committed_execution: Option<CommittedExecution>,
     destination_write: Box<DestinationWriteFacts>,
 }
 
@@ -340,12 +387,19 @@ impl ExecutionFailure {
     /// keeps malformed records under ADR-0036 even when none survive to provide
     /// an inferable schema.
     fn apply_pending_reject_threshold(mut self, reject_threshold: u64) -> Self {
-        let rejected_count = self.rejected.len() as u64;
-        if self.schema_decision.is_none() && rejected_count > reject_threshold {
-            let source_rows = self.source_rows.unwrap_or(rejected_count);
-            self.failure = reject_threshold_failure(rejected_count, source_rows, reject_threshold);
+        if self.schema_decision.is_none() && self.rejected_count > reject_threshold {
+            let source_rows = self.source_rows.unwrap_or(self.rejected_count);
+            self.failure =
+                reject_threshold_failure(self.rejected_count, source_rows, reject_threshold);
             self.source_rows = Some(source_rows);
         }
+        self
+    }
+
+    /// Attaches the rejection count already streamed when the failure
+    /// happened, so the report and its artifact facts stay honest.
+    fn with_rejected_count(mut self, rejected_count: u64) -> Self {
+        self.rejected_count = rejected_count;
         self
     }
 }
@@ -357,14 +411,27 @@ impl From<LoadFailure> for ExecutionFailure {
             schema_decision: None,
             source_rows: None,
             written_records: 0,
-            rejected: Vec::new(),
+            rejected_count: 0,
+            committed_execution: None,
             destination_write: Box::new(DestinationWriteFacts::not_applicable()),
         }
     }
 }
 
 pub fn run() -> ExitCode {
-    let cli = Cli::parse();
+    run_from(std::env::args_os())
+}
+
+/// Runs the CLI over explicit arguments. Public for the in-process harness
+/// the internal library target exists for (ADR-0028) — the bounded-memory
+/// proof must execute the full pipeline under the test's global allocator,
+/// which a child process would escape.
+pub fn run_from<ArgsIter, Arg>(args: ArgsIter) -> ExitCode
+where
+    ArgsIter: IntoIterator<Item = Arg>,
+    Arg: Into<OsString> + Clone,
+{
+    let cli = Cli::parse_from(args);
     match cli.command {
         Command::Load(args) => match run_load(args) {
             Ok(report) => {
@@ -398,19 +465,17 @@ fn run_load(args: LoadArgs) -> Result<LoadReport, Box<dyn std::error::Error>> {
     let artifact_dir = artifact_root.join(&load_id);
     fs::create_dir_all(&artifact_dir)?;
 
-    let execution = definition.and_then(execute_load_definition);
-
-    // The rejected-records artifact is written before the report that names
-    // it, from whichever side of the outcome carries rejections (ADR-0036).
-    let rejected = match &execution {
-        Ok(details) => &details.rejected,
-        Err(failure) => &failure.rejected,
+    // The rejected-records artifact streams during the read (ADR-0045), so
+    // it exists before the report that names it (ADR-0036).
+    let mut sink = rejection::RejectionSink::new(&artifact_dir);
+    let execution = match definition {
+        Ok(definition) => execute_load_definition(definition, &mut sink),
+        Err(failure) => Err(failure),
     };
-    if !rejected.is_empty() {
-        fs::write(
-            artifact_dir.join(rejection::REJECTED_RECORDS_FILENAME),
-            rejection::artifact_jsonl(rejected),
-        )?;
+    // An artifact write failure aborts without a report, exactly like the
+    // pre-streaming whole-artifact write did.
+    if let Some(error) = sink.take_io_error() {
+        return Err(Box::new(error));
     }
 
     let finished_unix_ms = unix_ms();
@@ -460,6 +525,7 @@ fn read_load_definition(definition_path: &Path) -> Result<LoadDefinition, Report
 #[allow(clippy::result_large_err)]
 fn execute_load_definition(
     definition: LoadDefinition,
+    sink: &mut rejection::RejectionSink,
 ) -> Result<ExecutionDetails, ReportableFailure> {
     let source_summary = definition
         .source
@@ -488,7 +554,8 @@ fn execute_load_definition(
                 schema_decision: not_evaluated_schema_decision(),
                 source_rows: 0,
                 written_records: 0,
-                rejected: Vec::new(),
+                rejected_count: 0,
+                committed_execution: None,
                 destination_write: DestinationWriteFacts::not_applicable(),
                 code: "unsupported_load_definition_version",
                 message: format!("unsupported load definition version: {version}"),
@@ -503,7 +570,8 @@ fn execute_load_definition(
                 schema_decision: not_evaluated_schema_decision(),
                 source_rows: 0,
                 written_records: 0,
-                rejected: Vec::new(),
+                rejected_count: 0,
+                committed_execution: None,
                 destination_write: DestinationWriteFacts::not_applicable(),
                 code: "missing_load_definition_version",
                 message: "load definition version is required".to_string(),
@@ -511,7 +579,7 @@ fn execute_load_definition(
         }
     }
 
-    execute_supported_load(&definition).map_err(|execution_failure| ReportableFailure {
+    execute_supported_load(&definition, sink).map_err(|execution_failure| ReportableFailure {
         source_summary,
         destination_summary,
         dataset,
@@ -522,7 +590,8 @@ fn execute_load_definition(
             .unwrap_or_else(not_evaluated_schema_decision),
         source_rows: execution_failure.source_rows.unwrap_or(0),
         written_records: execution_failure.written_records,
-        rejected: execution_failure.rejected,
+        rejected_count: execution_failure.rejected_count,
+        committed_execution: execution_failure.committed_execution,
         destination_write: *execution_failure.destination_write,
         code: execution_failure.failure.code,
         message: execution_failure.failure.message,
@@ -545,6 +614,7 @@ fn reject_threshold_failure(
 
 fn execute_supported_load(
     definition: &LoadDefinition,
+    sink: &mut rejection::RejectionSink,
 ) -> Result<ExecutionDetails, ExecutionFailure> {
     let source = definition.source.as_ref().ok_or_else(|| LoadFailure {
         code: "missing_source",
@@ -559,13 +629,14 @@ fn execute_supported_load(
         .clone()
         .unwrap_or_else(|| "full_refresh".to_string());
 
-    // Validate the load mode, both connectors, and the schema directive before
-    // any source or destination I/O so an unsupported definition fails without
-    // reading the source or touching the destination (ADR-0019), preserving the
-    // error precedence: load mode -> source connector -> destination connector
-    // -> schema directive (config, then pinned schema file) -> read -> write.
-    // The source format is validated inside read() so its precedence stays
-    // after the destination-connector check for a doubly-invalid definition.
+    // Validate the load mode, both connectors, the schema directive, and the
+    // execution config before any source or destination I/O so an unsupported
+    // definition fails without reading the source or touching the destination
+    // (ADR-0019), preserving the error precedence: load mode -> source
+    // connector -> destination connector -> schema directive (config, then
+    // pinned schema file) -> execution config -> read -> write. The source
+    // format is validated inside read() so its precedence stays after the
+    // destination-connector check for a doubly-invalid definition.
     let mode = LoadMode::parse(&load_mode)?;
     let source_port = source_connector(source)?;
     let destination_port = destination_connector(destination, definition.dataset.as_deref())?;
@@ -575,61 +646,82 @@ fn execute_supported_load(
         definition.transform.as_ref(),
         &resolved_source_format(&source.path, source.format.as_deref()),
     )?;
+    let chunk_rows = resolve_chunk_rows(definition.execution.as_ref());
 
     let reject_threshold = definition.reject_threshold.unwrap_or(0);
     let SourceRead {
-        batch,
         schema_decision,
         pinned_schema_write,
         source_bytes,
-        rejected,
+        source_rows,
+        rejected_count,
+        chunks,
     } = source_port
-        .read(&directive)
+        .read(&directive, chunk_rows as usize, sink)
         .map_err(|failure| failure.apply_pending_reject_threshold(reject_threshold))?;
-
-    let rejected_count = rejected.len() as u64;
-    let row_count = batch.num_rows() as u64;
-    let source_rows = row_count + rejected_count;
+    let row_count = source_rows - rejected_count;
 
     // The reject threshold gates the load while it is still side-effect free
     // (ADR-0036): more rejected records than the definition tolerates
     // (`reject_threshold`, default 0 per ADR-0020) is a validation failure,
     // which must leave the pin unpersisted and the destination untouched
-    // (ADR-0019).
+    // (ADR-0019). Pass 1 evaluates rejections over the full input before any
+    // chunk is written (ADR-0045), so a breach anywhere in the source stops
+    // the load here, before any destination write can happen.
     if rejected_count > reject_threshold {
-        return Err(ExecutionFailure {
-            failure: reject_threshold_failure(rejected_count, source_rows, reject_threshold),
-            schema_decision: Some(Box::new(schema_decision)),
-            source_rows: Some(source_rows),
-            written_records: 0,
-            rejected,
-            destination_write: Box::new(DestinationWriteFacts::not_applicable()),
-        });
+        return Err(resolved_pre_write_failure(
+            reject_threshold_failure(rejected_count, source_rows, reject_threshold),
+            schema_decision,
+            source_rows,
+            rejected_count,
+        ));
     }
 
-    // Persist the produced or extended pin before the destination write: the
-    // pin records the schema decision of this load's source, which stays valid
-    // even if the write then fails, and a retry converges on the same pin.
-    // Failures past this point happened after the schema decision and the
-    // rejections were established, so they carry both for the report.
-    let write_result = (|| {
-        if let Some(pinned_schema_write) = &pinned_schema_write {
-            persist_pinned_schema(pinned_schema_write)?;
+    // Persist the produced or extended pin after the threshold gate and
+    // before the first destination write: the pin records the schema decision
+    // of this load's source, which stays valid even if the write then fails,
+    // and a retry converges on the same pin. Failures past this point
+    // happened after the schema decision and the rejections were established,
+    // so they carry both for the report.
+    if let Some(pinned_schema_write) = &pinned_schema_write {
+        if let Err(failure) = persist_pinned_schema(pinned_schema_write) {
+            return Err(resolved_pre_write_failure(
+                failure,
+                schema_decision,
+                source_rows,
+                rejected_count,
+            ));
         }
-        destination_port.write(&batch, mode)
-    })();
-    let DestinationWrite {
-        bytes_written,
-        facts,
-    } = match write_result {
-        Ok(write) => write,
-        Err(write_failure) => {
+    }
+
+    let outcome = match run_write_phase(chunks, destination_port.as_ref(), mode) {
+        Ok(outcome) => outcome,
+        // A failure opening the session keeps the pre-write posture: no
+        // record batch was ever exchanged, so the report stays at
+        // `not_started` exactly as it did before sessions existed
+        // (ADR-0047).
+        Err(WritePhaseFailure::BeforeSession(write_failure)) => {
             return Err(ExecutionFailure {
                 failure: write_failure.failure,
                 schema_decision: Some(Box::new(schema_decision)),
                 source_rows: Some(source_rows),
                 written_records: write_failure.written_records,
-                rejected,
+                rejected_count,
+                committed_execution: None,
+                destination_write: Box::new(write_failure.facts),
+            })
+        }
+        Err(WritePhaseFailure::InSession(write_failure)) => {
+            return Err(ExecutionFailure {
+                failure: write_failure.failure,
+                schema_decision: Some(Box::new(schema_decision)),
+                source_rows: Some(source_rows),
+                written_records: write_failure.written_records,
+                rejected_count,
+                committed_execution: Some(CommittedExecution {
+                    committed_chunks: write_failure.committed_chunks,
+                    chunk_rows,
+                }),
                 destination_write: Box::new(write_failure.facts),
             })
         }
@@ -648,14 +740,108 @@ fn execute_supported_load(
         },
         byte_counts: ByteCounts {
             source: Some(source_bytes),
-            destination: bytes_written,
+            destination: outcome.bytes_written,
         },
-        rejected,
-        destination_write: facts,
+        rejected_count,
+        destination_write: outcome.facts,
         execution: json!({
             "record_format": "arrow_record_batch",
-            "batch_count": 1
+            "batch_count": outcome.chunk_count,
+            "chunk_rows": chunk_rows
         }),
+    })
+}
+
+/// Resolves the effective chunk bound from the definition's `execution`
+/// block (ADR-0046): the declared `chunk_rows`, or the default wherever the
+/// block or the key is absent. Never a failure — every invalid bound was
+/// already rejected at YAML parse time.
+fn resolve_chunk_rows(execution: Option<&ExecutionConfig>) -> u64 {
+    execution
+        .and_then(|execution| execution.chunk_rows)
+        .map(std::num::NonZeroU64::get)
+        .unwrap_or(DEFAULT_CHUNK_ROWS)
+}
+
+/// An execution failure raised after the read resolved the load but before
+/// the destination session opened — the threshold gate, the pin write, the
+/// session open itself: the schema decision, counts, and already-streamed
+/// rejections travel, and the execution posture stays pre-write.
+fn resolved_pre_write_failure(
+    failure: LoadFailure,
+    schema_decision: Value,
+    source_rows: u64,
+    rejected_count: u64,
+) -> ExecutionFailure {
+    ExecutionFailure {
+        failure,
+        schema_decision: Some(Box::new(schema_decision)),
+        source_rows: Some(source_rows),
+        written_records: 0,
+        rejected_count,
+        committed_execution: None,
+        destination_write: Box::new(DestinationWriteFacts::not_applicable()),
+    }
+}
+
+/// The write-phase outcome of a load whose every chunk committed: the chunk
+/// count the report states as `batch_count`, plus the destination-owned
+/// write result.
+struct WritePhaseOutcome {
+    bytes_written: Option<u64>,
+    facts: DestinationWriteFacts,
+    chunk_count: u64,
+}
+
+/// A write-phase failure, split at the session boundary (ADR-0047): before
+/// the destination session opened no record batch was ever exchanged, so
+/// the load keeps the pre-write report posture; once it opened, failures
+/// report the committed execution posture.
+#[derive(Debug)]
+enum WritePhaseFailure {
+    BeforeSession(DestinationWriteFailure),
+    InSession(DestinationWriteFailure),
+}
+
+/// Streams the source chunks into one destination write session (ADR-0046):
+/// begin, one `write_chunk` per source chunk, then the terminal commit. A
+/// destination failure carries its own committed-state facts; a source
+/// failure mid-stream — the mutation guard, or a chunk that fails to build
+/// — abandons the session and reports the destination state at abandonment,
+/// so append's committed chunk prefix stays honestly visible (ADR-0047).
+fn run_write_phase(
+    chunks: impl Iterator<Item = Result<RecordBatch, LoadFailure>>,
+    destination: &dyn Destination,
+    mode: LoadMode,
+) -> Result<WritePhaseOutcome, WritePhaseFailure> {
+    let mut writer = destination
+        .begin(mode)
+        .map_err(WritePhaseFailure::BeforeSession)?;
+    let mut chunk_count = 0_u64;
+    for chunk in chunks {
+        match chunk {
+            Ok(batch) => {
+                writer
+                    .write_chunk(&batch)
+                    .map_err(WritePhaseFailure::InSession)?;
+                chunk_count += 1;
+            }
+            Err(source_failure) => {
+                let abandoned = writer.abandon();
+                return Err(WritePhaseFailure::InSession(DestinationWriteFailure {
+                    failure: source_failure,
+                    facts: abandoned.facts,
+                    written_records: abandoned.written_records,
+                    committed_chunks: abandoned.committed_chunks,
+                }));
+            }
+        }
+    }
+    let write = writer.commit().map_err(WritePhaseFailure::InSession)?;
+    Ok(WritePhaseOutcome {
+        bytes_written: write.bytes_written,
+        facts: write.facts,
+        chunk_count,
     })
 }
 
@@ -858,17 +1044,6 @@ mod tests {
         }
     }
 
-    fn rejected_record(line: u64) -> rejection::RejectedRecord {
-        rejection::RejectedRecord {
-            line,
-            code: rejection::MALFORMED_CSV_RECORD,
-            field: None,
-            source_field: None,
-            message: "expected 2 fields, found 3".to_string(),
-            record: Value::Null,
-        }
-    }
-
     #[test]
     fn from_success_reports_the_success_posture_around_the_execution_facts() {
         let details = ExecutionDetails {
@@ -886,7 +1061,7 @@ mod tests {
                 source: Some(64),
                 destination: Some(128),
             },
-            rejected: vec![rejected_record(3)],
+            rejected_count: 1,
             destination_write: DestinationWriteFacts::best_effort("replace_directory"),
             execution: json!({ "record_format": "arrow_record_batch", "batch_count": 1 }),
         };
@@ -953,7 +1128,7 @@ mod tests {
                 source: Some(64),
                 destination: Some(128),
             },
-            rejected: Vec::new(),
+            rejected_count: 0,
             destination_write: DestinationWriteFacts::not_applicable(),
             execution: json!({}),
         };
@@ -979,7 +1154,8 @@ mod tests {
             schema_decision: not_evaluated_schema_decision(),
             source_rows: 0,
             written_records: 0,
-            rejected: Vec::new(),
+            rejected_count: 0,
+            committed_execution: None,
             destination_write: DestinationWriteFacts::not_applicable(),
             code: "missing_source",
             message: "load definition source is required".to_string(),
@@ -1043,7 +1219,8 @@ mod tests {
             schema_decision: json!({ "mode": "inferred" }),
             source_rows: 3,
             written_records: 0,
-            rejected: vec![rejected_record(2), rejected_record(3)],
+            rejected_count: 2,
+            committed_execution: None,
             destination_write: DestinationWriteFacts::not_applicable(),
             code: "reject_threshold_exceeded",
             message: "rejected 2 of 3 records, exceeding the reject threshold of 0".to_string(),
@@ -1092,6 +1269,7 @@ mod tests {
             transform: None,
             schema: None,
             artifacts: None,
+            execution: None,
             reject_threshold,
         }
     }
@@ -1101,7 +1279,8 @@ mod tests {
         let work = tempfile::TempDir::new().expect("tempdir");
         let definition = threshold_definition(&work, None);
 
-        let failure = execute_supported_load(&definition)
+        let mut sink = rejection::RejectionSink::new(work.path());
+        let failure = execute_supported_load(&definition, &mut sink)
             .err()
             .expect("one rejection exceeds the default threshold of 0");
 
@@ -1117,7 +1296,13 @@ mod tests {
             "inferred"
         );
         assert_eq!(failure.source_rows, Some(2));
-        assert_eq!(failure.rejected.len(), 1);
+        assert_eq!(failure.rejected_count, 1);
+        // The rejection was streamed to its artifact before the gate fired.
+        assert!(sink.take_io_error().is_none());
+        assert!(work
+            .path()
+            .join(rejection::REJECTED_RECORDS_FILENAME)
+            .exists());
         // The threshold gate is side-effect free: no destination was written.
         assert!(!work.path().join("customers_dataset").exists());
     }
@@ -1128,13 +1313,14 @@ mod tests {
         let work = tempfile::TempDir::new().expect("tempdir");
         let definition = threshold_definition(&work, Some(1));
 
-        let details =
-            execute_supported_load(&definition).expect("at-or-below the threshold completes");
+        let mut sink = rejection::RejectionSink::new(work.path());
+        let details = execute_supported_load(&definition, &mut sink)
+            .expect("at-or-below the threshold completes");
 
         assert_eq!(details.row_counts.source, 2);
         assert_eq!(details.row_counts.written, 1);
         assert_eq!(details.row_counts.rejected, 1);
-        assert_eq!(details.rejected.len(), 1);
+        assert_eq!(details.rejected_count, 1);
         assert!(work.path().join("customers_dataset").exists());
     }
 
@@ -1152,7 +1338,8 @@ mod tests {
             overrides: None,
         });
 
-        let failure = execute_supported_load(&definition)
+        let mut sink = rejection::RejectionSink::new(work.path());
+        let failure = execute_supported_load(&definition, &mut sink)
             .err()
             .expect("one rejection exceeds the default threshold of 0");
 
@@ -1161,6 +1348,220 @@ mod tests {
             !pinned_path.exists(),
             "a threshold-failed load must not persist the pin"
         );
+    }
+
+    #[test]
+    fn from_failure_reports_the_committed_write_phase_posture() {
+        // A failure after the load entered the write phase reports the
+        // chunked execution posture: the committed chunk count and the
+        // effective chunk bound (ADR-0047).
+        let failure = ReportableFailure {
+            source_summary: json!({ "connector": "local_file" }),
+            destination_summary: json!({ "connector": "parquet" }),
+            dataset: Some("customers".to_string()),
+            load_mode: "append".to_string(),
+            schema_decision: json!({ "mode": "inferred" }),
+            source_rows: 5,
+            written_records: 2,
+            rejected_count: 0,
+            committed_execution: Some(CommittedExecution {
+                committed_chunks: 2,
+                chunk_rows: 1,
+            }),
+            destination_write: DestinationWriteFacts::best_effort("staged_part_append"),
+            code: "source_changed_during_load",
+            message: "source changed during the load".to_string(),
+        };
+
+        let report = LoadReport::from_failure(
+            "load-under-test".to_string(),
+            "artifacts/load-under-test".to_string(),
+            timings(),
+            failure,
+        );
+
+        assert_eq!(
+            report.execution,
+            json!({
+                "record_format": "arrow_record_batch",
+                "batch_count": 2,
+                "chunk_rows": 1
+            })
+        );
+        assert_eq!(report.row_counts.written, 2);
+    }
+
+    // ---- Source-mutation guard across the write phase (ADR-0045, ADR-0047) ----
+
+    /// Reads a CSV source through the streaming port for a write-phase test:
+    /// the resolved chunk stream plus the sink directory keeping the
+    /// artifact.
+    fn read_csv_chunks(
+        work: &tempfile::TempDir,
+        source_path: &Path,
+        chunk_rows: usize,
+    ) -> connector::SourceRead {
+        let source_port = source_connector(&SourceDefinition {
+            connector: "local_file".to_string(),
+            path: source_path.to_path_buf(),
+            format: Some("csv".to_string()),
+        })
+        .expect("source connector");
+        let mut sink = rejection::RejectionSink::new(work.path());
+        let read = source_port
+            .read(&schema::SchemaDirective::inferred(), chunk_rows, &mut sink)
+            .expect("read source");
+        assert!(sink.take_io_error().is_none());
+        read
+    }
+
+    fn parquet_destination(work: &tempfile::TempDir) -> Box<dyn connector::Destination> {
+        destination_connector(
+            &DestinationDefinition {
+                connector: "parquet".to_string(),
+                path: work.path().join("customers_dataset"),
+            },
+            None,
+        )
+        .expect("parquet connector")
+    }
+
+    fn duckdb_destination(work: &tempfile::TempDir) -> Box<dyn connector::Destination> {
+        destination_connector(
+            &DestinationDefinition {
+                connector: "duckdb".to_string(),
+                path: work.path().join("customers.duckdb"),
+            },
+            Some("customers"),
+        )
+        .expect("duckdb connector")
+    }
+
+    fn seed_destination(work: &tempfile::TempDir, destination: &dyn connector::Destination) {
+        let seed_path = work.path().join("seed.csv");
+        fs::write(&seed_path, "id,name\n7,Seed\n8,Kept\n").expect("write seed csv");
+        let read = read_csv_chunks(work, &seed_path, usize::MAX);
+        run_write_phase(read.chunks, destination, LoadMode::FullRefresh).expect("seed destination");
+    }
+
+    fn duckdb_rows(work: &tempfile::TempDir) -> usize {
+        let connection =
+            duckdb::Connection::open(work.path().join("customers.duckdb")).expect("open duckdb");
+        connection
+            .query_row("SELECT count(*) FROM customers", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("count rows") as usize
+    }
+
+    #[test]
+    fn full_refresh_source_change_leaves_both_destinations_untouched() {
+        // A bytes-only mutation after the read: every per-record outcome
+        // still matches, so only the byte hash catches it — before the
+        // terminal commit, leaving the seeded dataset intact (ADR-0045).
+        for connector_name in ["parquet", "duckdb"] {
+            let work = tempfile::TempDir::new().expect("tempdir");
+            let destination: Box<dyn connector::Destination> = match connector_name {
+                "parquet" => parquet_destination(&work),
+                _ => duckdb_destination(&work),
+            };
+            seed_destination(&work, destination.as_ref());
+
+            let source_path = work.path().join("customers.csv");
+            fs::write(&source_path, "id,name\n1,Ada\n2,Grace\n3,Cara\n").expect("write csv");
+            let read = read_csv_chunks(&work, &source_path, 1);
+            fs::write(&source_path, "id,name\n1,Bob\n2,Grace\n3,Cara\n").expect("mutate csv");
+
+            let Err(failure) =
+                run_write_phase(read.chunks, destination.as_ref(), LoadMode::FullRefresh)
+            else {
+                panic!("source change fails the load")
+            };
+            let WritePhaseFailure::InSession(failure) = failure else {
+                panic!("the mutation guard fires inside the open session")
+            };
+            assert_eq!(failure.failure.code, "source_changed_during_load");
+            assert_eq!(failure.committed_chunks, 0, "{connector_name}");
+            assert_eq!(failure.written_records, 0, "{connector_name}");
+            assert_eq!(
+                failure.facts.report_value(),
+                json!({ "atomicity": "not_applicable" }),
+                "{connector_name}"
+            );
+
+            // The seeded destination survives untouched.
+            match connector_name {
+                "parquet" => {
+                    let parts = fs::read_dir(work.path().join("customers_dataset"))
+                        .expect("destination directory")
+                        .filter(|entry| {
+                            entry.as_ref().expect("entry").path().extension()
+                                == Some("parquet".as_ref())
+                        })
+                        .count();
+                    assert_eq!(parts, 1, "the seed part alone remains");
+                }
+                _ => assert_eq!(duckdb_rows(&work), 2),
+            }
+        }
+    }
+
+    #[test]
+    fn append_source_change_keeps_exactly_the_committed_chunk_prefix() {
+        // Record 3 turns semantically divergent after the read: with a chunk
+        // bound of 1, chunks 1 and 2 commit before the divergence surfaces,
+        // and the failure reports that prefix honestly (ADR-0047).
+        for connector_name in ["parquet", "duckdb"] {
+            let work = tempfile::TempDir::new().expect("tempdir");
+            let destination: Box<dyn connector::Destination> = match connector_name {
+                "parquet" => parquet_destination(&work),
+                _ => duckdb_destination(&work),
+            };
+            seed_destination(&work, destination.as_ref());
+
+            let source_path = work.path().join("customers.csv");
+            fs::write(&source_path, "id,name\n1,Ada\n2,Grace\n3,Cara\n").expect("write csv");
+            let read = read_csv_chunks(&work, &source_path, 1);
+            fs::write(&source_path, "id,name\n1,Ada\n2,Grace\n3,Cara,extra\n").expect("mutate csv");
+
+            let Err(failure) = run_write_phase(read.chunks, destination.as_ref(), LoadMode::Append)
+            else {
+                panic!("source change fails the load")
+            };
+            let WritePhaseFailure::InSession(failure) = failure else {
+                panic!("the mutation guard fires inside the open session")
+            };
+            assert_eq!(failure.failure.code, "source_changed_during_load");
+            assert_eq!(failure.committed_chunks, 2, "{connector_name}");
+            assert_eq!(failure.written_records, 2, "{connector_name}");
+            let expected_strategy = match connector_name {
+                "parquet" => "staged_part_append",
+                _ => "insert",
+            };
+            assert_eq!(
+                failure.facts.report_value(),
+                json!({ "atomicity": "best_effort", "strategy": expected_strategy }),
+                "{connector_name}"
+            );
+
+            match connector_name {
+                "parquet" => {
+                    let parts = fs::read_dir(work.path().join("customers_dataset"))
+                        .expect("destination directory")
+                        .filter(|entry| {
+                            entry.as_ref().expect("entry").path().extension()
+                                == Some("parquet".as_ref())
+                        })
+                        .count();
+                    assert_eq!(parts, 3, "the seed part plus one part per committed chunk");
+                }
+                _ => assert_eq!(
+                    duckdb_rows(&work),
+                    4,
+                    "the seed rows plus the committed prefix"
+                ),
+            }
+        }
     }
 
     #[test]

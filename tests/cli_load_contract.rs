@@ -123,6 +123,10 @@ load_mode: full_refresh
     assert_eq!(report["destination_write"]["atomicity"], "best_effort");
     assert_eq!(report["execution"]["record_format"], "arrow_record_batch");
     assert_eq!(report["execution"]["batch_count"], 1);
+    assert_eq!(
+        report["execution"]["chunk_rows"], 65536,
+        "the effective chunk bound is echoed, defaulting to 65536 (ADR-0046)"
+    );
     assert!(report["error_summary"].is_null());
     assert!(report_path.ends_with("load-report.json"));
 
@@ -305,6 +309,10 @@ load_mode: full_refresh
     );
     assert_eq!(report["execution"]["record_format"], "arrow_record_batch");
     assert_eq!(report["execution"]["batch_count"], 1);
+    assert_eq!(
+        report["execution"]["chunk_rows"], 65536,
+        "the effective chunk bound is echoed, defaulting to 65536 (ADR-0046)"
+    );
     assert!(report["error_summary"].is_null());
     assert!(report_path.ends_with("load-report.json"));
 
@@ -491,6 +499,10 @@ load_mode: full_refresh
     assert_eq!(report["destination_write"]["atomicity"], "best_effort");
     assert_eq!(report["execution"]["record_format"], "arrow_record_batch");
     assert_eq!(report["execution"]["batch_count"], 1);
+    assert_eq!(
+        report["execution"]["chunk_rows"], 65536,
+        "the effective chunk bound is echoed, defaulting to 65536 (ADR-0046)"
+    );
     assert!(report["error_summary"].is_null());
     assert!(report_path.ends_with("load-report.json"));
 
@@ -679,6 +691,10 @@ load_mode: full_refresh
     );
     assert_eq!(report["execution"]["record_format"], "arrow_record_batch");
     assert_eq!(report["execution"]["batch_count"], 1);
+    assert_eq!(
+        report["execution"]["chunk_rows"], 65536,
+        "the effective chunk bound is echoed, defaulting to 65536 (ADR-0046)"
+    );
     assert!(report["error_summary"].is_null());
     assert!(report_path.ends_with("load-report.json"));
 
@@ -5830,6 +5846,10 @@ reject_threshold: 1
     assert_eq!(report["row_counts"]["rejected"], 1);
     assert_eq!(report["rejected_records"]["count"], 1);
     assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+    // The destination session never opened (the parent path blocks it), so
+    // the execution posture stays pre-write (ADR-0047).
+    assert_eq!(report["execution"]["record_format"], "not_started");
+    assert_eq!(report["execution"]["batch_count"], 0);
 
     let artifact_path = PathBuf::from(
         report["rejected_records"]["artifact"]
@@ -6936,6 +6956,810 @@ struct CliLoadResult {
     stdout: String,
     report_path: PathBuf,
     report: Value,
+}
+
+// ---- Chunked execution (issue #52: ADR-0045, ADR-0046, ADR-0047) ----
+
+/// Writes a load definition with an `execution.chunk_rows` block and
+/// optional extra blocks appended verbatim.
+fn write_chunked_definition(
+    definition_path: &Path,
+    source_path: &Path,
+    destination_connector: &str,
+    destination_path: &Path,
+    load_mode: &str,
+    chunk_rows: u64,
+    extra_blocks: &str,
+) {
+    let source_format = source_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .expect("source path carries its format extension");
+    fs::write(
+        definition_path,
+        format!(
+            "version: 1\n\
+             source:\n\
+             \x20 connector: local_file\n\
+             \x20 path: {}\n\
+             \x20 format: {source_format}\n\
+             destination:\n\
+             \x20 connector: {destination_connector}\n\
+             \x20 path: {}\n\
+             dataset: customers\n\
+             load_mode: {load_mode}\n\
+             execution:\n\
+             \x20 chunk_rows: {chunk_rows}\n\
+             {extra_blocks}",
+            source_path.display(),
+            destination_path.display(),
+        ),
+    )
+    .expect("write load definition");
+}
+
+#[test]
+fn multi_chunk_full_refresh_matches_single_chunk_content_for_both_connectors() {
+    // 5 records at a chunk bound of 2 execute as 3 chunks. Full refresh
+    // keeps its single terminal commit (ADR-0047): Parquet lands one part
+    // per chunk behind one rename, DuckDB lands one table holding every
+    // chunk, and both report the committed chunk count with the echoed
+    // bound.
+    for destination_connector in ["parquet", "duckdb"] {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.csv");
+        fs::write(
+            &source_path,
+            "customer_id,name\n1,Ada\n2,Grace\n3,Cara\n4,Dana\n5,Elle\n",
+        )
+        .expect("write source csv");
+        let destination_path = match destination_connector {
+            "parquet" => work.path().join("customers_dataset"),
+            _ => work.path().join("customers.duckdb"),
+        };
+        let definition_path = work.path().join("load.yml");
+        write_chunked_definition(
+            &definition_path,
+            &source_path,
+            destination_connector,
+            &destination_path,
+            "full_refresh",
+            2,
+            "",
+        );
+
+        let load = run_cli_load(
+            work.path(),
+            &work.path().join("artifacts"),
+            &definition_path,
+            true,
+        );
+        let report = &load.report;
+
+        assert_eq!(
+            report["exit_status"], "succeeded",
+            "{destination_connector}"
+        );
+        assert_eq!(report["row_counts"]["source"], 5);
+        assert_eq!(report["row_counts"]["written"], 5);
+        assert_eq!(report["execution"]["record_format"], "arrow_record_batch");
+        assert_eq!(
+            report["execution"]["batch_count"], 3,
+            "batch_count counts committed chunks: ceil(5 / 2)"
+        );
+        assert_eq!(report["execution"]["chunk_rows"], 2);
+
+        match destination_connector {
+            "parquet" => {
+                assert_eq!(
+                    report["destination_write"]["strategy"],
+                    "staging_then_replace"
+                );
+                let records = id_name_records(&read_parquet_batches(&destination_path));
+                assert_eq!(records.len(), 5);
+                assert_eq!(records[0], (1, "Ada".to_string()));
+                assert_eq!(records[4], (5, "Elle".to_string()));
+                assert_eq!(
+                    parquet_files(&destination_path).len(),
+                    3,
+                    "one part per chunk"
+                );
+            }
+            _ => {
+                assert_eq!(
+                    report["destination_write"]["strategy"],
+                    "transactional_replace"
+                );
+                let batch = read_single_duckdb_batch(&destination_path, "customers");
+                assert_eq!(batch.num_rows(), 5);
+            }
+        }
+    }
+}
+
+#[test]
+fn multi_chunk_append_commits_one_chunk_at_a_time_for_both_connectors() {
+    // Append commits per chunk (ADR-0047): 5 records at a bound of 2 land as
+    // 3 committed chunks on top of the seeded dataset.
+    for destination_connector in ["parquet", "duckdb"] {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.csv");
+        let destination_path = match destination_connector {
+            "parquet" => work.path().join("customers_dataset"),
+            _ => work.path().join("customers.duckdb"),
+        };
+        let definition_path = work.path().join("load.yml");
+
+        fs::write(&source_path, "customer_id,name\n1,Ada\n").expect("write seed csv");
+        write_load_definition(
+            &definition_path,
+            &source_path,
+            "csv",
+            destination_connector,
+            &destination_path,
+            "full_refresh",
+            None,
+        );
+        run_cli_load(
+            work.path(),
+            &work.path().join("artifacts-seed"),
+            &definition_path,
+            true,
+        );
+
+        fs::write(
+            &source_path,
+            "customer_id,name\n2,Grace\n3,Cara\n4,Dana\n5,Elle\n6,Faye\n",
+        )
+        .expect("write append csv");
+        write_chunked_definition(
+            &definition_path,
+            &source_path,
+            destination_connector,
+            &destination_path,
+            "append",
+            2,
+            "",
+        );
+        let append = run_cli_load(
+            work.path(),
+            &work.path().join("artifacts-append"),
+            &definition_path,
+            true,
+        );
+        let report = &append.report;
+
+        assert_eq!(
+            report["exit_status"], "succeeded",
+            "{destination_connector}"
+        );
+        assert_eq!(report["row_counts"]["written"], 5);
+        assert_eq!(report["execution"]["batch_count"], 3);
+        assert_eq!(report["execution"]["chunk_rows"], 2);
+
+        match destination_connector {
+            "parquet" => {
+                assert_eq!(
+                    report["destination_write"]["strategy"],
+                    "staged_part_append"
+                );
+                let records = id_name_records(&read_parquet_batches(&destination_path));
+                assert_eq!(records.len(), 6, "the seed record plus five appended");
+                assert_eq!(
+                    parquet_files(&destination_path).len(),
+                    4,
+                    "the seed part plus one committed part per append chunk"
+                );
+            }
+            _ => {
+                assert_eq!(report["destination_write"]["strategy"], "insert");
+                let batch = read_single_duckdb_batch(&destination_path, "customers");
+                assert_eq!(batch.num_rows(), 6);
+            }
+        }
+    }
+}
+
+#[test]
+fn an_empty_execution_block_defaults_the_chunk_bound() {
+    // `execution: {}` declares nothing, so the bound defaults to 65536
+    // exactly as an absent block does (ADR-0046) — no new failure code
+    // exists for the execution block.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "customer_id\n1\n").expect("write source csv");
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            "version: 1\n\
+             source:\n\
+             \x20 connector: local_file\n\
+             \x20 path: {}\n\
+             \x20 format: csv\n\
+             destination:\n\
+             \x20 connector: parquet\n\
+             \x20 path: {}\n\
+             dataset: customers\n\
+             load_mode: full_refresh\n\
+             execution: {{}}\n",
+            source_path.display(),
+            destination_path.display(),
+        ),
+    )
+    .expect("write load definition");
+
+    let load = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts"),
+        &definition_path,
+        true,
+    );
+    assert_eq!(load.report["exit_status"], "succeeded");
+    assert_eq!(load.report["execution"]["chunk_rows"], 65536);
+}
+
+#[test]
+fn invalid_execution_blocks_fail_before_source_or_destination_work() {
+    // The execution block is part of the strict contract: a zero, negative,
+    // or non-integer bound fails YAML parsing (`chunk_rows` is a nonzero
+    // integer), and an unknown key is rejected recursively (ADR-0037) — all
+    // before any source read or destination write, and all under the
+    // existing definition failure code.
+    for (execution_block, expected_code, expected_message_part) in [
+        (
+            "execution:\n  chunk_rows: 0\n",
+            "invalid_load_definition_yaml",
+            "expected a nonzero u64",
+        ),
+        (
+            "execution:\n  workers: 4\n",
+            "invalid_load_definition_yaml",
+            "unknown field `workers`",
+        ),
+        (
+            "execution:\n  chunk_rows: -1\n",
+            "invalid_load_definition_yaml",
+            "expected a nonzero u64",
+        ),
+    ] {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.csv");
+        fs::write(&source_path, "customer_id\n1\n").expect("write source csv");
+        let destination_path = work.path().join("customers_dataset");
+        let definition_path = work.path().join("load.yml");
+        fs::write(
+            &definition_path,
+            format!(
+                "version: 1\n\
+                 source:\n\
+                 \x20 connector: local_file\n\
+                 \x20 path: {}\n\
+                 \x20 format: csv\n\
+                 destination:\n\
+                 \x20 connector: parquet\n\
+                 \x20 path: {}\n\
+                 dataset: customers\n\
+                 load_mode: full_refresh\n\
+                 {execution_block}",
+                source_path.display(),
+                destination_path.display(),
+            ),
+        )
+        .expect("write load definition");
+
+        let load = run_cli_load(
+            work.path(),
+            &work.path().join("artifacts"),
+            &definition_path,
+            false,
+        );
+        let report = &load.report;
+
+        assert_eq!(
+            report["error_summary"]["code"], expected_code,
+            "{execution_block:?}"
+        );
+        let message = report["error_summary"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            message.contains(expected_message_part),
+            "message {message:?} misses {expected_message_part:?}"
+        );
+        assert_eq!(report["execution"]["record_format"], "not_started");
+        assert_eq!(report["execution"]["batch_count"], 0);
+        assert!(
+            !destination_path.exists(),
+            "an invalid execution block must not reach the destination"
+        );
+    }
+}
+
+#[test]
+fn a_late_reject_threshold_breach_leaves_destination_and_pin_untouched() {
+    // The rejection sits in the last record: pass 1 evaluates the threshold
+    // over the full input before any write (ADR-0045), so even at a chunk
+    // bound of 1 — where earlier records would already have filled chunks —
+    // the breach fails the load with today's code and wording, no
+    // destination content, and no persisted pin.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "customer_id\n1\n2\n3\n4,extra\n").expect("write source csv");
+    let destination_path = work.path().join("customers_dataset");
+    let pinned_path = work.path().join("customers.schema.yml");
+    let definition_path = work.path().join("load.yml");
+    write_chunked_definition(
+        &definition_path,
+        &source_path,
+        "parquet",
+        &destination_path,
+        "full_refresh",
+        1,
+        &format!("schema:\n  pinned_path: {}\n", pinned_path.display()),
+    );
+
+    let load = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts"),
+        &definition_path,
+        false,
+    );
+    let report = &load.report;
+
+    assert_eq!(report["error_summary"]["code"], "reject_threshold_exceeded");
+    assert_eq!(
+        report["error_summary"]["message"],
+        "rejected 1 of 4 records, exceeding the reject threshold of 0"
+    );
+    assert_eq!(report["row_counts"]["source"], 4);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 1);
+    assert_eq!(report["execution"]["record_format"], "not_started");
+    assert_eq!(report["execution"]["batch_count"], 0);
+    assert!(
+        !destination_path.exists(),
+        "a threshold breach anywhere in the source precedes any destination write"
+    );
+    assert!(
+        !pinned_path.exists(),
+        "a threshold-failed load must not persist the pin"
+    );
+}
+
+#[test]
+fn multi_chunk_pinned_loads_resolve_schema_against_the_whole_input() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    let destination_path = work.path().join("customers_dataset");
+    let pinned_path = work.path().join("customers.schema.yml");
+    let definition_path = work.path().join("load.yml");
+
+    // Bootstrap at a chunk bound of 1: `total` reads int64 in the first
+    // record and only widens to float64 in the last — the pin must record
+    // the whole-input observation, not the first chunk's.
+    fs::write(
+        &source_path,
+        "{\"id\": 1, \"total\": 1}\n{\"id\": 2, \"total\": 2}\n{\"id\": 3, \"total\": 2.5}\n",
+    )
+    .expect("write source jsonl");
+    write_chunked_definition(
+        &definition_path,
+        &source_path,
+        "parquet",
+        &destination_path,
+        "full_refresh",
+        1,
+        &format!("schema:\n  pinned_path: {}\n", pinned_path.display()),
+    );
+    let bootstrap = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-bootstrap"),
+        &definition_path,
+        true,
+    );
+    assert_eq!(bootstrap.report["execution"]["batch_count"], 3);
+    assert_eq!(
+        bootstrap.report["schema_decision"]["fields"][1],
+        serde_json::json!({"name": "total", "type": "float64", "nullable": true})
+    );
+    let pin_text = fs::read_to_string(&pinned_path).expect("bootstrapped pin");
+    assert!(
+        pin_text.contains("type: float64"),
+        "pin {pin_text:?} records the whole-input widening"
+    );
+
+    // Additive drift under the pin: `note` exists only in the final record,
+    // so the whole-input union must admit it as one added field — and a
+    // pinned field carried by every record is never missing-field drift just
+    // because single-record chunks lack it.
+    fs::write(
+        &source_path,
+        "{\"id\": 1, \"total\": 1}\n{\"id\": 2, \"total\": 2}\n\
+         {\"id\": 3, \"total\": 2.5, \"note\": \"vip\"}\n",
+    )
+    .expect("write drifted jsonl");
+    write_chunked_definition(
+        &definition_path,
+        &source_path,
+        "parquet",
+        &destination_path,
+        "full_refresh",
+        1,
+        &format!(
+            "schema:\n  pinned_path: {}\n  drift_policy: allow_additive_nullable\n",
+            pinned_path.display()
+        ),
+    );
+    let drifted = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-drift"),
+        &definition_path,
+        true,
+    );
+    assert_eq!(
+        drifted.report["schema_decision"]["drift_status"],
+        "additive_fields_added"
+    );
+    assert_eq!(
+        drifted.report["schema_decision"]["added_fields"],
+        serde_json::json!([{"name": "note", "type": "utf8", "nullable": true}])
+    );
+    let extended_pin = fs::read_to_string(&pinned_path).expect("extended pin");
+    assert!(
+        extended_pin.contains("name: note"),
+        "pin {extended_pin:?} carries the added field"
+    );
+    let records = read_parquet_batches(&destination_path);
+    let total_rows: usize = records.iter().map(|batch| batch.num_rows()).sum();
+    assert_eq!(total_rows, 3);
+}
+
+#[test]
+fn a_drift_failed_multi_chunk_load_keeps_only_parse_rejections_in_the_artifact() {
+    // The pin names a field absent from every record — missing-field drift
+    // judged against the whole input — while the source interleaves a parse
+    // rejection and a would-be validation rejection. The drift failure must
+    // leave an artifact carrying only the parse rejection (ADR-0045's
+    // spill-discard).
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    fs::write(&source_path, "{\"id\": 1}\n[1]\n{\"id\": \"abc\"}\n").expect("write source jsonl");
+    let pinned_path = work.path().join("customers.schema.yml");
+    fs::write(
+        &pinned_path,
+        "version: 1\n\
+         fields:\n\
+         - name: id\n\
+         \x20 type: int64\n\
+         - name: missing\n\
+         \x20 type: utf8\n",
+    )
+    .expect("write pinned schema");
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    write_chunked_definition(
+        &definition_path,
+        &source_path,
+        "parquet",
+        &destination_path,
+        "full_refresh",
+        1,
+        &format!(
+            "schema:\n  pinned_path: {}\nreject_threshold: 5\n",
+            pinned_path.display()
+        ),
+    );
+
+    let load = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts"),
+        &definition_path,
+        false,
+    );
+    let report = &load.report;
+
+    assert_eq!(report["error_summary"]["code"], "schema_drift");
+    assert_eq!(report["schema_decision"]["drift_status"], "failed_on_drift");
+    assert_eq!(report["rejected_records"]["count"], 1);
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let rejected_lines = read_rejected_records(&artifact_path);
+    assert_eq!(
+        rejected_lines.len(),
+        1,
+        "a shape-drift failure's artifact carries only parse rejections"
+    );
+    assert_eq!(rejected_lines[0]["line"], 2);
+    assert_eq!(rejected_lines[0]["code"], "malformed_jsonl_record");
+    assert!(!destination_path.exists());
+}
+
+#[test]
+fn multi_chunk_artifacts_interleave_parse_and_validation_rejections_byte_identically() {
+    // CSV under a pin: the parse rejection on line 3 and the validation
+    // rejection on line 4 interleave in source-line order, and every line
+    // matches the exact artifact rendering.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "id\n1\n2,extra\nabc\n5\n").expect("write source csv");
+    let pinned_path = work.path().join("customers.schema.yml");
+    fs::write(
+        &pinned_path,
+        "version: 1\nfields:\n- name: id\n  type: int64\n",
+    )
+    .expect("write pinned schema");
+    let destination_path = work.path().join("customers_dataset");
+    let definition_path = work.path().join("load.yml");
+    write_chunked_definition(
+        &definition_path,
+        &source_path,
+        "parquet",
+        &destination_path,
+        "full_refresh",
+        1,
+        &format!(
+            "schema:\n  pinned_path: {}\nreject_threshold: 2\n",
+            pinned_path.display()
+        ),
+    );
+
+    let load = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts"),
+        &definition_path,
+        true,
+    );
+    let artifact_path = PathBuf::from(
+        load.report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let artifact = fs::read_to_string(&artifact_path).expect("artifact");
+    let expected = format!(
+        "{}\n{}\n",
+        serde_json::json!({
+            "line": 3,
+            "code": "malformed_csv_record",
+            "field": null,
+            "source_field": null,
+            "message": "expected 1 fields, found 2",
+            "record": ["2", "extra"]
+        }),
+        serde_json::json!({
+            "line": 4,
+            "code": "type_coercion_failed",
+            "field": "id",
+            "source_field": null,
+            "message": "value \"abc\" does not fit pinned type int64 for field \"id\"",
+            "record": {"id": "abc"}
+        })
+    );
+    assert_eq!(artifact, expected);
+
+    // JSONL under an override: the parse rejection streams while the
+    // validation rejection spills through the end-of-input merge — the
+    // final artifact still reads in source-line order, byte-identically.
+    let jsonl_path = work.path().join("customers.jsonl");
+    fs::write(
+        &jsonl_path,
+        "{\"id\": 1, \"name\": \"Ada\"}\n[1]\n{\"id\": 3, \"name\": null}\n{\"id\": 4, \"name\": \"Cara\"}\n",
+    )
+    .expect("write source jsonl");
+    let jsonl_definition_path = work.path().join("load-jsonl.yml");
+    write_chunked_definition(
+        &jsonl_definition_path,
+        &jsonl_path,
+        "parquet",
+        &work.path().join("customers_jsonl_dataset"),
+        "full_refresh",
+        1,
+        "schema:\n  overrides:\n  - name: name\n    nullable: false\nreject_threshold: 2\n",
+    );
+
+    let jsonl_load = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-jsonl"),
+        &jsonl_definition_path,
+        true,
+    );
+    let jsonl_artifact_path = PathBuf::from(
+        jsonl_load.report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let jsonl_artifact = fs::read_to_string(&jsonl_artifact_path).expect("artifact");
+    let jsonl_expected = format!(
+        "{}\n{}\n",
+        serde_json::json!({
+            "line": 2,
+            "code": "malformed_jsonl_record",
+            "field": null,
+            "source_field": null,
+            "message": "each JSONL record must be a JSON object",
+            "record": "[1]"
+        }),
+        serde_json::json!({
+            "line": 3,
+            "code": "missing_required_field",
+            "field": "name",
+            "source_field": null,
+            "message": "required field \"name\" is null",
+            "record": {"id": 3, "name": null}
+        })
+    );
+    assert_eq!(jsonl_artifact, jsonl_expected);
+}
+
+#[test]
+fn multi_chunk_artifacts_stay_byte_identical_for_inferred_csv_and_pinned_jsonl() {
+    // The remaining two directive cells of the artifact matrix: CSV under an
+    // inference-driven override, and JSONL under a pin — each interleaving a
+    // parse and a validation rejection across single-record chunks.
+    let work = TempDir::new().expect("tempdir");
+
+    // CSV, inferred directive with an override: the override supplies the
+    // per-record check inference alone would not impose.
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "id\n1\n2,extra\nabc\n5\n").expect("write source csv");
+    let definition_path = work.path().join("load.yml");
+    write_chunked_definition(
+        &definition_path,
+        &source_path,
+        "parquet",
+        &work.path().join("customers_dataset"),
+        "full_refresh",
+        1,
+        "schema:\n  overrides:\n  - name: id\n    type: int64\nreject_threshold: 2\n",
+    );
+
+    let load = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts"),
+        &definition_path,
+        true,
+    );
+    let artifact_path = PathBuf::from(
+        load.report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let artifact = fs::read_to_string(&artifact_path).expect("artifact");
+    let expected = format!(
+        "{}\n{}\n",
+        serde_json::json!({
+            "line": 3,
+            "code": "malformed_csv_record",
+            "field": null,
+            "source_field": null,
+            "message": "expected 1 fields, found 2",
+            "record": ["2", "extra"]
+        }),
+        serde_json::json!({
+            "line": 4,
+            "code": "type_coercion_failed",
+            "field": "id",
+            "source_field": null,
+            "message": "value \"abc\" does not fit overridden type int64 for field \"id\"",
+            "record": {"id": "abc"}
+        })
+    );
+    assert_eq!(artifact, expected);
+
+    // JSONL under a pin: the validation rejection spills until the shape
+    // verdict passes and merges back in line order.
+    let jsonl_path = work.path().join("customers.jsonl");
+    fs::write(
+        &jsonl_path,
+        "{\"id\": 1}\n[1]\n{\"id\": \"abc\"}\n{\"id\": 4}\n",
+    )
+    .expect("write source jsonl");
+    let pinned_path = work.path().join("customers.schema.yml");
+    fs::write(
+        &pinned_path,
+        "version: 1\nfields:\n- name: id\n  type: int64\n",
+    )
+    .expect("write pinned schema");
+    let jsonl_definition_path = work.path().join("load-jsonl.yml");
+    write_chunked_definition(
+        &jsonl_definition_path,
+        &jsonl_path,
+        "parquet",
+        &work.path().join("customers_jsonl_dataset"),
+        "full_refresh",
+        1,
+        &format!(
+            "schema:\n  pinned_path: {}\nreject_threshold: 2\n",
+            pinned_path.display()
+        ),
+    );
+
+    let jsonl_load = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-jsonl"),
+        &jsonl_definition_path,
+        true,
+    );
+    let jsonl_artifact_path = PathBuf::from(
+        jsonl_load.report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let jsonl_artifact = fs::read_to_string(&jsonl_artifact_path).expect("artifact");
+    let jsonl_expected = format!(
+        "{}\n{}\n",
+        serde_json::json!({
+            "line": 2,
+            "code": "malformed_jsonl_record",
+            "field": null,
+            "source_field": null,
+            "message": "each JSONL record must be a JSON object",
+            "record": "[1]"
+        }),
+        serde_json::json!({
+            "line": 3,
+            "code": "type_coercion_failed",
+            "field": "id",
+            "source_field": null,
+            "message": "value \"abc\" does not fit pinned type int64 for field \"id\"",
+            "record": {"id": "abc"}
+        })
+    );
+    assert_eq!(jsonl_artifact, jsonl_expected);
+}
+
+#[test]
+fn chunk_split_is_deterministic_across_identical_runs() {
+    // The same source bytes and the same bound must produce the same
+    // per-chunk row counts — the future retry and parallelism unit — made
+    // observable by append's one-part-per-chunk commits.
+    let mut observed_splits = Vec::new();
+    for _ in 0..2 {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.csv");
+        fs::write(
+            &source_path,
+            "customer_id,name\n1,Ada\n2,Grace\n3,Cara\n4,Dana\n5,Elle\n6,Faye\n7,Gwen\n8,Hope\n",
+        )
+        .expect("write source csv");
+        let destination_path = work.path().join("customers_dataset");
+        let definition_path = work.path().join("load.yml");
+        write_chunked_definition(
+            &definition_path,
+            &source_path,
+            "parquet",
+            &destination_path,
+            "append",
+            3,
+            "",
+        );
+
+        let load = run_cli_load(
+            work.path(),
+            &work.path().join("artifacts"),
+            &definition_path,
+            true,
+        );
+        assert_eq!(load.report["execution"]["batch_count"], 3);
+
+        let mut part_rows = parquet_files(&destination_path)
+            .iter()
+            .map(|path| {
+                read_parquet_file_batches(path)
+                    .iter()
+                    .map(|batch| batch.num_rows())
+                    .sum::<usize>()
+            })
+            .collect::<Vec<_>>();
+        part_rows.sort();
+        assert_eq!(part_rows, vec![2, 3, 3], "chunks fill in source order");
+        observed_splits.push(part_rows);
+    }
+    assert_eq!(observed_splits[0], observed_splits[1]);
 }
 
 fn write_load_definition(

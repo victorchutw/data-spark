@@ -2,9 +2,15 @@
 //!
 //! A column's type is decided once here — by inference over the observed
 //! values, or by validating those observations against a pinned schema
-//! ([`SchemaDirective`]) — and the same decision drives materialization into an
-//! Arrow [`RecordBatch`]. CSV cells arrive as text ([`from_text_columns`]) and
-//! JSONL cells arrive as typed [`Value`]s ([`from_json_columns`]); both fold
+//! ([`SchemaDirective`]) — and the same decision drives how records
+//! materialize into Arrow [`RecordBatch`] chunks. The module splits along the
+//! two source passes of ADR-0045: a streaming pass-1 observer per format
+//! ([`TextObserver`], [`JsonObserver`]) folds one record at a time into
+//! bounded state — the per-column observed-type lattice and the per-record
+//! check outcomes — and resolves the whole-input schema decision at end of
+//! input ([`Resolution`]); pass 2 then materializes fixed-size chunks of
+//! surviving records against the resolved plan ([`ChunkPlan`]). CSV cells
+//! arrive as text and JSONL cells arrive as typed [`Value`]s; both fold
 //! observations through the [`InferredType`] lattice, so the two formats
 //! produce and validate schemas the same way: a value fits a pinned field iff
 //! its observed type widens to the pinned type under that lattice (ADR-0034).
@@ -51,7 +57,8 @@
 //! Everything type-related — the lattice, observation rules, the pinned schema
 //! file contract ([`PinnedSchema`], ADR-0033), drift comparison, per-record
 //! validation, materialization, and the `schema_decision` shape — is private
-//! behind these two entry points.
+//! behind the observers, the resolution they finish into, and the chunk
+//! builder that materializes against it.
 
 use crate::connector::DestinationWriteFacts;
 use crate::rejection::{self, RejectedRecord};
@@ -66,12 +73,14 @@ use std::sync::Arc;
 
 const PINNED_SCHEMA_VERSION: u64 = 1;
 
-/// A materialized load: the typed Arrow batch of the surviving records, the
-/// `schema_decision` shape that the load report echoes back to the caller,
-/// the pinned schema file write the caller performs when this load produces
-/// or extends a pin (ADR-0033), and the records per-record validation
-/// rejected (ADR-0035) — the caller owns the artifact write and the reject
-/// threshold, so this module stays types-only.
+/// A whole-input materialization outcome, kept as the test-only convenience
+/// over the streaming observer + chunk builder machinery: the typed Arrow
+/// batch of the surviving records, the `schema_decision` shape the load
+/// report echoes, the pinned schema file write the caller performs when the
+/// load produces or extends a pin (ADR-0033), and the records per-record
+/// validation rejected (ADR-0035). Production reads stream instead
+/// (ADR-0045), so only tests materialize a whole input in one call.
+#[cfg(test)]
 pub(crate) struct Materialized {
     pub(crate) batch: RecordBatch,
     pub(crate) schema_decision: Value,
@@ -971,145 +980,395 @@ fn parse_canonical_u8(text: &str) -> Option<u8> {
     text.parse().ok()
 }
 
-/// Materializes CSV columns, whose cells arrive untyped as text and are typed
-/// by how they parse, under the load's schema directive.
-pub(crate) fn from_text_columns(
-    directive: &SchemaDirective,
-    field_names: Vec<String>,
-    records: Vec<TextRecord>,
-) -> Result<Materialized, ExecutionFailure> {
-    stamped(
-        directive,
-        text_materialization(directive, field_names, records),
-    )
+/// The resolved outcome of pass 1 (ADR-0045): the fixed plan pass 2
+/// materializes chunks against, the per-record checks both passes agree on,
+/// the `schema_decision` the load report echoes, and the pinned schema file
+/// write the caller performs when the load produces or extends a pin. The
+/// plan is final — inference, transform resolution, overrides, pin
+/// comparison, and drift are all decided against the whole input before any
+/// chunk is built.
+pub(crate) struct Resolution {
+    pub(crate) plan: ChunkPlan,
+    pub(crate) checks: Vec<FieldCheck>,
+    pub(crate) decision: Value,
+    pub(crate) pinned_schema_write: Option<PinnedSchemaWrite>,
 }
 
-/// Materializes JSONL columns from their parsed [`Value`]s directly, owning
-/// how absent and [`Value::Null`] values become Arrow nulls, so a JSON string
-/// like `"01234"` stays text instead of being round-tripped through a
-/// re-parse.
-pub(crate) fn from_json_columns(
-    directive: &SchemaDirective,
-    field_names: Vec<String>,
-    records: Vec<JsonRecord>,
-) -> Result<Materialized, ExecutionFailure> {
-    stamped(
-        directive,
-        json_materialization(directive, field_names, records),
-    )
+impl Resolution {
+    /// Renders the rejection a JSONL record spilled during pass 1 carries in
+    /// the artifact, now that the resolved checks fix which violated check
+    /// names it (ADR-0045). `None` only if the record no longer violates any
+    /// check, which pass-1/pass-2 check agreement rules out.
+    pub(crate) fn rejection_for(&self, record: &JsonRecord) -> Option<RejectedRecord> {
+        validate_json_record(record, &self.checks)
+    }
 }
 
-/// Adds the directive echoes to whichever schema decision a materialization
+/// The streaming pass-1 observer for CSV records: folds each record into the
+/// whole-input and surviving-records type lattices and, when the schema
+/// verdict is already known to be healthy from the header, judges the record
+/// against the per-record checks (ADR-0045). CSV shape verdicts — transform
+/// resolution, override names, pin conflicts, drift — depend only on the
+/// header, so a pending verdict skips per-record validation exactly like
+/// today's whole-input path, and [`TextObserver::finish`] re-derives the
+/// failure with the whole-input observations its message needs.
+pub(crate) struct TextObserver<'a> {
+    directive: &'a SchemaDirective,
+    field_names: &'a [String],
+    checks: Option<Vec<FieldCheck>>,
+    all_types: Vec<InferredType>,
+    survivor_types: Vec<InferredType>,
+}
+
+impl<'a> TextObserver<'a> {
+    pub(crate) fn new(directive: &'a SchemaDirective, field_names: &'a [String]) -> Self {
+        // Probe the verdict with placeholder observations: only the checks
+        // matter here, and they do not depend on observed types. A failing
+        // probe leaves the observer in observation-only mode, and finish()
+        // re-derives the same failure with the real observations.
+        let placeholder = vec![InferredType::Null; field_names.len()];
+        let checks = resolve_plan(directive, field_names, &placeholder, &placeholder)
+            .ok()
+            .map(|resolution| resolution.checks);
+        TextObserver {
+            directive,
+            field_names,
+            checks,
+            all_types: vec![InferredType::Null; field_names.len()],
+            survivor_types: vec![InferredType::Null; field_names.len()],
+        }
+    }
+
+    /// Folds one record into the observer: the whole-input lattice always
+    /// advances, and under a healthy verdict the record is judged against the
+    /// per-record checks — returning its rejection, or feeding the
+    /// surviving-records lattice that shapes inference and added fields.
+    /// Under a pending verdict every record returns `None` unjudged, matching
+    /// the whole-input path, where a shape failure precedes validation.
+    pub(crate) fn observe(&mut self, record: &TextRecord) -> Option<RejectedRecord> {
+        merge_text_observations(&mut self.all_types, record);
+        let checks = self.checks.as_ref()?;
+        if let Some(rejection) = validate_text_record(record, checks, self.field_names) {
+            return Some(rejection);
+        }
+        merge_text_observations(&mut self.survivor_types, record);
+        None
+    }
+
+    /// Resolves the whole-input schema decision: the fixed plan and checks on
+    /// success, or the schema failure — re-derived with the whole-input
+    /// observations, so a declared-type drift message names the real
+    /// effective types.
+    pub(crate) fn finish(self) -> Result<Resolution, ExecutionFailure> {
+        resolve_plan(
+            self.directive,
+            self.field_names,
+            &self.all_types,
+            &self.survivor_types,
+        )
+    }
+}
+
+fn merge_text_observations(types: &mut [InferredType], record: &TextRecord) {
+    for (column_index, cell) in record.cells.iter().enumerate() {
+        if let Some(value) = cell {
+            types[column_index] = types[column_index].merge(infer_text_type(value));
+        }
+    }
+}
+
+/// The streaming pass-1 observer for JSONL records. The JSONL dataset shape —
+/// the union of keys across all records — is only known at end of input, so
+/// unlike CSV no shape verdict exists while streaming: every record is judged
+/// against the directive-derived checks (the pinned fields and the overrides
+/// outside the pin, whose set equals the resolved checks whenever the verdict
+/// passes), and the caller spills rejected records until
+/// [`JsonObserver::finish`] delivers the verdict (ADR-0045). Outcomes are
+/// judged as "violates any check", which is order-free, so the unresolved
+/// dataset column order cannot change them.
+pub(crate) struct JsonObserver<'a> {
+    directive: &'a SchemaDirective,
+    checks: Vec<FieldCheck>,
+    all_types: HashMap<String, InferredType>,
+    survivor_types: HashMap<String, InferredType>,
+    flatten_all: Vec<InferredType>,
+    flatten_survivors: Vec<InferredType>,
+}
+
+/// The pass-1 outcome of one JSONL record: survived, or rejected by a
+/// per-record check — with the rejection itself deferred to the resolved
+/// checks, since which violated check names it depends on the dataset column
+/// order only end of input fixes.
+pub(crate) enum JsonOutcome {
+    Survived,
+    Rejected,
+}
+
+impl<'a> JsonObserver<'a> {
+    pub(crate) fn new(directive: &'a SchemaDirective) -> Self {
+        let flatten_count = directive.transform().flatten.len();
+        JsonObserver {
+            directive,
+            checks: directive_checks(directive),
+            all_types: HashMap::new(),
+            survivor_types: HashMap::new(),
+            flatten_all: vec![InferredType::Null; flatten_count],
+            flatten_survivors: vec![InferredType::Null; flatten_count],
+        }
+    }
+
+    /// Folds one record into the observer: the whole-input lattices always
+    /// advance, and the record is judged against the directive-derived
+    /// checks. A surviving record also feeds the surviving-records lattices
+    /// that shape inference and added fields.
+    pub(crate) fn observe(&mut self, record: &JsonRecord) -> JsonOutcome {
+        merge_json_observations(
+            &mut self.all_types,
+            &mut self.flatten_all,
+            self.directive,
+            record,
+        );
+        if json_record_violates(record, &self.checks) {
+            return JsonOutcome::Rejected;
+        }
+        merge_json_observations(
+            &mut self.survivor_types,
+            &mut self.flatten_survivors,
+            self.directive,
+            record,
+        );
+        JsonOutcome::Survived
+    }
+
+    /// Resolves the whole-input schema decision against the observed key
+    /// union, exactly like the whole-input path: transform resolution,
+    /// override names, pin conflicts, shape drift, and declared-type checks
+    /// all judge the union `field_names` spells, so a batch-wide-absent
+    /// pinned field is missing-field drift.
+    pub(crate) fn finish(self, field_names: &[String]) -> Result<Resolution, ExecutionFailure> {
+        let width = field_names.len() + self.flatten_all.len();
+        let mut all_types = vec![InferredType::Null; width];
+        let mut survivor_types = vec![InferredType::Null; width];
+        for (column_index, field_name) in field_names.iter().enumerate() {
+            if let Some(observed) = self.all_types.get(field_name) {
+                all_types[column_index] = *observed;
+            }
+            if let Some(observed) = self.survivor_types.get(field_name) {
+                survivor_types[column_index] = *observed;
+            }
+        }
+        for (position, observed) in self.flatten_all.iter().enumerate() {
+            all_types[field_names.len() + position] = *observed;
+        }
+        for (position, observed) in self.flatten_survivors.iter().enumerate() {
+            survivor_types[field_names.len() + position] = *observed;
+        }
+        resolve_plan(self.directive, field_names, &all_types, &survivor_types)
+    }
+}
+
+fn merge_json_observations(
+    types: &mut HashMap<String, InferredType>,
+    flatten_types: &mut [InferredType],
+    directive: &SchemaDirective,
+    record: &JsonRecord,
+) {
+    for (field_name, value) in &record.object {
+        let observed = types
+            .entry(field_name.clone())
+            .or_insert(InferredType::Null);
+        *observed = observed.merge(infer_json_type(value));
+    }
+    for (position, entry) in directive.transform().flatten.iter().enumerate() {
+        if let Some(value) = json_path_value(&entry.segments, &record.object) {
+            flatten_types[position] = flatten_types[position].merge(infer_json_type(value));
+        }
+    }
+}
+
+/// The per-record checks derivable from the directive alone, before the JSONL
+/// key union is known: every pinned field (a pin field missing from the union
+/// is missing-field drift, so on any load that validates records the pin is
+/// fully matched) plus every override outside the pin (an override naming no
+/// dataset field is `unknown_override_field`, another verdict that precedes
+/// validation). Whenever the end-of-input verdict passes, this set equals the
+/// resolved checks, so pass-1 outcomes agree with the resolved plan; when the
+/// verdict fails, the outcomes are discarded with the spill.
+fn directive_checks(directive: &SchemaDirective) -> Vec<FieldCheck> {
+    let transform = directive.transform();
+    let overrides = directive.overrides();
+    let mut checks = Vec::new();
+    let mut pin_named: HashSet<&str> = HashSet::new();
+    if let SchemaDirective::Pinned { pin, .. } = directive {
+        for pin_field in &pin.fields {
+            pin_named.insert(pin_field.name.as_str());
+            checks.push(FieldCheck {
+                name: pin_field.name.clone(),
+                source: json_source_address(transform, &pin_field.name),
+                observed_index: 0,
+                expected_type: Some((pin_field.field_type, TypeOrigin::Pinned)),
+                required: !pin_field.nullable,
+            });
+        }
+    }
+    for override_ in &overrides.overrides {
+        if pin_named.contains(override_.name.as_str()) {
+            continue;
+        }
+        checks.push(FieldCheck {
+            name: override_.name.clone(),
+            source: json_source_address(transform, &override_.name),
+            observed_index: 0,
+            expected_type: override_
+                .field_type
+                .map(|field_type| (field_type, TypeOrigin::Overridden)),
+            required: override_.nullable == Some(false),
+        });
+    }
+    checks
+}
+
+/// The source address a dataset field name reads from in a JSONL record,
+/// derived from the transform configuration alone: the declared path when the
+/// name is a flatten output's dataset name (ADR-0041), the rename key when a
+/// rename mapping produced the name (ADR-0039), and the name itself
+/// otherwise. Rename targets and flatten outputs are config-unique, so the
+/// reverse lookup is unambiguous.
+fn json_source_address(transform: &SchemaTransform, dataset_name: &str) -> SourceAddress {
+    if let Some(entry) = transform
+        .flatten
+        .iter()
+        .find(|entry| transform.dataset_name(&entry.output) == dataset_name)
+    {
+        return SourceAddress::Path(entry.segments.clone());
+    }
+    if let Some((source_name, _)) = transform
+        .rename
+        .iter()
+        .find(|(_, target)| target == dataset_name)
+    {
+        return SourceAddress::Field(source_name.clone());
+    }
+    SourceAddress::Field(dataset_name.to_string())
+}
+
+/// Whether a JSONL record violates any of the checks: the order-free
+/// restriction of [`validate_json_record`], used while the check order is
+/// still unresolved during pass 1 — and by pass 2, whose outcomes must be
+/// the same pure function of (record, checks). A record violates iff
+/// `validate` would reject it, whatever the check order.
+pub(crate) fn json_record_violates(record: &JsonRecord, checks: &[FieldCheck]) -> bool {
+    checks
+        .iter()
+        .any(|check| match check.source.json_value(&record.object) {
+            None | Some(Value::Null) => check.required,
+            Some(value) => check
+                .expected_type
+                .is_some_and(|(expected_type, _)| !json_value_fits(value, expected_type)),
+        })
+}
+
+/// Resolves the whole-input schema decision shared by both formats: the
+/// transform against the observed shape, override names, and — under a pin —
+/// conflicts, shape drift, and declared-type re-declarations, in exactly the
+/// whole-input order, then plans every field's materialized type from the
+/// whole-input observations. `all_types` spans the observed source shape
+/// plus the flatten columns and feeds only failure messages; added fields
+/// and inference take their types from `survivor_types`, so a rejected
+/// record's values never shape the destination.
+fn resolve_plan(
+    directive: &SchemaDirective,
+    field_names: &[String],
+    all_types: &[InferredType],
+    survivor_types: &[InferredType],
+) -> Result<Resolution, ExecutionFailure> {
+    stamped_resolution(directive, || {
+        let columns = resolve_transform(directive, field_names)?;
+        check_override_names(directive, &columns)?;
+        match directive {
+            SchemaDirective::Inferred { overrides, .. } => Ok(inferred_resolution(
+                &columns,
+                survivor_types,
+                None,
+                overrides,
+            )),
+            SchemaDirective::PinInferred {
+                pinned_path,
+                overrides,
+                ..
+            } => Ok(inferred_resolution(
+                &columns,
+                survivor_types,
+                Some(pinned_path),
+                overrides,
+            )),
+            SchemaDirective::Pinned {
+                pinned_path,
+                pin,
+                drift_policy,
+                overrides,
+                ..
+            } => {
+                check_override_conflicts(pinned_path, pin, overrides)?;
+                let ShapeMatch { matched, added } =
+                    match_shape(pinned_path, pin, drift_policy, &columns)?;
+                check_declared_type_overrides(pinned_path, pin, &matched, overrides, || {
+                    all_types.to_vec()
+                })?;
+                let mut checks = pinned_checks(&matched);
+                checks.extend(override_checks(overrides, added.iter()));
+                // Added fields take their types from the surviving records
+                // only, so a rejected record's values never shape the
+                // destination.
+                let added = planned_added_fields(added, survivor_types, overrides);
+                let plan = assemble_pinned_plan(pinned_path, matched, added);
+                Ok(Resolution {
+                    checks,
+                    plan: ChunkPlan::new(plan.fields),
+                    decision: plan.decision,
+                    pinned_schema_write: plan.pinned_schema_write,
+                })
+            }
+        }
+    })
+}
+
+/// Assembles the resolution of an inference-driven or pin-bootstrapping load:
+/// overridden fields validate per record like pinned fields (ADR-0038), and
+/// the surviving records alone shape every property no override sets.
+fn inferred_resolution(
+    columns: &[DatasetColumn],
+    survivor_types: &[InferredType],
+    pinned_path: Option<&str>,
+    overrides: &SchemaOverrides,
+) -> Resolution {
+    let checks = override_checks(overrides, columns.iter());
+    let plan = inferred_plan(columns, survivor_types, pinned_path, overrides);
+    Resolution {
+        checks,
+        plan: ChunkPlan::new(plan.fields),
+        decision: plan.decision,
+        pinned_schema_write: plan.pinned_schema_write,
+    }
+}
+
+/// Adds the directive echoes to whichever schema decision a resolution
 /// produced — the one place every decision passes through, so success and
 /// failure decisions alike carry the configured transform and overrides.
-fn stamped(
+fn stamped_resolution(
     directive: &SchemaDirective,
-    result: Result<Materialized, ExecutionFailure>,
-) -> Result<Materialized, ExecutionFailure> {
-    match result {
-        Ok(mut materialized) => {
-            materialized.schema_decision = directive.stamp(materialized.schema_decision);
-            Ok(materialized)
+    resolve: impl FnOnce() -> Result<Resolution, ExecutionFailure>,
+) -> Result<Resolution, ExecutionFailure> {
+    match resolve() {
+        Ok(mut resolution) => {
+            resolution.decision = directive.stamp(resolution.decision);
+            Ok(resolution)
         }
         Err(mut failure) => {
             if let Some(decision) = failure.schema_decision.take() {
                 failure.schema_decision = Some(Box::new(directive.stamp(*decision)));
             }
             Err(failure)
-        }
-    }
-}
-
-fn text_materialization(
-    directive: &SchemaDirective,
-    field_names: Vec<String>,
-    records: Vec<TextRecord>,
-) -> Result<Materialized, ExecutionFailure> {
-    let columns = resolve_transform(directive, &field_names)?;
-    check_override_names(directive, &columns)?;
-    match directive {
-        SchemaDirective::Inferred { overrides, .. } => {
-            inferred_text(&columns, &field_names, records, None, overrides)
-        }
-        SchemaDirective::PinInferred {
-            pinned_path,
-            overrides,
-            ..
-        } => inferred_text(
-            &columns,
-            &field_names,
-            records,
-            Some(pinned_path),
-            overrides,
-        ),
-        SchemaDirective::Pinned {
-            pinned_path,
-            pin,
-            drift_policy,
-            overrides,
-            ..
-        } => {
-            check_override_conflicts(pinned_path, pin, overrides)?;
-            let ShapeMatch { matched, added } =
-                match_shape(pinned_path, pin, drift_policy, &columns)?;
-            check_declared_type_overrides(pinned_path, pin, &matched, overrides, || {
-                observe_text_types(field_names.len(), &records)
-            })?;
-            let mut checks = pinned_checks(&matched);
-            checks.extend(override_checks(overrides, added.iter()));
-            let (survivors, rejected) = partition_text(records, &checks, &field_names);
-            // Added fields take their types from the surviving records only,
-            // so a rejected record's values never shape the destination.
-            let survivor_types = observe_text_types(field_names.len(), &survivors);
-            let added = planned_added_fields(added, &survivor_types, overrides);
-            let plan = assemble_pinned_plan(pinned_path, matched, added);
-            build_text(plan, &survivors, rejected)
-        }
-    }
-}
-
-fn json_materialization(
-    directive: &SchemaDirective,
-    field_names: Vec<String>,
-    records: Vec<JsonRecord>,
-) -> Result<Materialized, ExecutionFailure> {
-    let columns = resolve_transform(directive, &field_names)?;
-    check_override_names(directive, &columns)?;
-    match directive {
-        SchemaDirective::Inferred { overrides, .. } => {
-            inferred_json(&columns, &field_names, records, None, overrides)
-        }
-        SchemaDirective::PinInferred {
-            pinned_path,
-            overrides,
-            ..
-        } => inferred_json(
-            &columns,
-            &field_names,
-            records,
-            Some(pinned_path),
-            overrides,
-        ),
-        SchemaDirective::Pinned {
-            pinned_path,
-            pin,
-            drift_policy,
-            overrides,
-            ..
-        } => {
-            check_override_conflicts(pinned_path, pin, overrides)?;
-            let ShapeMatch { matched, added } =
-                match_shape(pinned_path, pin, drift_policy, &columns)?;
-            check_declared_type_overrides(pinned_path, pin, &matched, overrides, || {
-                observe_json_types(&field_names, &columns, &records)
-            })?;
-            let mut checks = pinned_checks(&matched);
-            checks.extend(override_checks(overrides, added.iter()));
-            let (survivors, rejected) = partition_json(records, &checks);
-            let survivor_types = observe_json_types(&field_names, &columns, &survivors);
-            let added = planned_added_fields(added, &survivor_types, overrides);
-            let plan = assemble_pinned_plan(pinned_path, matched, added);
-            build_json(plan, &survivors, rejected)
         }
     }
 }
@@ -1160,12 +1419,6 @@ impl SourceAddress {
         }
     }
 
-    /// Whether this address walks a flatten path rather than reading a
-    /// top-level field.
-    fn is_path(&self) -> bool {
-        matches!(self, SourceAddress::Path(_))
-    }
-
     /// Reads the addressed value from a JSONL record: a top-level lookup, or
     /// the total path walk of ADR-0041 — `None` (an Arrow null downstream)
     /// for a missing key or a null or non-object value anywhere before the
@@ -1174,15 +1427,22 @@ impl SourceAddress {
     fn json_value<'a>(&self, object: &'a serde_json::Map<String, Value>) -> Option<&'a Value> {
         match self {
             SourceAddress::Field(name) => object.get(name),
-            SourceAddress::Path(segments) => {
-                let mut value = object.get(&segments[0])?;
-                for segment in &segments[1..] {
-                    value = value.as_object()?.get(segment)?;
-                }
-                Some(value)
-            }
+            SourceAddress::Path(segments) => json_path_value(segments, object),
         }
     }
+}
+
+/// The total flatten-path walk of ADR-0041 over a record's object, shared by
+/// the path-addressed [`SourceAddress`] and the streaming flatten observation.
+fn json_path_value<'a>(
+    segments: &[String],
+    object: &'a serde_json::Map<String, Value>,
+) -> Option<&'a Value> {
+    let mut value = object.get(&segments[0])?;
+    for segment in &segments[1..] {
+        value = value.as_object()?.get(segment)?;
+    }
+    Some(value)
 }
 
 /// Resolves the directive's structural transform against the observed source
@@ -1369,42 +1629,6 @@ fn configured_posture_decision(directive: &SchemaDirective) -> Value {
     }
 }
 
-/// Materializes an inference-driven or pin-bootstrapping CSV load: overridden
-/// fields validate per record like pinned fields (ADR-0038), and the
-/// surviving records alone shape every property no override sets, so a
-/// rejected record's values never shape the destination. `field_names` stays
-/// the observed source shape — record width and rejection content — while
-/// `columns` is the dataset view the load materializes.
-fn inferred_text(
-    columns: &[DatasetColumn],
-    field_names: &[String],
-    records: Vec<TextRecord>,
-    pinned_path: Option<&str>,
-    overrides: &SchemaOverrides,
-) -> Result<Materialized, ExecutionFailure> {
-    let checks = override_checks(overrides, columns.iter());
-    let (survivors, rejected) = partition_text(records, &checks, field_names);
-    let survivor_types = observe_text_types(field_names.len(), &survivors);
-    let plan = inferred_plan(columns, &survivor_types, pinned_path, overrides);
-    build_text(plan, &survivors, rejected)
-}
-
-/// Materializes an inference-driven or pin-bootstrapping JSONL load; see
-/// [`inferred_text`].
-fn inferred_json(
-    columns: &[DatasetColumn],
-    field_names: &[String],
-    records: Vec<JsonRecord>,
-    pinned_path: Option<&str>,
-    overrides: &SchemaOverrides,
-) -> Result<Materialized, ExecutionFailure> {
-    let checks = override_checks(overrides, columns.iter());
-    let (survivors, rejected) = partition_json(records, &checks);
-    let survivor_types = observe_json_types(field_names, columns, &survivors);
-    let plan = inferred_plan(columns, &survivor_types, pinned_path, overrides);
-    build_json(plan, &survivors, rejected)
-}
-
 /// Fails the load with `unknown_override_field` when an override names a
 /// field absent from the dataset shape — the CSV header, or the union of the
 /// JSONL batch's record keys, where a batch-wide-absent field is absent
@@ -1516,7 +1740,8 @@ fn pre_materialization_failure(failure: LoadFailure, decision: Value) -> Executi
         schema_decision: Some(Box::new(decision)),
         source_rows: None,
         written_records: 0,
-        rejected: Vec::new(),
+        rejected_count: 0,
+        committed_execution: None,
         destination_write: Box::new(DestinationWriteFacts::not_applicable()),
     }
 }
@@ -1687,11 +1912,13 @@ fn match_shape(
 
 /// One per-record value check (ADR-0035, ADR-0038): the dataset field it
 /// guards, the source address it reads ([`SourceAddress`]; CSV cells read by
-/// observed column index), the type its values must widen to — if any —
-/// with the wording its rejections carry, and whether a null value rejects
-/// the record. Pinned fields check everything the pin declares; overridden
-/// fields check exactly the properties their override sets.
-struct FieldCheck {
+/// observed column index, meaningless for JSONL checks), the type its values
+/// must widen to — if any — with the wording its rejections carry, and
+/// whether a null value rejects the record. Pinned fields check everything
+/// the pin declares; overridden fields check exactly the properties their
+/// override sets. Check outcomes are a pure function of (record, checks), so
+/// the two source passes of ADR-0045 agree on them.
+pub(crate) struct FieldCheck {
     name: String,
     source: SourceAddress,
     observed_index: usize,
@@ -1771,47 +1998,12 @@ fn override_checks<'a>(
         .collect()
 }
 
-/// Splits CSV records into the survivors and the records the checks rejected
-/// (ADR-0035).
-fn partition_text(
-    records: Vec<TextRecord>,
-    checks: &[FieldCheck],
-    field_names: &[String],
-) -> (Vec<TextRecord>, Vec<RejectedRecord>) {
-    let mut survivors = Vec::with_capacity(records.len());
-    let mut rejected = Vec::new();
-    for record in records {
-        match validate_text_record(&record, checks, field_names) {
-            Some(rejection) => rejected.push(rejection),
-            None => survivors.push(record),
-        }
-    }
-    (survivors, rejected)
-}
-
-/// Splits JSONL records into the survivors and the records the checks
-/// rejected (ADR-0035).
-fn partition_json(
-    records: Vec<JsonRecord>,
-    checks: &[FieldCheck],
-) -> (Vec<JsonRecord>, Vec<RejectedRecord>) {
-    let mut survivors = Vec::with_capacity(records.len());
-    let mut rejected = Vec::new();
-    for record in records {
-        match validate_json_record(&record, checks) {
-            Some(rejection) => rejected.push(rejection),
-            None => survivors.push(record),
-        }
-    }
-    (survivors, rejected)
-}
-
 /// Validates one CSV record against the field checks, in check order: the
 /// first null cell in a required field or the first cell whose observed type
 /// does not widen to its expected type rejects the record (ADR-0035). The
 /// rejection names the dataset field while `record` keeps the original
 /// source content under source names (ADR-0039).
-fn validate_text_record(
+pub(crate) fn validate_text_record(
     record: &TextRecord,
     checks: &[FieldCheck],
     field_names: &[String],
@@ -2359,125 +2551,77 @@ fn pin_yaml(fields: &[PlannedField]) -> String {
     .to_yaml()
 }
 
-/// Builds the planned columns over the surviving CSV records and assembles
-/// the batch.
-fn build_text(
-    plan: FieldPlan,
-    records: &[TextRecord],
-    rejected: Vec<RejectedRecord>,
-) -> Result<Materialized, ExecutionFailure> {
-    let columns = plan
-        .fields
-        .iter()
-        .map(|planned| build_text_array(planned.materialized_type, records, planned.observed_index))
-        .collect::<Result<Vec<_>, _>>()?;
-    materialize(plan, columns, rejected)
+/// The fixed materialization plan pass 2 builds chunks against (ADR-0045):
+/// the planned fields in output order and the Arrow schema they spell. The
+/// batch schema and the reported `schema_decision` derive from the same
+/// resolution, so the report can never disagree with the chunks that were
+/// written, and every chunk of a load carries the identical schema.
+pub(crate) struct ChunkPlan {
+    fields: Vec<PlannedField>,
+    schema: Arc<Schema>,
 }
 
-/// Builds the planned columns over the surviving JSONL records — read
-/// through their source addresses — and assembles the batch.
-fn build_json(
-    plan: FieldPlan,
-    records: &[JsonRecord],
-    rejected: Vec<RejectedRecord>,
-) -> Result<Materialized, ExecutionFailure> {
-    let columns = plan
-        .fields
-        .iter()
-        .enumerate()
-        .map(|(column_index, planned)| {
-            build_json_array(
-                planned.materialized_type,
-                records,
-                &planned.source,
-                column_index,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    materialize(plan, columns, rejected)
-}
+impl ChunkPlan {
+    fn new(fields: Vec<PlannedField>) -> Self {
+        let schema = Arc::new(Schema::new(
+            fields
+                .iter()
+                .map(|planned| {
+                    Field::new(
+                        &planned.name,
+                        planned.materialized_type.data_type(),
+                        planned.nullable,
+                    )
+                })
+                .collect::<Vec<_>>(),
+        ));
+        ChunkPlan { fields, schema }
+    }
 
-/// Assembles the planned fields and their pre-built columns into a
-/// [`RecordBatch`]. The batch schema and the reported `schema_decision` derive
-/// from the same plan, so the report can never disagree with the batch that was
-/// written.
-fn materialize(
-    plan: FieldPlan,
-    columns: Vec<ArrayRef>,
-    rejected: Vec<RejectedRecord>,
-) -> Result<Materialized, ExecutionFailure> {
-    let schema = Arc::new(Schema::new(
-        plan.fields
+    /// Builds one chunk over surviving CSV records. An empty record run
+    /// builds the zero-row batch that materializes the schema alone.
+    pub(crate) fn build_text_chunk(
+        &self,
+        records: &[TextRecord],
+    ) -> Result<RecordBatch, LoadFailure> {
+        let columns = self
+            .fields
             .iter()
             .map(|planned| {
-                Field::new(
-                    &planned.name,
-                    planned.materialized_type.data_type(),
-                    planned.nullable,
+                build_text_array(planned.materialized_type, records, planned.observed_index)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.assemble(columns)
+    }
+
+    /// Builds one chunk over surviving JSONL records, read through their
+    /// source addresses.
+    pub(crate) fn build_json_chunk(
+        &self,
+        records: &[JsonRecord],
+    ) -> Result<RecordBatch, LoadFailure> {
+        let columns = self
+            .fields
+            .iter()
+            .enumerate()
+            .map(|(column_index, planned)| {
+                build_json_array(
+                    planned.materialized_type,
+                    records,
+                    &planned.source,
+                    column_index,
                 )
             })
-            .collect::<Vec<_>>(),
-    ));
-    let batch = RecordBatch::try_new(schema, columns).map_err(|error| LoadFailure {
-        code: "record_batch_creation_failed",
-        message: format!("failed to create Arrow record batch: {error}"),
-    })?;
-
-    Ok(Materialized {
-        batch,
-        schema_decision: plan.decision,
-        pinned_schema_write: plan.pinned_schema_write,
-        rejected,
-    })
-}
-
-fn observe_text_types(field_count: usize, records: &[TextRecord]) -> Vec<InferredType> {
-    let mut observed_types = vec![InferredType::Null; field_count];
-    for record in records {
-        for (column_index, value) in record.cells.iter().enumerate() {
-            if let Some(value) = value {
-                observed_types[column_index] =
-                    observed_types[column_index].merge(infer_text_type(value));
-            }
-        }
+            .collect::<Result<Vec<_>, _>>()?;
+        self.assemble(columns)
     }
-    observed_types
-}
 
-/// Observes the type of every source column of a JSONL batch: the observed
-/// top-level fields by name, then each flatten column by walking its source
-/// path (ADR-0041) into the virtual observed-type slot past the observed
-/// fields. A path that yields no value in any record leaves its slot `Null`,
-/// widening to text exactly like an all-absent field.
-fn observe_json_types(
-    field_names: &[String],
-    columns: &[DatasetColumn],
-    records: &[JsonRecord],
-) -> Vec<InferredType> {
-    let flatten_count = columns
-        .iter()
-        .filter(|column| column.source.is_path())
-        .count();
-    let mut observed_types = vec![InferredType::Null; field_names.len() + flatten_count];
-    for record in records {
-        for (column_index, field_name) in field_names.iter().enumerate() {
-            if let Some(value) = record.object.get(field_name) {
-                observed_types[column_index] =
-                    observed_types[column_index].merge(infer_json_type(value));
-            }
-        }
+    fn assemble(&self, columns: Vec<ArrayRef>) -> Result<RecordBatch, LoadFailure> {
+        RecordBatch::try_new(self.schema.clone(), columns).map_err(|error| LoadFailure {
+            code: "record_batch_creation_failed",
+            message: format!("failed to create Arrow record batch: {error}"),
+        })
     }
-    for column in columns {
-        if column.source.is_path() {
-            for record in records {
-                if let Some(value) = column.source.json_value(&record.object) {
-                    observed_types[column.observed_index] =
-                        observed_types[column.observed_index].merge(infer_json_type(value));
-                }
-            }
-        }
-    }
-    observed_types
 }
 
 fn build_text_array(
@@ -3037,6 +3181,67 @@ fn rescale_decimal_integer(value: i128, precision: u8, scale: u8) -> Option<i128
 fn bounded_decimal(scaled: i128, precision: u8) -> Option<i128> {
     let bound = 10_i128.pow(u32::from(precision));
     (-bound < scaled && scaled < bound).then_some(scaled)
+}
+
+/// Materializes a whole CSV input in one call — the streaming observer, the
+/// resolution, and one chunk over every survivor — as the test-only
+/// equivalence harness for the pass-based machinery: the observed behavior
+/// of this wrapper is the pre-chunking whole-input contract.
+#[cfg(test)]
+pub(crate) fn from_text_columns(
+    directive: &SchemaDirective,
+    field_names: Vec<String>,
+    records: Vec<TextRecord>,
+) -> Result<Materialized, ExecutionFailure> {
+    let mut observer = TextObserver::new(directive, &field_names);
+    let mut survivors = Vec::new();
+    let mut rejected = Vec::new();
+    for record in records {
+        match observer.observe(&record) {
+            Some(rejection) => rejected.push(rejection),
+            None => survivors.push(record),
+        }
+    }
+    let resolution = observer.finish()?;
+    let batch = resolution.plan.build_text_chunk(&survivors)?;
+    Ok(Materialized {
+        batch,
+        schema_decision: resolution.decision,
+        pinned_schema_write: resolution.pinned_schema_write,
+        rejected,
+    })
+}
+
+/// Materializes a whole JSONL input in one call; see [`from_text_columns`].
+/// Rejections spill as records during observation and render against the
+/// resolved checks, exactly like the streaming artifact path.
+#[cfg(test)]
+pub(crate) fn from_json_columns(
+    directive: &SchemaDirective,
+    field_names: Vec<String>,
+    records: Vec<JsonRecord>,
+) -> Result<Materialized, ExecutionFailure> {
+    let mut observer = JsonObserver::new(directive);
+    let mut survivors = Vec::new();
+    let mut spilled = Vec::new();
+    for record in records {
+        match observer.observe(&record) {
+            JsonOutcome::Rejected => spilled.push(record),
+            JsonOutcome::Survived => survivors.push(record),
+        }
+    }
+    let resolution = observer.finish(&field_names)?;
+    let rejected = spilled
+        .iter()
+        .filter_map(|record| resolution.rejection_for(record))
+        .collect();
+    let batch = resolution.plan.build_json_chunk(&survivors)?;
+    Ok(Materialized {
+        batch,
+        schema_decision: resolution.decision,
+        pinned_schema_write: resolution.pinned_schema_write,
+        rejected,
+    })
 }
 
 #[cfg(test)]
@@ -4357,7 +4562,7 @@ mod tests {
             "schema drift against pinned schema customers.schema.yml: \
              missing fields: name; added fields: nickname"
         );
-        assert!(error.rejected.is_empty());
+        assert_eq!(error.rejected_count, 0);
         assert_eq!(
             *error
                 .schema_decision
@@ -5200,7 +5405,7 @@ mod tests {
             error.failure.message,
             "schema overrides name fields absent from the observed source shape: vip"
         );
-        assert!(error.rejected.is_empty());
+        assert_eq!(error.rejected_count, 0);
         assert_eq!(
             *error.schema_decision.expect("decision echoes the posture"),
             json!({
@@ -5553,7 +5758,7 @@ mod tests {
             error.failure.message,
             "transform selects, renames, or flattens fields absent from the observed source shape: vip"
         );
-        assert!(error.rejected.is_empty());
+        assert_eq!(error.rejected_count, 0);
         assert_eq!(
             *error.schema_decision.expect("decision echoes the posture"),
             json!({
