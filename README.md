@@ -54,10 +54,12 @@ chmod +x data-spark-linux-x86_64
 ./data-spark-linux-x86_64 --help
 ```
 
-Optionally install it onto your `PATH` (the quickstart below assumes this):
+Optionally install it into a directory on your `PATH` (the quickstart below
+invokes `data-spark` directly). `~/.local/bin` is a common choice — `install
+-D` creates it if needed, but confirm the directory is on your `PATH`:
 
 ```bash
-install -m 0755 data-spark-linux-x86_64 ~/.local/bin/data-spark
+install -D -m 0755 data-spark-linux-x86_64 ~/.local/bin/data-spark
 ```
 
 ## Quickstart: your first load
