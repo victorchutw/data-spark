@@ -11,7 +11,8 @@ recognizes for a dual grant — and `Cargo.toml` declares the grant as the SPDX
 expression `license = "MIT OR Apache-2.0"` alongside the `description` and
 `repository` fields that describe the package to cargo tooling. Until now the
 repository had no license file at all, so the source and the release binaries
-published since v0.1.0 were all-rights-reserved by default; an explicit grant
+published since the first tagged release were all-rights-reserved by default;
+an explicit grant
 is what makes using, copying, and redistributing them legal for anyone other
 than the maintainer.
 
