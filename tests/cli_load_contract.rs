@@ -8029,9 +8029,19 @@ fn an_in_session_append_mismatch_carries_the_retry_object_with_zero_attempts() {
     let report = &load.report;
 
     assert_eq!(report["error_summary"]["code"], "destination_write_failed");
-    assert_eq!(report["execution"]["record_format"], "arrow_record_batch");
-    assert_eq!(report["execution"]["batch_count"], 0);
-    assert_eq!(report["execution"]["retry"], default_retry_echo());
+    assert_eq!(
+        report["execution"],
+        serde_json::json!({
+            "record_format": "arrow_record_batch",
+            "batch_count": 0,
+            "chunk_rows": 65536,
+            "parallelism": 1,
+            "connector_parallelism_limit": 1,
+            "retry": default_retry_echo()
+        }),
+        "the in-session posture carries the full execution echo, \
+         parallelism facts included (ADR-0053)"
+    );
 }
 
 #[test]
@@ -8075,6 +8085,175 @@ fn a_failed_begin_keeps_the_exact_not_started_posture_without_a_retry_object() {
         })
     );
     assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+}
+
+#[test]
+fn configured_parallelism_clamps_to_the_serial_connector_limit_across_the_matrix() {
+    // Both shipped destinations declare a Connector Parallelism Limit of 1
+    // for every mode (ADR-0051), so any configured `parallelism` yields
+    // effective parallelism 1 — the min of the two (ADR-0052) — and the
+    // report echoes both facts (ADR-0053) around otherwise unchanged
+    // execution content, with `report_version` still 1.
+    for (destination_connector, load_mode) in [
+        ("parquet", "full_refresh"),
+        ("parquet", "append"),
+        ("duckdb", "full_refresh"),
+        ("duckdb", "append"),
+    ] {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.csv");
+        fs::write(&source_path, "customer_id,name\n1,Ada\n").expect("write source csv");
+        let destination_path = match destination_connector {
+            "parquet" => work.path().join("customers_dataset"),
+            _ => work.path().join("customers.duckdb"),
+        };
+        // A DuckDB append needs the destination table to exist.
+        if destination_connector == "duckdb" && load_mode == "append" {
+            let connection =
+                duckdb::Connection::open(&destination_path).expect("open DuckDB destination");
+            connection
+                .execute_batch("CREATE TABLE customers (customer_id BIGINT, name VARCHAR)")
+                .expect("seed DuckDB destination");
+        }
+        let definition_path = work.path().join("load.yml");
+        write_retry_definition(
+            &definition_path,
+            &source_path,
+            destination_connector,
+            &destination_path,
+            load_mode,
+            "execution:\n  parallelism: 8\n",
+        );
+
+        let load = run_cli_load(
+            work.path(),
+            &work.path().join("artifacts"),
+            &definition_path,
+            true,
+        );
+        let report = &load.report;
+
+        assert_eq!(
+            report["exit_status"], "succeeded",
+            "{destination_connector}/{load_mode}"
+        );
+        assert_eq!(report["report_version"], 1);
+        assert_eq!(
+            report["execution"],
+            serde_json::json!({
+                "record_format": "arrow_record_batch",
+                "batch_count": 1,
+                "chunk_rows": 65536,
+                "parallelism": 1,
+                "connector_parallelism_limit": 1,
+                "retry": default_retry_echo()
+            }),
+            "{destination_connector}/{load_mode}"
+        );
+    }
+}
+
+#[test]
+fn parallelism_echoes_the_serial_default_and_the_explicit_serial_form_alike() {
+    // Absent — the block or the key — the effective parallelism is the
+    // connector's declared limit (ADR-0052), and `parallelism: 1` is the
+    // explicit serial form: every variant echoes 1/1 in the report.
+    for execution_block in ["", "execution: {}\n", "execution:\n  parallelism: 1\n"] {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.csv");
+        fs::write(&source_path, "customer_id\n1\n").expect("write source csv");
+        let destination_path = work.path().join("customers_dataset");
+        let definition_path = work.path().join("load.yml");
+        write_retry_definition(
+            &definition_path,
+            &source_path,
+            "parquet",
+            &destination_path,
+            "full_refresh",
+            execution_block,
+        );
+
+        let load = run_cli_load(
+            work.path(),
+            &work.path().join("artifacts"),
+            &definition_path,
+            true,
+        );
+
+        assert_eq!(
+            load.report["execution"]["parallelism"], 1,
+            "{execution_block:?}"
+        );
+        assert_eq!(
+            load.report["execution"]["connector_parallelism_limit"], 1,
+            "{execution_block:?}"
+        );
+    }
+}
+
+#[test]
+fn invalid_parallelism_values_fail_before_source_or_destination_work() {
+    // `execution.parallelism` is part of the strict contract (ADR-0052):
+    // zero, negative, and non-integer values fail YAML parsing under the
+    // existing definition failure code — no new failure code exists — and
+    // an unknown key beside a valid `parallelism` is still rejected
+    // recursively (ADR-0037), all before any source read or destination
+    // write.
+    for (execution_block, expected_message_part) in [
+        ("execution:\n  parallelism: 0\n", "expected a nonzero u64"),
+        ("execution:\n  parallelism: -2\n", "expected a nonzero u64"),
+        ("execution:\n  parallelism: 1.5\n", "parallelism"),
+        (
+            "execution:\n  parallelism: 2\n  workers: 4\n",
+            "unknown field `workers`",
+        ),
+    ] {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.csv");
+        fs::write(&source_path, "customer_id\n1\n").expect("write source csv");
+        let destination_path = work.path().join("customers_dataset");
+        let definition_path = work.path().join("load.yml");
+        write_retry_definition(
+            &definition_path,
+            &source_path,
+            "parquet",
+            &destination_path,
+            "full_refresh",
+            execution_block,
+        );
+
+        let load = run_cli_load(
+            work.path(),
+            &work.path().join("artifacts"),
+            &definition_path,
+            false,
+        );
+        let report = &load.report;
+
+        assert_eq!(
+            report["error_summary"]["code"], "invalid_load_definition_yaml",
+            "{execution_block:?}"
+        );
+        let message = report["error_summary"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            message.contains(expected_message_part),
+            "message {message:?} misses {expected_message_part:?}"
+        );
+        assert_eq!(
+            report["execution"],
+            serde_json::json!({
+                "record_format": "not_started",
+                "batch_count": 0
+            }),
+            "an invalid parallelism keeps the exact not_started posture"
+        );
+        assert!(
+            !destination_path.exists(),
+            "an invalid parallelism value must not reach the destination"
+        );
+    }
 }
 
 fn write_load_definition(

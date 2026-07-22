@@ -10,15 +10,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 mod connector;
+mod dispatch;
 mod rejection;
 mod retry;
 mod schema;
 
-use arrow_array::RecordBatch;
 use connector::{
-    destination_connector, resolved_source_format, source_connector, Destination,
-    DestinationWriteFacts, DestinationWriteFailure, LoadMode, SourceRead, Transience,
+    destination_connector, resolved_source_format, source_connector, DestinationWriteFacts,
+    LoadMode, SourceRead,
 };
+use dispatch::WritePhaseFailure;
 
 const LOAD_REPORT_VERSION: u8 = 1;
 const LOAD_REPORT_FILENAME: &str = "load-report.json";
@@ -130,6 +131,8 @@ impl LoadReport {
                 "record_format": "arrow_record_batch",
                 "batch_count": committed.committed_chunks,
                 "chunk_rows": committed.chunk_rows,
+                "parallelism": committed.parallelism,
+                "connector_parallelism_limit": committed.connector_parallelism_limit,
                 "retry": *committed.retry
             }),
         };
@@ -230,8 +233,8 @@ struct LoadDefinition {
     schema: Option<SchemaConfig>,
     artifacts: Option<ArtifactsConfig>,
     /// The execution-behavior settings of the load (ADR-0046): the chunk
-    /// bound and the retry policy (ADR-0049); parallelism settings will
-    /// join them.
+    /// bound, the parallelism window (ADR-0052), and the retry policy
+    /// (ADR-0049).
     execution: Option<ExecutionConfig>,
     /// The number of rejected records this load tolerates before failing.
     /// Defaults to `0`: any rejected record fails the load unless the
@@ -242,16 +245,22 @@ struct LoadDefinition {
 /// The `execution` block of a load definition (ADR-0046): how the load
 /// executes, as opposed to what it moves. `chunk_rows` bounds each
 /// materialized `RecordBatch` chunk to that many surviving records; absent —
-/// the block or the key — it defaults to 65536. Zero, negative, and
-/// non-integer bounds fail YAML parsing (`NonZeroU64`), so every invalid
-/// bound is a definition failure under the existing code and no new
-/// execution failure code exists. Unknown keys are rejected recursively
-/// (ADR-0037). `retry` holds the load's retry policy (ADR-0049);
-/// parallelism settings will join these.
+/// the block or the key — it defaults to 65536. `parallelism` bounds the
+/// load's in-flight window of concurrent chunk writes (ADR-0052): absent,
+/// the effective parallelism is the connector's declared limit for the
+/// load's mode; present, it is `min(configured, limit)`, and `1` is the
+/// explicit serial form. Peak memory scales as parallelism × `chunk_rows`
+/// with no cross-field validation — the product is the user's to own.
+/// Zero, negative, and non-integer values fail YAML parsing
+/// (`NonZeroU64`), so every invalid value is a definition failure under
+/// the existing code and no new execution failure code exists. Unknown
+/// keys are rejected recursively (ADR-0037). `retry` holds the load's
+/// retry policy (ADR-0049).
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ExecutionConfig {
     chunk_rows: Option<std::num::NonZeroU64>,
+    parallelism: Option<std::num::NonZeroU64>,
     retry: Option<RetryConfig>,
 }
 
@@ -375,6 +384,7 @@ impl ReportableFailure {
 /// the write phase (ADR-0047): the chunks the destination had committed —
 /// `0` for a full refresh before its terminal commit, the prefix for
 /// append — and the effective chunk bound the report echoes, joined by the
+/// effective parallelism beside its connector limit (ADR-0053) and the
 /// load's retry story (ADR-0050) — the policy echo plus the attempts array,
 /// always present in this posture even when nothing was retried. Failures
 /// before the write phase carry `None` and keep the `not_started` posture.
@@ -382,6 +392,8 @@ impl ReportableFailure {
 struct CommittedExecution {
     committed_chunks: u64,
     chunk_rows: u64,
+    parallelism: u64,
+    connector_parallelism_limit: u64,
     // Boxed so the failure types carrying this posture stay small enough to
     // return by value.
     retry: Box<Value>,
@@ -415,7 +427,9 @@ struct ExecutionFailure {
     source_rows: Option<u64>,
     written_records: u64,
     rejected_count: u64,
-    committed_execution: Option<CommittedExecution>,
+    // Boxed like the schema decision: the posture carries four counters and
+    // the retry story, too wide to ride the Err variant inline.
+    committed_execution: Option<Box<CommittedExecution>>,
     /// The retry story of a failure that kept the pre-write `not_started`
     /// posture: present exactly when wrapped `begin` attempts were recorded
     /// (ADR-0050's conditional presence rule) — provably never in the
@@ -639,7 +653,9 @@ fn execute_load_definition(
         source_rows: execution_failure.source_rows.unwrap_or(0),
         written_records: execution_failure.written_records,
         rejected_count: execution_failure.rejected_count,
-        committed_execution: execution_failure.committed_execution,
+        committed_execution: execution_failure
+            .committed_execution
+            .map(|committed| *committed),
         retry: execution_failure.retry,
         destination_write: *execution_failure.destination_write,
         code: execution_failure.failure.code,
@@ -697,6 +713,9 @@ fn execute_supported_load(
     )?;
     let chunk_rows = resolve_chunk_rows(definition.execution.as_ref());
     let retry_policy = resolve_retry_policy(definition.execution.as_ref());
+    let connector_parallelism_limit = destination_port.parallelism_limit(mode);
+    let parallelism =
+        resolve_parallelism(definition.execution.as_ref(), connector_parallelism_limit);
 
     let reject_threshold = definition.reject_threshold.unwrap_or(0);
     let SourceRead {
@@ -744,14 +763,15 @@ fn execute_supported_load(
         }
     }
 
-    let mut sleeper = retry::ThreadSleeper;
+    let sleeper = retry::ThreadSleeper;
     let mut retry_attempts = Vec::new();
-    let outcome = match run_write_phase(
+    let outcome = match dispatch::run_write_phase(
         chunks,
         destination_port.as_ref(),
         mode,
+        parallelism,
         &retry_policy,
-        &mut sleeper,
+        &sleeper,
         &mut retry_attempts,
     ) {
         Ok(outcome) => outcome,
@@ -780,11 +800,13 @@ fn execute_supported_load(
                 source_rows: Some(source_rows),
                 written_records: write_failure.written_records,
                 rejected_count,
-                committed_execution: Some(CommittedExecution {
+                committed_execution: Some(Box::new(CommittedExecution {
                     committed_chunks: write_failure.committed_chunks,
                     chunk_rows,
+                    parallelism: parallelism.get(),
+                    connector_parallelism_limit: connector_parallelism_limit.get(),
                     retry: Box::new(retry::report_value(&retry_policy, &retry_attempts)),
-                }),
+                })),
                 retry: None,
                 destination_write: Box::new(write_failure.facts),
             })
@@ -812,6 +834,8 @@ fn execute_supported_load(
             "record_format": "arrow_record_batch",
             "batch_count": outcome.chunk_count,
             "chunk_rows": chunk_rows,
+            "parallelism": parallelism.get(),
+            "connector_parallelism_limit": connector_parallelism_limit.get(),
             "retry": retry::report_value(&retry_policy, &retry_attempts)
         }),
     })
@@ -844,6 +868,24 @@ fn resolve_retry_policy(execution: Option<&ExecutionConfig>) -> retry::RetryPoli
     }
 }
 
+/// Resolves the effective load parallelism from the definition's
+/// `execution.parallelism` and the destination's declared Connector
+/// Parallelism Limit for the load's mode (ADR-0052): absent, the limit —
+/// the conservative connector-specific default of ADR-0023 — and present,
+/// `min(configured, limit)`, so the limit is a hard cap the configuration
+/// can never exceed. Never a failure — every invalid value was already
+/// rejected at YAML parse time.
+fn resolve_parallelism(
+    execution: Option<&ExecutionConfig>,
+    connector_parallelism_limit: std::num::NonZeroU64,
+) -> std::num::NonZeroU64 {
+    execution
+        .and_then(|execution| execution.parallelism)
+        .map_or(connector_parallelism_limit, |configured| {
+            configured.min(connector_parallelism_limit)
+        })
+}
+
 /// An execution failure raised after the read resolved the load but before
 /// the destination session opened — the threshold gate, the pin write, the
 /// session open itself: the schema decision, counts, and already-streamed
@@ -864,89 +906,6 @@ fn resolved_pre_write_failure(
         retry: None,
         destination_write: Box::new(DestinationWriteFacts::not_applicable()),
     }
-}
-
-/// The write-phase outcome of a load whose every chunk committed: the chunk
-/// count the report states as `batch_count`, plus the destination-owned
-/// write result.
-struct WritePhaseOutcome {
-    bytes_written: Option<u64>,
-    facts: DestinationWriteFacts,
-    chunk_count: u64,
-}
-
-/// A write-phase failure, split at the session boundary (ADR-0047): before
-/// the destination session opened no record batch was ever exchanged, so
-/// the load keeps the pre-write report posture; once it opened, failures
-/// report the committed execution posture.
-#[derive(Debug)]
-enum WritePhaseFailure {
-    BeforeSession(DestinationWriteFailure),
-    InSession(DestinationWriteFailure),
-}
-
-/// Streams the source chunks into one destination write session (ADR-0046):
-/// begin, one `write_chunk` per source chunk, then the terminal commit. The
-/// retry engine wraps `begin` and each `write_chunk` — the two retry units
-/// (ADR-0048) — re-attempting transient failures under the policy through
-/// the sleeper, with failed attempts of retried units accumulating onto the
-/// orchestrator-held `retry_attempts` log; the terminal `commit` is never
-/// engine-retried, structurally: committing consumes the writer, so nothing
-/// remains to re-call. A destination failure carries its own
-/// committed-state facts; a source failure mid-stream — the mutation guard,
-/// or a chunk that fails to build — abandons the session and reports the
-/// destination state at abandonment, so append's committed chunk prefix
-/// stays honestly visible (ADR-0047).
-fn run_write_phase(
-    chunks: impl Iterator<Item = Result<RecordBatch, LoadFailure>>,
-    destination: &dyn Destination,
-    mode: LoadMode,
-    retry_policy: &retry::RetryPolicy,
-    sleeper: &mut dyn retry::Sleeper,
-    retry_attempts: &mut Vec<retry::RetryAttempt>,
-) -> Result<WritePhaseOutcome, WritePhaseFailure> {
-    let mut writer = retry::run_unit(
-        retry_policy,
-        retry::RetryUnit::Begin,
-        retry_attempts,
-        sleeper,
-        || destination.begin(mode),
-    )
-    .map_err(WritePhaseFailure::BeforeSession)?;
-    let mut chunk_count = 0_u64;
-    for chunk in chunks {
-        match chunk {
-            Ok(batch) => {
-                retry::run_unit(
-                    retry_policy,
-                    retry::RetryUnit::WriteChunk {
-                        chunk_index: chunk_count,
-                    },
-                    retry_attempts,
-                    sleeper,
-                    || writer.write_chunk(&batch),
-                )
-                .map_err(WritePhaseFailure::InSession)?;
-                chunk_count += 1;
-            }
-            Err(source_failure) => {
-                let abandoned = writer.abandon();
-                return Err(WritePhaseFailure::InSession(DestinationWriteFailure {
-                    failure: source_failure,
-                    facts: abandoned.facts,
-                    written_records: abandoned.written_records,
-                    committed_chunks: abandoned.committed_chunks,
-                    transience: Transience::Terminal,
-                }));
-            }
-        }
-    }
-    let write = writer.commit().map_err(WritePhaseFailure::InSession)?;
-    Ok(WritePhaseOutcome {
-        bytes_written: write.bytes_written,
-        facts: write.facts,
-        chunk_count,
-    })
 }
 
 /// Resolves the definition's `transform` and `schema` blocks into the schema
@@ -1460,7 +1419,8 @@ mod tests {
     fn from_failure_reports_the_committed_write_phase_posture() {
         // A failure after the load entered the write phase reports the
         // chunked execution posture: the committed chunk count, the
-        // effective chunk bound (ADR-0047), and the retry story — the
+        // effective chunk bound (ADR-0047), the effective parallelism
+        // beside its connector limit (ADR-0053), and the retry story — the
         // policy echo with its attempts array, empty when nothing was
         // retried (ADR-0050).
         let retry_story = json!({
@@ -1481,6 +1441,8 @@ mod tests {
             committed_execution: Some(CommittedExecution {
                 committed_chunks: 2,
                 chunk_rows: 1,
+                parallelism: 1,
+                connector_parallelism_limit: 1,
                 retry: Box::new(retry_story.clone()),
             }),
             retry: None,
@@ -1502,6 +1464,8 @@ mod tests {
                 "record_format": "arrow_record_batch",
                 "batch_count": 2,
                 "chunk_rows": 1,
+                "parallelism": 1,
+                "connector_parallelism_limit": 1,
                 "retry": retry_story
             })
         );
@@ -1622,19 +1586,20 @@ mod tests {
         chunks: connector::SourceChunks,
         destination: &dyn connector::Destination,
         mode: LoadMode,
-    ) -> Result<WritePhaseOutcome, WritePhaseFailure> {
-        let mut sleeper = retry::RecordingSleeper::new();
+    ) -> Result<dispatch::WritePhaseOutcome, WritePhaseFailure> {
+        let sleeper = retry::RecordingSleeper::new();
         let mut retry_attempts = Vec::new();
-        let outcome = run_write_phase(
+        let outcome = dispatch::run_write_phase(
             chunks,
             destination,
             mode,
+            std::num::NonZeroU64::MIN,
             &retry::RetryPolicy::default(),
-            &mut sleeper,
+            &sleeper,
             &mut retry_attempts,
         );
         assert!(
-            sleeper.slept_ms.is_empty(),
+            sleeper.slept_ms().is_empty(),
             "no local failure is transient, so the engine never sleeps"
         );
         assert!(
@@ -1767,344 +1732,6 @@ mod tests {
         }
     }
 
-    // ---- Write-phase retry engine (issue #51: ADR-0048, ADR-0049, ADR-0050) ----
-
-    use crate::connector::{AbandonedWrite, DestinationWrite, DestinationWriter};
-    use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
-    use std::rc::Rc;
-
-    fn int64_batch(values: &[i64]) -> RecordBatch {
-        let field = arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false);
-        let schema = std::sync::Arc::new(arrow_schema::Schema::new(vec![field]));
-        RecordBatch::try_new(
-            schema,
-            vec![std::sync::Arc::new(arrow_array::Int64Array::from(
-                values.to_vec(),
-            ))],
-        )
-        .expect("test batch")
-    }
-
-    fn batch_values(batch: &RecordBatch) -> Vec<i64> {
-        batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow_array::Int64Array>()
-            .expect("int64 column")
-            .values()
-            .to_vec()
-    }
-
-    fn chunk_stream(chunks: &[&[i64]]) -> connector::SourceChunks {
-        let batches: Vec<Result<RecordBatch, LoadFailure>> = chunks
-            .iter()
-            .map(|values| Ok(int64_batch(values)))
-            .collect();
-        Box::new(batches.into_iter())
-    }
-
-    enum ScriptedWriteOutcome {
-        Succeed,
-        Fail {
-            message: &'static str,
-            transience: Transience,
-        },
-    }
-
-    fn scripted_transient(message: &'static str) -> ScriptedWriteOutcome {
-        ScriptedWriteOutcome::Fail {
-            message,
-            transience: Transience::Transient,
-        }
-    }
-
-    /// The scripted in-crate destination of the write-phase retry tests
-    /// (ADR-0048): models per-chunk commits like an append session, scripts
-    /// each `begin` and `write_chunk` call's outcome in call order — an
-    /// exhausted script succeeds — and observes every write invocation, so
-    /// tests prove the engine re-submits the same chunk batch and the
-    /// committed prefix stays honest. Transient failures are constructed
-    /// here and nowhere else: no shipped connector classifies any failure
-    /// transient.
-    struct ScriptedDestination {
-        begin_outcomes: RefCell<VecDeque<ScriptedWriteOutcome>>,
-        write_outcomes: Rc<RefCell<VecDeque<ScriptedWriteOutcome>>>,
-        begin_calls: Cell<u64>,
-        observed_writes: Rc<RefCell<Vec<Vec<i64>>>>,
-    }
-
-    impl ScriptedDestination {
-        fn new(
-            begin_outcomes: Vec<ScriptedWriteOutcome>,
-            write_outcomes: Vec<ScriptedWriteOutcome>,
-        ) -> Self {
-            ScriptedDestination {
-                begin_outcomes: RefCell::new(begin_outcomes.into()),
-                write_outcomes: Rc::new(RefCell::new(write_outcomes.into())),
-                begin_calls: Cell::new(0),
-                observed_writes: Rc::new(RefCell::new(Vec::new())),
-            }
-        }
-
-        fn observed_writes(&self) -> Vec<Vec<i64>> {
-            self.observed_writes.borrow().clone()
-        }
-    }
-
-    impl connector::Destination for ScriptedDestination {
-        fn supported_load_modes(&self) -> &'static [LoadMode] {
-            &[LoadMode::Append]
-        }
-
-        fn begin(
-            &self,
-            _mode: LoadMode,
-        ) -> Result<Box<dyn DestinationWriter>, DestinationWriteFailure> {
-            self.begin_calls.set(self.begin_calls.get() + 1);
-            match self.begin_outcomes.borrow_mut().pop_front() {
-                None | Some(ScriptedWriteOutcome::Succeed) => Ok(Box::new(ScriptedWriter {
-                    write_outcomes: Rc::clone(&self.write_outcomes),
-                    observed_writes: Rc::clone(&self.observed_writes),
-                    committed_chunks: 0,
-                    written_records: 0,
-                })),
-                Some(ScriptedWriteOutcome::Fail {
-                    message,
-                    transience,
-                }) => Err(DestinationWriteFailure {
-                    failure: LoadFailure {
-                        code: "destination_write_failed",
-                        message: message.to_string(),
-                    },
-                    facts: DestinationWriteFacts::not_applicable(),
-                    written_records: 0,
-                    committed_chunks: 0,
-                    transience,
-                }),
-            }
-        }
-    }
-
-    struct ScriptedWriter {
-        write_outcomes: Rc<RefCell<VecDeque<ScriptedWriteOutcome>>>,
-        observed_writes: Rc<RefCell<Vec<Vec<i64>>>>,
-        committed_chunks: u64,
-        written_records: u64,
-    }
-
-    impl DestinationWriter for ScriptedWriter {
-        fn write_chunk(&mut self, batch: &RecordBatch) -> Result<(), DestinationWriteFailure> {
-            self.observed_writes.borrow_mut().push(batch_values(batch));
-            match self.write_outcomes.borrow_mut().pop_front() {
-                None | Some(ScriptedWriteOutcome::Succeed) => {
-                    self.committed_chunks += 1;
-                    self.written_records += batch.num_rows() as u64;
-                    Ok(())
-                }
-                Some(ScriptedWriteOutcome::Fail {
-                    message,
-                    transience,
-                }) => Err(DestinationWriteFailure {
-                    failure: LoadFailure {
-                        code: "destination_write_failed",
-                        message: message.to_string(),
-                    },
-                    facts: DestinationWriteFacts::best_effort("scripted_append"),
-                    written_records: self.written_records,
-                    committed_chunks: self.committed_chunks,
-                    transience,
-                }),
-            }
-        }
-
-        fn commit(self: Box<Self>) -> Result<DestinationWrite, DestinationWriteFailure> {
-            Ok(DestinationWrite {
-                bytes_written: None,
-                facts: DestinationWriteFacts::best_effort("scripted_append"),
-            })
-        }
-
-        fn abandon(self: Box<Self>) -> AbandonedWrite {
-            AbandonedWrite {
-                committed_chunks: self.committed_chunks,
-                written_records: self.written_records,
-                facts: DestinationWriteFacts::best_effort("scripted_append"),
-            }
-        }
-    }
-
-    #[test]
-    fn a_transient_write_chunk_failure_resubmits_the_same_chunk_batch() {
-        // Chunk 0 fails transiently once: the engine re-invokes write_chunk
-        // with the identical batch — the retry unit's same-input rule
-        // (ADR-0048) — and the load completes with one recorded attempt.
-        let destination =
-            ScriptedDestination::new(Vec::new(), vec![scripted_transient("first chunk shortage")]);
-        let mut sleeper = retry::RecordingSleeper::new();
-        let mut retry_attempts = Vec::new();
-
-        let outcome = run_write_phase(
-            chunk_stream(&[&[1, 2], &[3, 4]]),
-            &destination,
-            LoadMode::Append,
-            &retry::RetryPolicy::default(),
-            &mut sleeper,
-            &mut retry_attempts,
-        )
-        .expect("the retried chunk commits");
-
-        assert_eq!(outcome.chunk_count, 2);
-        assert_eq!(
-            destination.observed_writes(),
-            vec![vec![1, 2], vec![1, 2], vec![3, 4]],
-            "the failed chunk is re-submitted with the same records"
-        );
-        assert_eq!(sleeper.slept_ms, vec![200]);
-        let entries: Vec<Value> = retry_attempts
-            .iter()
-            .map(retry::RetryAttempt::report_value)
-            .collect();
-        assert_eq!(
-            entries,
-            vec![json!({
-                "operation": "write_chunk",
-                "chunk_index": 0,
-                "attempt": 1,
-                "error": {
-                    "code": "destination_write_failed",
-                    "message": "first chunk shortage"
-                },
-                "delay_before_retry_ms": 200
-            })]
-        );
-    }
-
-    #[test]
-    fn a_transient_begin_failure_reopens_the_session() {
-        // begin is its own retry unit: a transient session-open failure is
-        // re-attempted, and the chunks stream into the second session.
-        let destination =
-            ScriptedDestination::new(vec![scripted_transient("connection shortage")], Vec::new());
-        let mut sleeper = retry::RecordingSleeper::new();
-        let mut retry_attempts = Vec::new();
-
-        let outcome = run_write_phase(
-            chunk_stream(&[&[1]]),
-            &destination,
-            LoadMode::Append,
-            &retry::RetryPolicy::default(),
-            &mut sleeper,
-            &mut retry_attempts,
-        )
-        .expect("the retried begin opens the session");
-
-        assert_eq!(destination.begin_calls.get(), 2);
-        assert_eq!(outcome.chunk_count, 1);
-        assert_eq!(destination.observed_writes(), vec![vec![1]]);
-        assert_eq!(sleeper.slept_ms, vec![200]);
-        let entries: Vec<Value> = retry_attempts
-            .iter()
-            .map(retry::RetryAttempt::report_value)
-            .collect();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0]["operation"], "begin");
-        assert!(entries[0].get("chunk_index").is_none());
-    }
-
-    #[test]
-    fn an_exhausted_chunk_unit_keeps_the_committed_prefix_and_the_full_history() {
-        // Chunk 0 commits; chunk 1 exhausts its three-attempt budget. The
-        // in-session failure carries the honest committed prefix and the
-        // last failure unchanged, and the log holds every failed attempt of
-        // the exhausted unit (ADR-0050).
-        let destination = ScriptedDestination::new(
-            Vec::new(),
-            vec![
-                ScriptedWriteOutcome::Succeed,
-                scripted_transient("first shortage"),
-                scripted_transient("second shortage"),
-                scripted_transient("third shortage"),
-            ],
-        );
-        let mut sleeper = retry::RecordingSleeper::new();
-        let mut retry_attempts = Vec::new();
-
-        let Err(WritePhaseFailure::InSession(failure)) = run_write_phase(
-            chunk_stream(&[&[1], &[2], &[3]]),
-            &destination,
-            LoadMode::Append,
-            &retry::RetryPolicy::default(),
-            &mut sleeper,
-            &mut retry_attempts,
-        ) else {
-            panic!("an exhausted chunk unit fails in session")
-        };
-
-        assert_eq!(failure.failure.code, "destination_write_failed");
-        assert_eq!(failure.failure.message, "third shortage");
-        assert_eq!(failure.committed_chunks, 1);
-        assert_eq!(failure.written_records, 1);
-        assert_eq!(
-            destination.observed_writes(),
-            vec![vec![1], vec![2], vec![2], vec![2]],
-            "every re-attempt of the exhausted unit re-submitted the same batch"
-        );
-        assert_eq!(sleeper.slept_ms, vec![200, 400]);
-        let entries: Vec<Value> = retry_attempts
-            .iter()
-            .map(retry::RetryAttempt::report_value)
-            .collect();
-        assert_eq!(entries.len(), 3);
-        for (index, entry) in entries.iter().enumerate() {
-            assert_eq!(entry["operation"], "write_chunk");
-            assert_eq!(entry["chunk_index"], 1);
-            assert_eq!(entry["attempt"], index as u64 + 1);
-        }
-        assert_eq!(entries[0]["delay_before_retry_ms"], 200);
-        assert_eq!(entries[1]["delay_before_retry_ms"], 400);
-        assert!(entries[2].get("delay_before_retry_ms").is_none());
-    }
-
-    #[test]
-    fn an_exhausted_begin_unit_fails_before_the_session_with_its_history() {
-        // begin never opens: the failure stays before the session — the
-        // not_started report posture — while the attempt log still tells
-        // the whole retry story (ADR-0050's conditional presence rule).
-        let destination = ScriptedDestination::new(
-            vec![
-                scripted_transient("first shortage"),
-                scripted_transient("second shortage"),
-                scripted_transient("third shortage"),
-            ],
-            Vec::new(),
-        );
-        let mut sleeper = retry::RecordingSleeper::new();
-        let mut retry_attempts = Vec::new();
-
-        let Err(WritePhaseFailure::BeforeSession(failure)) = run_write_phase(
-            chunk_stream(&[&[1]]),
-            &destination,
-            LoadMode::Append,
-            &retry::RetryPolicy::default(),
-            &mut sleeper,
-            &mut retry_attempts,
-        ) else {
-            panic!("an exhausted begin unit fails before the session")
-        };
-
-        assert_eq!(failure.failure.message, "third shortage");
-        assert_eq!(destination.begin_calls.get(), 3);
-        assert!(destination.observed_writes().is_empty());
-        assert_eq!(sleeper.slept_ms, vec![200, 400]);
-        let entries: Vec<Value> = retry_attempts
-            .iter()
-            .map(retry::RetryAttempt::report_value)
-            .collect();
-        assert_eq!(entries.len(), 3);
-        assert!(entries.iter().all(|entry| entry["operation"] == "begin"));
-    }
-
     #[test]
     fn load_definition_parses_the_reject_threshold() {
         let definition =
@@ -2200,6 +1827,85 @@ mod tests {
         assert_eq!(policy.max_attempts.get(), 5);
         assert_eq!(policy.initial_delay_ms, 200);
         assert_eq!(policy.max_delay_ms, 5000);
+    }
+
+    #[test]
+    fn load_definition_parses_the_parallelism_key() {
+        // `execution.parallelism` is one optional nonzero scalar beside
+        // `chunk_rows` and `retry` (ADR-0052): zero, negative, and
+        // non-integer forms fail YAML parsing, surfacing as
+        // invalid_load_definition_yaml at the load boundary.
+        let definition =
+            serde_yaml::from_str::<LoadDefinition>("version: 1\nexecution:\n  parallelism: 4\n")
+                .expect("definition with parallelism parses");
+        assert_eq!(
+            definition
+                .execution
+                .expect("execution block")
+                .parallelism
+                .map(std::num::NonZeroU64::get),
+            Some(4)
+        );
+
+        let definition = serde_yaml::from_str::<LoadDefinition>("version: 1\nexecution: {}\n")
+            .expect("definition without parallelism parses");
+        assert!(definition
+            .execution
+            .expect("execution block")
+            .parallelism
+            .is_none());
+
+        for yaml in [
+            "version: 1\nexecution:\n  parallelism: 0\n",
+            "version: 1\nexecution:\n  parallelism: -2\n",
+            "version: 1\nexecution:\n  parallelism: 1.5\n",
+        ] {
+            assert!(
+                serde_yaml::from_str::<LoadDefinition>(yaml).is_err(),
+                "invalid parallelism accepted: {yaml:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_parallelism_defaults_to_the_connector_limit_and_clamps_configured_values() {
+        // Absent, the effective parallelism is the connector's declared
+        // limit for the load's mode; present, it is min(configured, limit)
+        // — the limit is a hard cap, never exceeded (ADR-0052).
+        let nonzero = |value: u64| std::num::NonZeroU64::new(value).expect("nonzero");
+        let execution = |yaml: &str| {
+            serde_yaml::from_str::<LoadDefinition>(yaml)
+                .expect("definition parses")
+                .execution
+        };
+
+        for (yaml, limit, expected) in [
+            ("version: 1\n", 1, 1),
+            ("version: 1\nexecution: {}\n", 4, 4),
+            ("version: 1\nexecution:\n  parallelism: 8\n", 2, 2),
+            ("version: 1\nexecution:\n  parallelism: 1\n", 4, 1),
+            ("version: 1\nexecution:\n  parallelism: 3\n", 3, 3),
+        ] {
+            assert_eq!(
+                resolve_parallelism(execution(yaml).as_ref(), nonzero(limit)),
+                nonzero(expected),
+                "for {yaml:?} under limit {limit}"
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_destinations_declare_the_serial_parallelism_limit_for_every_mode() {
+        // The provably serial shipped matrix (ADR-0051): both shipped
+        // destinations hold the default limit of 1 for every load mode, so
+        // any configured parallelism clamps to 1 and the windowed engine is
+        // unreachable outside test connectors.
+        let work = tempfile::TempDir::new().expect("tempdir");
+        for destination in [parquet_destination(&work), duckdb_destination(&work)] {
+            for mode in [LoadMode::FullRefresh, LoadMode::Append] {
+                assert_eq!(destination.parallelism_limit(mode).get(), 1);
+            }
+        }
     }
 
     #[test]

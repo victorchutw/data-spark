@@ -169,7 +169,9 @@ The amount of concurrent work allowed within a load.
 _Avoid_: Concurrency, workers
 
 **Connector Parallelism Limit**:
-The maximum load parallelism a connector allows by default for safe operation.
+The maximum load parallelism a destination connector declares per load mode,
+serving both as the hard cap on configured parallelism and as the effective
+default when none is configured.
 _Avoid_: Worker limit, concurrency cap
 
 **External Orchestrator**:

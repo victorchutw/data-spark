@@ -1,0 +1,11 @@
+---
+status: accepted
+---
+
+# Report Parallelism as the Effective Value Beside the Connector Limit
+
+The load report's `execution` object gains two additive fields in the `record_format: "arrow_record_batch"` postures — success and in-session failures: **`parallelism`**, the effective value after ADR-0052's `min(configured, limit)`, and **`connector_parallelism_limit`**, the mode's declared limit. Together they make a clamped configuration self-explanatory: a definition asking for 8 against a limit of 1 reports `parallelism: 1, connector_parallelism_limit: 1`, so the reader sees both what ran and why without consulting connector documentation. The `not_started` posture carries neither — no write phase ran, so there is no effective parallelism to state, mirroring how that posture already omits `chunk_rows` and the unconditional retry echo (ADR-0050). In the shipped connector matrix every report echoes `1` and `1`.
+
+`batch_count`, `row_counts`, `chunk_rows`, and every established fact keep their meaning, and `report_version` stays `1` — the additive precedent of ADR-0030, ADR-0046, and ADR-0050. Concurrency must not make report content nondeterministic: the `attempts` array of the retry echo is ordered at report assembly — `begin` entries first, then ascending chunk index, then ascending attempt — byte-identical to the appending order of a serial load and independent of the wall-clock completion order of concurrent slots, and the surfaced failure of a halted window is the lowest-chunk-index terminal failure (ADR-0051), so identical inputs yield identical reports at any parallelism.
+
+Alternatives rejected: echoing the configured value instead of the effective one (the report states what the load did, not what the definition asked; the raw ask already lives in the definition the report sits beside); only the effective value without the limit (a clamped run would look like a misread configuration until the reader digs up the connector's limit); a per-chunk timing or slot-assignment trace (nondeterministic content for no decision a reader could take from it — the window bound and the deterministic attempt order already tell the execution story); bumping `report_version` (additive fields do not change how existing readers parse the report).
