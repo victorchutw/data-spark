@@ -33,8 +33,10 @@ use std::cell::Cell;
 use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read};
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Mutex;
 use uuid::Uuid;
 
 /// What a [`Source`] hands back once pass 1 resolved the load (ADR-0045,
@@ -246,6 +248,19 @@ pub(crate) trait Source {
 pub(crate) trait Destination {
     fn supported_load_modes(&self) -> &'static [LoadMode];
 
+    /// The Connector Parallelism Limit of one load mode (ADR-0051): the
+    /// hard cap on how many `write_chunk` operations the dispatcher may
+    /// run concurrently within a load in that mode, and the effective
+    /// parallelism when the definition configures none. Declaring a limit
+    /// above 1 carries a declaration obligation mirroring the transience
+    /// rule of ADR-0048: only when concurrent `write_chunk` completions
+    /// cannot break the mode's documented commit semantics. The default is
+    /// the always-safe serial 1, and no shipped connector overrides it —
+    /// the shipped matrix is provably serial.
+    fn parallelism_limit(&self, _mode: LoadMode) -> NonZeroU64 {
+        NonZeroU64::MIN
+    }
+
     fn validate_mode(&self, mode: LoadMode) -> Result<(), LoadFailure> {
         if self.supported_load_modes().contains(&mode) {
             Ok(())
@@ -264,16 +279,21 @@ pub(crate) trait Destination {
     fn begin(&self, mode: LoadMode) -> Result<Box<dyn DestinationWriter>, DestinationWriteFailure>;
 }
 
-/// One destination write session (ADR-0046): chunks are written in order
-/// through [`DestinationWriter::write_chunk`], and the session ends in
-/// exactly one of [`DestinationWriter::commit`] — returning the write facts
-/// — or [`DestinationWriter::abandon`], when the source side fails
-/// mid-stream. The commit boundary is mode-owned (ADR-0047): a full-refresh
-/// session makes nothing visible before `commit`, while an append session
-/// commits every chunk inside `write_chunk`. Dropping an uncommitted writer
-/// cleans up its staging state.
-pub(crate) trait DestinationWriter {
-    fn write_chunk(&mut self, batch: &RecordBatch) -> Result<(), DestinationWriteFailure>;
+/// One destination write session (ADR-0046): chunks are written through
+/// [`DestinationWriter::write_chunk`], and the session ends in exactly one
+/// of [`DestinationWriter::commit`] — returning the write facts — or
+/// [`DestinationWriter::abandon`], when the load fails mid-stream. The
+/// commit boundary is mode-owned (ADR-0047): a full-refresh session makes
+/// nothing visible before `commit`, while an append session commits every
+/// chunk inside `write_chunk`. `write_chunk` takes `&self` and the trait is
+/// `Sync` because the dispatcher may run up to the mode's declared
+/// parallelism limit of writes concurrently from its worker threads
+/// (ADR-0051); each writer owns whatever interior synchronization its
+/// declared limit needs — a plain lock suffices at limit 1. `commit` and
+/// `abandon` consume the writer on the dispatching thread after every write
+/// returned. Dropping an uncommitted writer cleans up its staging state.
+pub(crate) trait DestinationWriter: Sync {
+    fn write_chunk(&self, batch: &RecordBatch) -> Result<(), DestinationWriteFailure>;
 
     fn commit(self: Box<Self>) -> Result<DestinationWrite, DestinationWriteFailure>;
 
@@ -649,9 +669,16 @@ impl Destination for ParquetDestination {
 struct ParquetFullRefreshWriter {
     destination_path: PathBuf,
     staging_path: PathBuf,
+    // Interior lock because `write_chunk` takes `&self` (the session
+    // contract is `Sync`); at this connector's declared parallelism limit
+    // of 1 the lock is never contended.
+    progress: Mutex<ParquetFullRefreshProgress>,
+    committed: bool,
+}
+
+struct ParquetFullRefreshProgress {
     parts: u64,
     bytes_written: u64,
-    committed: bool,
 }
 
 impl ParquetFullRefreshWriter {
@@ -693,21 +720,24 @@ impl ParquetFullRefreshWriter {
         Ok(ParquetFullRefreshWriter {
             destination_path,
             staging_path,
-            parts: 0,
-            bytes_written: 0,
+            progress: Mutex::new(ParquetFullRefreshProgress {
+                parts: 0,
+                bytes_written: 0,
+            }),
             committed: false,
         })
     }
 }
 
 impl DestinationWriter for ParquetFullRefreshWriter {
-    fn write_chunk(&mut self, batch: &RecordBatch) -> Result<(), DestinationWriteFailure> {
+    fn write_chunk(&self, batch: &RecordBatch) -> Result<(), DestinationWriteFailure> {
+        let mut progress = self.progress.lock().expect("writer progress lock");
         let parquet_file_path = self
             .staging_path
-            .join(format!("part-{:05}.parquet", self.parts));
+            .join(format!("part-{:05}.parquet", progress.parts));
         let bytes_written = write_parquet_batch(&parquet_file_path, batch)?;
-        self.parts += 1;
-        self.bytes_written += bytes_written;
+        progress.parts += 1;
+        progress.bytes_written += bytes_written;
         Ok(())
     }
 
@@ -740,8 +770,13 @@ impl DestinationWriter for ParquetFullRefreshWriter {
         })?;
         self.committed = true;
 
+        let bytes_written = self
+            .progress
+            .lock()
+            .expect("writer progress lock")
+            .bytes_written;
         Ok(DestinationWrite {
-            bytes_written: Some(self.bytes_written),
+            bytes_written: Some(bytes_written),
             facts: DestinationWriteFacts::best_effort("staging_then_replace"),
         })
     }
@@ -775,30 +810,19 @@ impl Drop for ParquetFullRefreshWriter {
 struct ParquetAppendWriter {
     destination_path: PathBuf,
     destination_schema: Option<SchemaRef>,
+    // Interior lock because `write_chunk` takes `&self` (the session
+    // contract is `Sync`); at this connector's declared parallelism limit
+    // of 1 the lock is never contended.
+    progress: Mutex<ParquetAppendProgress>,
+}
+
+struct ParquetAppendProgress {
     committed_chunks: u64,
     written_records: u64,
     bytes_written: u64,
 }
 
-impl ParquetAppendWriter {
-    fn begin(destination_path: PathBuf) -> Result<Self, DestinationWriteFailure> {
-        fs::create_dir_all(&destination_path).map_err(|error| LoadFailure {
-            code: "destination_write_failed",
-            message: format!(
-                "failed to prepare Parquet destination {}: {error}",
-                destination_path.display()
-            ),
-        })?;
-        let destination_schema = existing_parquet_schema(&destination_path)?;
-        Ok(ParquetAppendWriter {
-            destination_path,
-            destination_schema,
-            committed_chunks: 0,
-            written_records: 0,
-            bytes_written: 0,
-        })
-    }
-
+impl ParquetAppendProgress {
     /// Attaches the committed-prefix facts to a chunk failure: once a chunk
     /// has committed, the destination has changed, so even a pre-boundary
     /// failure must report the append strategy rather than `not_applicable`.
@@ -817,8 +841,31 @@ impl ParquetAppendWriter {
     }
 }
 
+impl ParquetAppendWriter {
+    fn begin(destination_path: PathBuf) -> Result<Self, DestinationWriteFailure> {
+        fs::create_dir_all(&destination_path).map_err(|error| LoadFailure {
+            code: "destination_write_failed",
+            message: format!(
+                "failed to prepare Parquet destination {}: {error}",
+                destination_path.display()
+            ),
+        })?;
+        let destination_schema = existing_parquet_schema(&destination_path)?;
+        Ok(ParquetAppendWriter {
+            destination_path,
+            destination_schema,
+            progress: Mutex::new(ParquetAppendProgress {
+                committed_chunks: 0,
+                written_records: 0,
+                bytes_written: 0,
+            }),
+        })
+    }
+}
+
 impl DestinationWriter for ParquetAppendWriter {
-    fn write_chunk(&mut self, batch: &RecordBatch) -> Result<(), DestinationWriteFailure> {
+    fn write_chunk(&self, batch: &RecordBatch) -> Result<(), DestinationWriteFailure> {
+        let mut progress = self.progress.lock().expect("writer progress lock");
         let append_batch = match &self.destination_schema {
             None => batch.clone(),
             Some(destination_schema) => align_batch_to_destination_schema(
@@ -826,7 +873,7 @@ impl DestinationWriter for ParquetAppendWriter {
                 batch,
                 destination_schema.clone(),
             )
-            .map_err(|failure| self.chunk_failure(failure))?,
+            .map_err(|failure| progress.chunk_failure(failure))?,
         };
 
         let part_token = Uuid::new_v4();
@@ -840,7 +887,7 @@ impl DestinationWriter for ParquetAppendWriter {
             Ok(bytes_written) => bytes_written,
             Err(failure) => {
                 let _ = remove_path_if_exists(&staging_path);
-                return Err(self.chunk_failure(failure));
+                return Err(progress.chunk_failure(failure));
             }
         };
         if let Err(error) = fs::rename(&staging_path, &parquet_file_path) {
@@ -854,31 +901,37 @@ impl DestinationWriter for ParquetAppendWriter {
                     ),
                 },
                 facts: DestinationWriteFacts::best_effort("staged_part_append"),
-                written_records: self.written_records,
-                committed_chunks: self.committed_chunks,
+                written_records: progress.written_records,
+                committed_chunks: progress.committed_chunks,
                 transience: Transience::Terminal,
             });
         }
-        self.committed_chunks += 1;
-        self.written_records += append_batch.num_rows() as u64;
-        self.bytes_written += bytes_written;
+        progress.committed_chunks += 1;
+        progress.written_records += append_batch.num_rows() as u64;
+        progress.bytes_written += bytes_written;
         Ok(())
     }
 
     fn commit(self: Box<Self>) -> Result<DestinationWrite, DestinationWriteFailure> {
         // Every chunk already committed inside write_chunk; the terminal
         // commit only reports the session's facts.
+        let bytes_written = self
+            .progress
+            .lock()
+            .expect("writer progress lock")
+            .bytes_written;
         Ok(DestinationWrite {
-            bytes_written: Some(self.bytes_written),
+            bytes_written: Some(bytes_written),
             facts: DestinationWriteFacts::best_effort("staged_part_append"),
         })
     }
 
     fn abandon(self: Box<Self>) -> AbandonedWrite {
+        let progress = self.progress.lock().expect("writer progress lock");
         append_abandoned(
             "staged_part_append",
-            self.committed_chunks,
-            self.written_records,
+            progress.committed_chunks,
+            progress.written_records,
         )
     }
 }
@@ -1113,6 +1166,13 @@ impl Destination for DuckDbDestination {
 /// writer drops the connection, which rolls the open transaction back.
 struct DuckDbFullRefreshWriter {
     table: DuckDbTable,
+    // Interior lock because `write_chunk` takes `&self` (the session
+    // contract is `Sync`); at this connector's declared parallelism limit
+    // of 1 the lock is never contended.
+    session: Mutex<DuckDbFullRefreshSession>,
+}
+
+struct DuckDbFullRefreshSession {
     connection: Option<Connection>,
     // Chunks written inside the still-open transaction: nothing is committed
     // before COMMIT, which is why abandon reports zero regardless.
@@ -1134,9 +1194,11 @@ impl DuckDbFullRefreshWriter {
             })?;
         Ok(DuckDbFullRefreshWriter {
             table,
-            connection: Some(connection),
-            written_chunks: 0,
-            written_records: 0,
+            session: Mutex::new(DuckDbFullRefreshSession {
+                connection: Some(connection),
+                written_chunks: 0,
+                written_records: 0,
+            }),
         })
     }
 
@@ -1157,12 +1219,12 @@ impl DuckDbFullRefreshWriter {
 }
 
 impl DestinationWriter for DuckDbFullRefreshWriter {
-    fn write_chunk(&mut self, batch: &RecordBatch) -> Result<(), DestinationWriteFailure> {
-        let connection = self.connection.as_ref().expect("session connection open");
+    fn write_chunk(&self, batch: &RecordBatch) -> Result<(), DestinationWriteFailure> {
+        let mut session = self.session.lock().expect("writer session lock");
         // The first chunk replaces the table; the remaining chunks extend it
         // inside the same transaction, so every statement shares the replace
         // wording and the atomic posture.
-        let statement = if self.written_chunks == 0 {
+        let statement = if session.written_chunks == 0 {
             format!(
                 "CREATE OR REPLACE TABLE {} AS SELECT * FROM arrow(?, ?)",
                 self.table.quoted_dataset()
@@ -1173,16 +1235,26 @@ impl DestinationWriter for DuckDbFullRefreshWriter {
                 self.table.quoted_dataset()
             )
         };
-        connection
+        session
+            .connection
+            .as_ref()
+            .expect("session connection open")
             .execute(&statement, arrow_recordbatch_to_query_params(batch.clone()))
             .map_err(|error| self.replace_failure(error))?;
-        self.written_chunks += 1;
-        self.written_records += batch.num_rows() as u64;
+        session.written_chunks += 1;
+        session.written_records += batch.num_rows() as u64;
         Ok(())
     }
 
-    fn commit(mut self: Box<Self>) -> Result<DestinationWrite, DestinationWriteFailure> {
-        let connection = self.connection.take().expect("session connection open");
+    fn commit(self: Box<Self>) -> Result<DestinationWrite, DestinationWriteFailure> {
+        let (connection, written_chunks, written_records) = {
+            let mut session = self.session.lock().expect("writer session lock");
+            (
+                session.connection.take().expect("session connection open"),
+                session.written_chunks,
+                session.written_records,
+            )
+        };
         connection.execute_batch("COMMIT").map_err(|error| {
             DestinationWriteFailure::atomic(
                 LoadFailure {
@@ -1203,8 +1275,8 @@ impl DestinationWriter for DuckDbFullRefreshWriter {
             DestinationWriteFailure {
                 failure: self.table.close_failure(error),
                 facts: DestinationWriteFacts::atomic("transactional_replace"),
-                written_records: self.written_records,
-                committed_chunks: self.written_chunks,
+                written_records,
+                committed_chunks: written_chunks,
                 transience: Transience::Terminal,
             }
         })?;
@@ -1234,10 +1306,35 @@ impl DestinationWriter for DuckDbFullRefreshWriter {
 /// keeps exactly the committed chunk prefix.
 struct DuckDbAppendWriter {
     table: DuckDbTable,
-    connection: Option<Connection>,
     destination_schema: SchemaRef,
+    // Interior lock because `write_chunk` takes `&self` (the session
+    // contract is `Sync`); at this connector's declared parallelism limit
+    // of 1 the lock is never contended.
+    session: Mutex<DuckDbAppendSession>,
+}
+
+struct DuckDbAppendSession {
+    connection: Option<Connection>,
     committed_chunks: u64,
     written_records: u64,
+}
+
+impl DuckDbAppendSession {
+    /// Attaches the committed-prefix facts to a chunk failure; see
+    /// [`ParquetAppendProgress::chunk_failure`].
+    fn chunk_failure(&self, failure: LoadFailure) -> DestinationWriteFailure {
+        if self.committed_chunks > 0 {
+            DestinationWriteFailure {
+                failure,
+                facts: DestinationWriteFacts::best_effort("insert"),
+                written_records: self.written_records,
+                committed_chunks: self.committed_chunks,
+                transience: Transience::Terminal,
+            }
+        } else {
+            failure.into()
+        }
+    }
 }
 
 impl DuckDbAppendWriter {
@@ -1261,42 +1358,31 @@ impl DuckDbAppendWriter {
         };
         Ok(DuckDbAppendWriter {
             table,
-            connection: Some(connection),
             destination_schema,
-            committed_chunks: 0,
-            written_records: 0,
+            session: Mutex::new(DuckDbAppendSession {
+                connection: Some(connection),
+                committed_chunks: 0,
+                written_records: 0,
+            }),
         })
-    }
-
-    /// Attaches the committed-prefix facts to a chunk failure; see
-    /// [`ParquetAppendWriter::chunk_failure`].
-    fn chunk_failure(&self, failure: LoadFailure) -> DestinationWriteFailure {
-        if self.committed_chunks > 0 {
-            DestinationWriteFailure {
-                failure,
-                facts: DestinationWriteFacts::best_effort("insert"),
-                written_records: self.written_records,
-                committed_chunks: self.committed_chunks,
-                transience: Transience::Terminal,
-            }
-        } else {
-            failure.into()
-        }
     }
 }
 
 impl DestinationWriter for DuckDbAppendWriter {
-    fn write_chunk(&mut self, batch: &RecordBatch) -> Result<(), DestinationWriteFailure> {
+    fn write_chunk(&self, batch: &RecordBatch) -> Result<(), DestinationWriteFailure> {
+        let mut session = self.session.lock().expect("writer session lock");
         let append_batch =
             align_batch_to_duckdb_schema(&self.table, batch, self.destination_schema.clone())
-                .map_err(|failure| self.chunk_failure(failure))?;
+                .map_err(|failure| session.chunk_failure(failure))?;
 
-        let connection = self.connection.as_ref().expect("session connection open");
         let statement = format!(
             "INSERT INTO {} BY NAME SELECT * FROM arrow(?, ?)",
             self.table.quoted_dataset()
         );
-        connection
+        session
+            .connection
+            .as_ref()
+            .expect("session connection open")
             .execute(
                 &statement,
                 arrow_recordbatch_to_query_params(append_batch.clone()),
@@ -1311,24 +1397,31 @@ impl DestinationWriter for DuckDbAppendWriter {
                     ),
                 },
                 facts: DestinationWriteFacts::best_effort("insert"),
-                written_records: self.written_records,
-                committed_chunks: self.committed_chunks,
+                written_records: session.written_records,
+                committed_chunks: session.committed_chunks,
                 transience: Transience::Terminal,
             })?;
-        self.committed_chunks += 1;
-        self.written_records += append_batch.num_rows() as u64;
+        session.committed_chunks += 1;
+        session.written_records += append_batch.num_rows() as u64;
         Ok(())
     }
 
-    fn commit(mut self: Box<Self>) -> Result<DestinationWrite, DestinationWriteFailure> {
-        let connection = self.connection.take().expect("session connection open");
+    fn commit(self: Box<Self>) -> Result<DestinationWrite, DestinationWriteFailure> {
+        let (connection, committed_chunks, written_records) = {
+            let mut session = self.session.lock().expect("writer session lock");
+            (
+                session.connection.take().expect("session connection open"),
+                session.committed_chunks,
+                session.written_records,
+            )
+        };
         connection
             .close()
             .map_err(|(_, error)| DestinationWriteFailure {
                 failure: self.table.close_failure(error),
                 facts: DestinationWriteFacts::best_effort("insert"),
-                written_records: self.written_records,
-                committed_chunks: self.committed_chunks,
+                written_records,
+                committed_chunks,
                 transience: Transience::Terminal,
             })?;
 
@@ -1339,7 +1432,8 @@ impl DestinationWriter for DuckDbAppendWriter {
     }
 
     fn abandon(self: Box<Self>) -> AbandonedWrite {
-        append_abandoned("insert", self.committed_chunks, self.written_records)
+        let session = self.session.lock().expect("writer session lock");
+        append_abandoned("insert", session.committed_chunks, session.written_records)
     }
 }
 
@@ -2055,7 +2149,7 @@ mod tests {
         batch: &RecordBatch,
         mode: LoadMode,
     ) -> DestinationWrite {
-        let mut writer = destination.begin(mode).expect("begin write session");
+        let writer = destination.begin(mode).expect("begin write session");
         writer.write_chunk(batch).expect("write chunk");
         writer.commit().expect("commit write session")
     }
@@ -2756,7 +2850,7 @@ mod tests {
         let first = two_row_batch(&work, "first.csv");
         let second = one_row_batch(&work, "second.csv");
 
-        let mut writer = destination
+        let writer = destination
             .begin(LoadMode::FullRefresh)
             .expect("begin session");
         writer.write_chunk(&first).expect("write first chunk");
@@ -2807,7 +2901,7 @@ mod tests {
         let batch = two_row_batch(&work, "seed.csv");
         write_single(&destination, &batch, LoadMode::FullRefresh);
 
-        let mut writer = destination
+        let writer = destination
             .begin(LoadMode::FullRefresh)
             .expect("begin session");
         writer.write_chunk(&batch).expect("write chunk");
@@ -2851,7 +2945,7 @@ mod tests {
 
         // An abandoned replace rolls back: the seeded rows survive.
         let replacement = one_row_batch(&work, "replacement.csv");
-        let mut writer = destination
+        let writer = destination
             .begin(LoadMode::FullRefresh)
             .expect("begin session");
         writer.write_chunk(&replacement).expect("write chunk");
@@ -2861,7 +2955,7 @@ mod tests {
         assert_eq!(read_back.num_rows(), 2);
 
         // A committed multi-chunk replace lands every chunk in one table.
-        let mut writer = destination
+        let writer = destination
             .begin(LoadMode::FullRefresh)
             .expect("begin session");
         writer.write_chunk(&replacement).expect("write first chunk");
@@ -2892,7 +2986,7 @@ mod tests {
         write_single(&destination, &seed, LoadMode::FullRefresh);
 
         let appended = one_row_batch(&work, "appended.csv");
-        let mut writer = destination.begin(LoadMode::Append).expect("begin session");
+        let writer = destination.begin(LoadMode::Append).expect("begin session");
         writer.write_chunk(&appended).expect("write chunk");
         let abandoned = writer.abandon();
 

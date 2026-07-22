@@ -43,9 +43,11 @@ impl Default for RetryPolicy {
 /// The wait the engine performs between attempts. Production wires the real
 /// thread sleep; tests wire a recording fake that returns instantly, so the
 /// whole suite performs zero real sleeping and asserts delays as recorded
-/// values.
-pub(crate) trait Sleeper {
-    fn sleep_ms(&mut self, delay_ms: u64);
+/// values. `Sync` because concurrent write slots share one sleeper and each
+/// waits on its own thread (ADR-0051): a wait occupies only the slot that
+/// performs it.
+pub(crate) trait Sleeper: Sync {
+    fn sleep_ms(&self, delay_ms: u64);
 }
 
 /// The production sleeper: a real thread sleep. Provably idle in the shipped
@@ -53,7 +55,7 @@ pub(crate) trait Sleeper {
 pub(crate) struct ThreadSleeper;
 
 impl Sleeper for ThreadSleeper {
-    fn sleep_ms(&mut self, delay_ms: u64) {
+    fn sleep_ms(&self, delay_ms: u64) {
         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
     }
 }
@@ -92,7 +94,7 @@ pub(crate) fn run_unit<T>(
     policy: &RetryPolicy,
     unit: RetryUnit,
     attempts: &mut Vec<RetryAttempt>,
-    sleeper: &mut dyn Sleeper,
+    sleeper: &dyn Sleeper,
     mut operation: impl FnMut() -> Result<T, DestinationWriteFailure>,
 ) -> Result<T, DestinationWriteFailure> {
     let mut attempt = 1_u64;
@@ -159,19 +161,35 @@ pub(crate) fn report_when_attempted(
 
 /// Renders the report's `execution.retry` object (ADR-0050): the effective
 /// policy echo plus the attempts array — empty when nothing was retried.
+/// The array is ordered deterministically at assembly (ADR-0053): `begin`
+/// entries first, then ascending chunk index, then ascending attempt —
+/// byte-identical to the appending order of a serial load, and independent
+/// of the wall-clock completion order of concurrent slots.
 pub(crate) fn report_value(policy: &RetryPolicy, attempts: &[RetryAttempt]) -> Value {
+    let mut ordered: Vec<&RetryAttempt> = attempts.iter().collect();
+    ordered.sort_by_key(|attempt| attempt.unit_order());
     json!({
         "max_attempts": policy.max_attempts.get(),
         "initial_delay_ms": policy.initial_delay_ms,
         "max_delay_ms": policy.max_delay_ms,
-        "attempts": attempts
-            .iter()
+        "attempts": ordered
+            .into_iter()
             .map(RetryAttempt::report_value)
             .collect::<Vec<_>>(),
     })
 }
 
 impl RetryAttempt {
+    /// The deterministic report position of this entry: `begin` before
+    /// every chunk, chunks by ascending index, attempts ascending within a
+    /// unit.
+    fn unit_order(&self) -> (u8, u64, u64) {
+        match self.unit {
+            RetryUnit::Begin => (0, 0, self.attempt),
+            RetryUnit::WriteChunk { chunk_index } => (1, chunk_index, self.attempt),
+        }
+    }
+
     /// One attempts-array entry: `operation`, the 0-based `chunk_index`
     /// (absent for `begin`), the 1-based `attempt` within the unit, the
     /// failure mirrored in the `error_summary` shape, and the wait that
@@ -199,25 +217,35 @@ impl RetryAttempt {
 }
 
 /// A sleeper that records the requested waits instead of performing them,
-/// so tests assert the backoff sequence without any real sleep.
+/// so tests assert the backoff sequence without any real sleep. The record
+/// sits behind a lock because concurrent slots share one sleeper; recorded
+/// order across slots is scheduling order, so concurrency tests assert the
+/// sorted multiset while single-slot tests keep asserting the sequence.
 #[cfg(test)]
 pub(crate) struct RecordingSleeper {
-    pub(crate) slept_ms: Vec<u64>,
+    slept_ms: std::sync::Mutex<Vec<u64>>,
 }
 
 #[cfg(test)]
 impl RecordingSleeper {
     pub(crate) fn new() -> Self {
         RecordingSleeper {
-            slept_ms: Vec::new(),
+            slept_ms: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn slept_ms(&self) -> Vec<u64> {
+        self.slept_ms.lock().expect("sleeper record lock").clone()
     }
 }
 
 #[cfg(test)]
 impl Sleeper for RecordingSleeper {
-    fn sleep_ms(&mut self, delay_ms: u64) {
-        self.slept_ms.push(delay_ms);
+    fn sleep_ms(&self, delay_ms: u64) {
+        self.slept_ms
+            .lock()
+            .expect("sleeper record lock")
+            .push(delay_ms);
     }
 }
 
@@ -287,20 +315,20 @@ mod tests {
             transient("second shortage"),
             ScriptedOutcome::Succeed,
         ]);
-        let mut sleeper = RecordingSleeper::new();
+        let sleeper = RecordingSleeper::new();
         let mut attempts = Vec::new();
 
         let value = run_unit(
             &RetryPolicy::default(),
             RetryUnit::WriteChunk { chunk_index: 4 },
             &mut attempts,
-            &mut sleeper,
+            &sleeper,
             || operation.invoke(),
         )
         .expect("the third attempt succeeds");
 
         assert_eq!(value, 3, "the operation ran exactly three times");
-        assert_eq!(sleeper.slept_ms, vec![200, 400]);
+        assert_eq!(sleeper.slept_ms(), vec![200, 400]);
         let entries: Vec<Value> = attempts.iter().map(RetryAttempt::report_value).collect();
         assert_eq!(
             entries,
@@ -340,21 +368,21 @@ mod tests {
             transient("second shortage"),
             transient("third shortage"),
         ]);
-        let mut sleeper = RecordingSleeper::new();
+        let sleeper = RecordingSleeper::new();
         let mut attempts = Vec::new();
 
         let failure = run_unit(
             &RetryPolicy::default(),
             RetryUnit::Begin,
             &mut attempts,
-            &mut sleeper,
+            &sleeper,
             || operation.invoke(),
         )
         .expect_err("an exhausted budget surfaces the failure");
 
         assert_eq!(failure.failure.code, "destination_write_failed");
         assert_eq!(failure.failure.message, "third shortage");
-        assert_eq!(sleeper.slept_ms, vec![200, 400]);
+        assert_eq!(sleeper.slept_ms(), vec![200, 400]);
         let entries: Vec<Value> = attempts.iter().map(RetryAttempt::report_value).collect();
         assert_eq!(
             entries,
@@ -402,20 +430,20 @@ mod tests {
                 transience: Transience::Terminal,
             },
         ]);
-        let mut sleeper = RecordingSleeper::new();
+        let sleeper = RecordingSleeper::new();
         let mut attempts = Vec::new();
 
         let failure = run_unit(
             &RetryPolicy::default(),
             RetryUnit::WriteChunk { chunk_index: 0 },
             &mut attempts,
-            &mut sleeper,
+            &sleeper,
             || operation.invoke(),
         )
         .expect_err("a terminal failure surfaces");
 
         assert_eq!(failure.failure.message, "storage detached");
-        assert_eq!(sleeper.slept_ms, vec![200]);
+        assert_eq!(sleeper.slept_ms(), vec![200]);
         let entries: Vec<Value> = attempts.iter().map(RetryAttempt::report_value).collect();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1]["attempt"], 2);
@@ -435,21 +463,21 @@ mod tests {
             message: "table is missing",
             transience: Transience::Terminal,
         }]);
-        let mut sleeper = RecordingSleeper::new();
+        let sleeper = RecordingSleeper::new();
         let mut attempts = Vec::new();
 
         let failure = run_unit(
             &RetryPolicy::default(),
             RetryUnit::Begin,
             &mut attempts,
-            &mut sleeper,
+            &sleeper,
             || operation.invoke(),
         )
         .expect_err("a terminal failure surfaces");
 
         assert_eq!(failure.failure.message, "table is missing");
         assert_eq!(operation.calls, 1, "terminal failures retry zero times");
-        assert!(sleeper.slept_ms.is_empty());
+        assert!(sleeper.slept_ms().is_empty());
         assert!(attempts.is_empty());
     }
 
@@ -463,21 +491,21 @@ mod tests {
             ..RetryPolicy::default()
         };
         let mut operation = ScriptedOperation::new(vec![transient("first shortage")]);
-        let mut sleeper = RecordingSleeper::new();
+        let sleeper = RecordingSleeper::new();
         let mut attempts = Vec::new();
 
         let failure = run_unit(
             &policy,
             RetryUnit::WriteChunk { chunk_index: 2 },
             &mut attempts,
-            &mut sleeper,
+            &sleeper,
             || operation.invoke(),
         )
         .expect_err("a single-attempt budget surfaces the first failure");
 
         assert_eq!(failure.failure.message, "first shortage");
         assert_eq!(operation.calls, 1);
-        assert!(sleeper.slept_ms.is_empty());
+        assert!(sleeper.slept_ms().is_empty());
         assert!(attempts.is_empty());
     }
 
@@ -487,7 +515,7 @@ mod tests {
         // twice before succeeding under a budget of three: neither unit's
         // retries consume the other's budget, so both recover, and the
         // backoff sequence restarts per unit.
-        let mut sleeper = RecordingSleeper::new();
+        let sleeper = RecordingSleeper::new();
         let mut attempts = Vec::new();
 
         for chunk_index in [0, 1] {
@@ -500,13 +528,13 @@ mod tests {
                 &RetryPolicy::default(),
                 RetryUnit::WriteChunk { chunk_index },
                 &mut attempts,
-                &mut sleeper,
+                &sleeper,
                 || operation.invoke(),
             )
             .unwrap_or_else(|_| panic!("unit {chunk_index} recovers within its own budget"));
         }
 
-        assert_eq!(sleeper.slept_ms, vec![200, 400, 200, 400]);
+        assert_eq!(sleeper.slept_ms(), vec![200, 400, 200, 400]);
         let entries: Vec<Value> = attempts.iter().map(RetryAttempt::report_value).collect();
         assert_eq!(entries.len(), 4);
         assert_eq!(entries[0]["chunk_index"], 0);
@@ -538,19 +566,15 @@ mod tests {
             ScriptedOutcome::Succeed,
         ];
         let mut operation = ScriptedOperation::new(outcomes);
-        let mut sleeper = RecordingSleeper::new();
+        let sleeper = RecordingSleeper::new();
         let mut attempts = Vec::new();
 
-        run_unit(
-            &policy,
-            RetryUnit::Begin,
-            &mut attempts,
-            &mut sleeper,
-            || operation.invoke(),
-        )
+        run_unit(&policy, RetryUnit::Begin, &mut attempts, &sleeper, || {
+            operation.invoke()
+        })
         .expect("the sixth attempt succeeds");
 
-        assert_eq!(sleeper.slept_ms, vec![100, 200, 400, 700, 700]);
+        assert_eq!(sleeper.slept_ms(), vec![100, 200, 400, 700, 700]);
     }
 
     #[test]
@@ -567,38 +591,34 @@ mod tests {
             transient("shortage"),
             ScriptedOutcome::Succeed,
         ]);
-        let mut sleeper = RecordingSleeper::new();
+        let sleeper = RecordingSleeper::new();
         let mut attempts = Vec::new();
 
-        run_unit(
-            &policy,
-            RetryUnit::Begin,
-            &mut attempts,
-            &mut sleeper,
-            || operation.invoke(),
-        )
+        run_unit(&policy, RetryUnit::Begin, &mut attempts, &sleeper, || {
+            operation.invoke()
+        })
         .expect("the third attempt succeeds");
 
-        assert_eq!(sleeper.slept_ms, vec![300, 300]);
+        assert_eq!(sleeper.slept_ms(), vec![300, 300]);
     }
 
     #[test]
     fn a_first_attempt_success_touches_neither_the_sleeper_nor_the_log() {
         let mut operation = ScriptedOperation::new(vec![ScriptedOutcome::Succeed]);
-        let mut sleeper = RecordingSleeper::new();
+        let sleeper = RecordingSleeper::new();
         let mut attempts = Vec::new();
 
         run_unit(
             &RetryPolicy::default(),
             RetryUnit::Begin,
             &mut attempts,
-            &mut sleeper,
+            &sleeper,
             || operation.invoke(),
         )
         .expect("the first attempt succeeds");
 
         assert_eq!(operation.calls, 1);
-        assert!(sleeper.slept_ms.is_empty());
+        assert!(sleeper.slept_ms().is_empty());
         assert!(attempts.is_empty());
     }
 
@@ -615,15 +635,11 @@ mod tests {
             transient("connection shortage"),
             ScriptedOutcome::Succeed,
         ]);
-        let mut sleeper = RecordingSleeper::new();
+        let sleeper = RecordingSleeper::new();
         let mut attempts = Vec::new();
-        run_unit(
-            &policy,
-            RetryUnit::Begin,
-            &mut attempts,
-            &mut sleeper,
-            || operation.invoke(),
-        )
+        run_unit(&policy, RetryUnit::Begin, &mut attempts, &sleeper, || {
+            operation.invoke()
+        })
         .expect("the second attempt succeeds");
 
         let story =
@@ -634,6 +650,74 @@ mod tests {
             1
         );
         assert_eq!(story["attempts"][0]["operation"], "begin");
+    }
+
+    #[test]
+    fn the_report_value_orders_attempts_begin_first_then_chunk_index_then_attempt() {
+        // The deterministic attempts order of ADR-0053: report assembly
+        // sorts the log — `begin` entries first, then ascending chunk
+        // index, then ascending attempt — so concurrent slots completing in
+        // any wall-clock order yield one report shape, byte-identical to
+        // the serial appending order.
+        let policy = RetryPolicy::default();
+        let sleeper = RecordingSleeper::new();
+        let mut attempts = Vec::new();
+
+        // Record real entries per unit, then interleave them in a scrambled
+        // completion order: chunk 4 first, then begin, then chunk 1.
+        let mut scrambled = Vec::new();
+        for chunk_index in [4, 1] {
+            let mut operation = ScriptedOperation::new(vec![
+                transient("first shortage"),
+                transient("second shortage"),
+                ScriptedOutcome::Succeed,
+            ]);
+            run_unit(
+                &policy,
+                RetryUnit::WriteChunk { chunk_index },
+                &mut attempts,
+                &sleeper,
+                || operation.invoke(),
+            )
+            .expect("the unit recovers");
+            scrambled.append(&mut attempts);
+            if chunk_index == 4 {
+                let mut operation = ScriptedOperation::new(vec![
+                    transient("connection shortage"),
+                    ScriptedOutcome::Succeed,
+                ]);
+                run_unit(&policy, RetryUnit::Begin, &mut attempts, &sleeper, || {
+                    operation.invoke()
+                })
+                .expect("begin recovers");
+                scrambled.append(&mut attempts);
+            }
+        }
+
+        let entries = report_value(&policy, &scrambled)["attempts"]
+            .as_array()
+            .expect("attempts array")
+            .clone();
+        let keys: Vec<(Value, Value, Value)> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry["operation"].clone(),
+                    entry.get("chunk_index").cloned().unwrap_or(Value::Null),
+                    entry["attempt"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            vec![
+                (json!("begin"), Value::Null, json!(1)),
+                (json!("write_chunk"), json!(1), json!(1)),
+                (json!("write_chunk"), json!(1), json!(2)),
+                (json!("write_chunk"), json!(4), json!(1)),
+                (json!("write_chunk"), json!(4), json!(2)),
+            ]
+        );
     }
 
     #[test]
