@@ -145,6 +145,18 @@ fn delay_before_attempt_ms(policy: &RetryPolicy, attempt: u64) -> u64 {
         .min(policy.max_delay_ms)
 }
 
+/// The conditional retry story of the `not_started` report posture
+/// (ADR-0050): `Some` exactly when attempts were recorded, so a
+/// never-retried failure report keeps its established shape while an
+/// exhausted transient `begin` still tells the whole story. Boxed for the
+/// failure types that carry it.
+pub(crate) fn report_when_attempted(
+    policy: &RetryPolicy,
+    attempts: &[RetryAttempt],
+) -> Option<Box<Value>> {
+    (!attempts.is_empty()).then(|| Box::new(report_value(policy, attempts)))
+}
+
 /// Renders the report's `execution.retry` object (ADR-0050): the effective
 /// policy echo plus the attempts array — empty when nothing was retried.
 pub(crate) fn report_value(policy: &RetryPolicy, attempts: &[RetryAttempt]) -> Value {
@@ -588,6 +600,40 @@ mod tests {
         assert_eq!(operation.calls, 1);
         assert!(sleeper.slept_ms.is_empty());
         assert!(attempts.is_empty());
+    }
+
+    #[test]
+    fn the_not_started_retry_story_exists_exactly_when_attempts_were_recorded() {
+        // The conditional presence rule of ADR-0050: an empty log yields no
+        // retry story — the never-retried `not_started` report stays
+        // byte-identical — while a recorded log yields the full policy echo
+        // with its entries.
+        let policy = RetryPolicy::default();
+        assert!(report_when_attempted(&policy, &[]).is_none());
+
+        let mut operation = ScriptedOperation::new(vec![
+            transient("connection shortage"),
+            ScriptedOutcome::Succeed,
+        ]);
+        let mut sleeper = RecordingSleeper::new();
+        let mut attempts = Vec::new();
+        run_unit(
+            &policy,
+            RetryUnit::Begin,
+            &mut attempts,
+            &mut sleeper,
+            || operation.invoke(),
+        )
+        .expect("the second attempt succeeds");
+
+        let story =
+            *report_when_attempted(&policy, &attempts).expect("recorded attempts tell their story");
+        assert_eq!(story["max_attempts"], 3);
+        assert_eq!(
+            story["attempts"].as_array().expect("attempts array").len(),
+            1
+        );
+        assert_eq!(story["attempts"][0]["operation"], "begin");
     }
 
     #[test]

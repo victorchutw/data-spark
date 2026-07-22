@@ -769,8 +769,7 @@ fn execute_supported_load(
                 written_records: write_failure.written_records,
                 rejected_count,
                 committed_execution: None,
-                retry: (!retry_attempts.is_empty())
-                    .then(|| Box::new(retry::report_value(&retry_policy, &retry_attempts))),
+                retry: retry::report_when_attempted(&retry_policy, &retry_attempts),
                 destination_write: Box::new(write_failure.facts),
             })
         }
