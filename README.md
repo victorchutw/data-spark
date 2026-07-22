@@ -28,7 +28,7 @@ As of v0.2.0:
   memory stays flat regardless of source size.
 - **Retry**: transient write failures are retried with backoff, and every
   attempt is recorded in the load report.
-- **Parallelism**: chunk writes can run concurrently, capped by the limit each
+- **Parallelism**: chunk writes can run in parallel, capped by the limit each
   destination connector declares per load mode.
 - **Versioned contracts**: load definitions (YAML) and load reports (JSON)
   each carry an explicit contract version.
@@ -112,8 +112,8 @@ Artifact directory: .data-spark/runs/c0eeb484-7210-43db-b6f4-0c6d2470f026
 Load report: .data-spark/runs/c0eeb484-7210-43db-b6f4-0c6d2470f026/load-report.json
 ```
 
-The dataset now lives in `customers.duckdb` as the `customers` table, ready to
-query with any DuckDB client.
+The `customers` dataset now lives in `customers.duckdb`, ready to query with
+any DuckDB client.
 
 Each load writes its artifacts to its own artifact directory —
 `.data-spark/runs/<load-id>/` by default, or under the directory given with
