@@ -76,6 +76,10 @@ _Avoid_: SQL transform, modeling, enrichment
 One logical item inside a dataset.
 _Avoid_: Row, event, object
 
+**Chunk**:
+A bounded run of consecutive records that a load reads, validates, writes, and commits as one unit; the load report's `batch_count` counts chunks, and Arrow `RecordBatch` is the exchange format of one chunk.
+_Avoid_: Batch, micro-batch, page, block
+
 **Load**:
 One attempt to move records from a source into a destination.
 _Avoid_: Job, run, sync
