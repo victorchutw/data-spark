@@ -21,7 +21,8 @@ A load — success or failure — writes a JSON load report
 themselves — an artifact directory that cannot be created, or an artifact
 write that fails — which aborts the load with exit code `1` and no report.
 The failure codes named throughout this reference appear in the report's
-`error_summary.code`. The load report contract is documented separately.
+`error_summary.code`. The load report contract is documented in the
+[Load Report Reference](load-report.md).
 
 ## Conventions in this reference
 

@@ -13,24 +13,24 @@ produce the load artifacts themselves: an artifact directory that cannot be
 created, or an artifact write that fails, aborts the load with exit code `1`
 and no report.
 
-stdout carries the human-readable load summary instead: a short block naming
-the load id, status, load mode, source, destination, record counts, and
-artifact paths. It is for people; everything below is the contract for
-programs.
+stdout carries the human-readable load summary instead. It is for people;
+everything below is the contract for programs.
 
 The YAML side of the contract — the load definition a load runs from — is
 documented in the [Load Definition Reference](load-definition.md).
 
 ## Conventions in this reference
 
-- Every JSON block below is real output, taken unedited from a load run
-  against the release binary. The one exception is the retry attempt entry
-  under [`retry`](#retry), which no shipped connector can produce; it is
-  marked where it appears.
+- Every JSON block below is real output, taken unedited from a load against
+  the release binary. The one exception is the retry attempt entry under
+  [`retry`](#retry), which no shipped connector can produce; it is marked
+  where it appears.
 - Complete reports appear under [Complete examples](#complete-examples).
   Blocks elsewhere show one subtree and name the field they show.
-- `load_id`, `artifact_dir`, and the three `timings` values differ on every
-  run. Every other value shown is exactly what the binary wrote.
+- `load_id`, `artifact_dir`, and the three `timings` values are different in
+  every load, and the one value that embeds them — the `rejected_records`
+  artifact path — is shown with `<load_id>` standing in for the id. Every
+  other value shown is exactly what the binary wrote.
 
 ## Where the report is written
 
@@ -103,8 +103,9 @@ so a report can be traced back to its console output and its artifacts.
 ### `artifact_dir`
 
 The artifact directory, written exactly as the load resolved it — a relative
-root stays relative, an absolute root stays absolute. The report itself is
-always `<artifact_dir>/load-report.json`.
+root stays relative, an absolute root stays absolute; see [Where the report
+is written](#where-the-report-is-written). The report itself is always
+`<artifact_dir>/load-report.json`.
 
 ## Echoed context
 
@@ -114,7 +115,11 @@ not what the load resolved it to.
 
 ### `source_summary` and `destination_summary`
 
-<!-- proof: case=unsupported-mode path=source_summary -->
+`source_summary` carries the definition's `source` block: `connector`, `path`,
+and `format`. `format` is `null` when the definition omitted it — the echo is
+the definition as written, so the format resolved from the path extension
+does not appear here:
+
 ```json
 {
   "connector": "local_file",
@@ -123,15 +128,12 @@ not what the load resolved it to.
 }
 ```
 
-`source_summary` carries the definition's `source` block: `connector`, `path`,
-and `format`. `format` is `null` when the definition omitted it — the echo is
-the definition as written, so the format resolved from the path extension
-does not appear here.
-
 `destination_summary` carries the definition's `destination` block:
 `connector` and `path`.
 
-Both are `{}` when the load failed before the definition parsed — a
+A block the definition omitted is echoed as `{}` — so a definition with no
+`destination` reports its `source` and an empty `destination_summary`. Both
+are `{}` when the load failed before the definition parsed at all: a
 definition file that could not be read, or that is not valid YAML for the
 contract.
 
@@ -166,13 +168,13 @@ and what drift it found on the way.
 | `mode` | always | `inferred`, `pinned`, or `not_evaluated`. |
 | `fields` | a schema was resolved, and in every `pinned` posture | The dataset schema in output order. |
 | `drift_status` | `mode` is not `not_evaluated` | The drift outcome; see below. |
-| `pinned_schema_path` | the definition set `schema.pinned_path` | The pinned schema file the load read or wrote. |
+| `pinned_schema_path` | the definition set `schema.pinned_path`, and `mode` is not `not_evaluated` | The pinned schema file the load read or wrote. |
 | `pinned_schema_persisted` | this load wrote that file | Always `true` when present. |
 | `added_fields` | `drift_status` is `additive_fields_added` | The fields this load added to the pin. |
 | `drift` | `drift_status` is `failed_on_drift` | What the drift was; see [drift detail](#drift-detail). |
 | `conflict` | the load failed with `schema_override_conflict` | The override that contradicts the pin. |
-| `overrides` | the definition declared `schema.overrides` | The overrides, echoed as written. |
-| `transform` | the definition declared `transform` | The structural transform, echoed as written. |
+| `overrides` | the definition declared `schema.overrides`, and `mode` is not `not_evaluated` | The overrides, echoed as written. |
+| `transform` | the definition declared `transform`, and `mode` is not `not_evaluated` | The structural transform, echoed as written. |
 
 Each entry of `fields` — and of `added_fields` — carries `name`, `type`, and
 `nullable`, in the order the load materializes them. `type` is the dataset
@@ -202,7 +204,6 @@ can reach — plus the declared types `timestamp`, `timestamptz`, and
 
 A plain inferred load — no pinning configured:
 
-<!-- proof: case=inferred path=schema_decision -->
 ```json
 {
   "mode": "inferred",
@@ -236,7 +237,6 @@ The first load of a definition that names a `schema.pinned_path` bootstraps
 the pin from its own inference, so it reports `mode: inferred` with the two
 pin keys:
 
-<!-- proof: case=pin-bootstrap path=schema_decision -->
 ```json
 {
   "mode": "inferred",
@@ -272,7 +272,6 @@ The next load of the same definition reads that file and compares against it.
 An unchanged source shape drifts by nothing, and the pin is not rewritten —
 so `pinned_schema_persisted` is absent:
 
-<!-- proof: case=pinned-none path=schema_decision -->
 ```json
 {
   "mode": "pinned",
@@ -308,7 +307,6 @@ allow_additive_nullable`: `fields` is the whole extended schema, and
 `added_fields` names just what this load added. The pin was rewritten to
 carry them, so a field that disappears again is caught as drift next time:
 
-<!-- proof: case=additive path=schema_decision -->
 ```json
 {
   "mode": "pinned",
@@ -353,11 +351,12 @@ carry them, so a field that disappears again is caught as drift next time:
 ```
 
 A load that failed before it could finish resolving a schema reports the
-posture it was configured for, with no `fields` — nothing had been resolved
-yet — and no comparison. Here an override named a field the source does not
-have, on a definition whose pin did not exist yet:
+posture it was configured for, with no comparison run. An inference posture
+has no `fields` — nothing had been resolved yet — while a pinned posture
+still states the pin's own fields, because those were read from the file.
+Here an override named a field the source does not have, on a definition
+whose pin did not exist yet:
 
-<!-- proof: case=unknown-override path=schema_decision -->
 ```json
 {
   "mode": "inferred",
@@ -376,7 +375,6 @@ A load that failed before any schema work — an unreadable or invalid
 definition, an unsupported connector, an unsupported load mode — reports the
 decision as unmade:
 
-<!-- proof: case=broken-yaml path=schema_decision -->
 ```json
 {
   "mode": "not_evaluated"
@@ -394,7 +392,6 @@ source fields the pin does not have (`added_fields`), or both
 Both are lists of names, not of field objects, and either is empty when only
 the other kind of drift occurred:
 
-<!-- proof: case=drift-failure path=schema_decision.drift -->
 ```json
 {
   "missing_fields": [
@@ -409,7 +406,6 @@ the other kind of drift occurred:
 Duplicate dataset field names (`duplicate_fields`), which cannot be matched
 against the pin at all:
 
-<!-- proof: case=duplicate path=schema_decision.drift -->
 ```json
 {
   "duplicate_fields": [
@@ -425,7 +421,6 @@ declared types enter a schema only through declaration, so each entry names
 the field, its `pinned_type`, and the `effective_type` the source would
 otherwise produce:
 
-<!-- proof: case=undeclared path=schema_decision.drift -->
 ```json
 {
   "undeclared_fields": [
@@ -447,7 +442,6 @@ so it fails with `schema_override_conflict` and `drift_status:
 not_applicable`. `conflict` names the `field`, its `pinned` properties, and
 the `override` — which lists only the properties the override actually set:
 
-<!-- proof: case=conflict path=schema_decision.conflict -->
 ```json
 {
   "field": "amount",
@@ -465,11 +459,13 @@ the `override` — which lists only the properties the override actually set:
 ### `transform` and `overrides` echoes
 
 When the definition declared a structural transform or per-field overrides,
-every decision this load reports — success and failure alike — echoes them as
-written, with unset keys omitted. The transform echo carries `flatten`,
-`select`, and `rename` exactly as the definition set them:
+every schema decision the load reached echoes them as written, with unset
+keys omitted — the decisions its failures carry included, which is what makes
+a failed load's decision readable. A load that failed before any schema work
+reports `mode: not_evaluated`, and that decision carries no echoes. The
+transform echo carries `flatten`, `select`, and `rename` exactly as the
+definition set them:
 
-<!-- proof: case=transform path=schema_decision.transform -->
 ```json
 {
   "flatten": {
@@ -486,7 +482,6 @@ written, with unset keys omitted. The transform echo carries `flatten`,
 }
 ```
 
-<!-- proof: case=transform path=schema_decision.overrides -->
 ```json
 [
   {
@@ -517,7 +512,6 @@ source field ([ADR-0040](../adr/0040-apply-structural-transforms-before-schema-p
 
 On a successful load, `written` is `source` minus `rejected`:
 
-<!-- proof: case=rejected path=row_counts -->
 ```json
 {
   "source": 3,
@@ -531,7 +525,6 @@ is `0` when the failure preceded the read finishing, and `written` counts
 only what the destination had already committed — for an append that failed
 part way, the committed chunk prefix:
 
-<!-- proof: case=duckdb-prefix path=row_counts -->
 ```json
 {
   "source": 2,
@@ -547,7 +540,6 @@ part way, the committed chunk prefix:
 | `source` | The source file's size in bytes, measured when it was opened. |
 | `destination` | The bytes the destination wrote, or `null` when it has no honest count. |
 
-<!-- proof: case=parquet path=byte_counts -->
 ```json
 {
   "source": 284,
@@ -571,8 +563,10 @@ Both counts are `null` in every failure report.
 | `duration_ms` | `finished_unix_ms` minus `started_unix_ms`. |
 
 The clock is the system wall clock, so the timestamps are comparable across
-loads only as far as that clock is. The window covers the whole load,
-including reading the definition and writing the artifacts.
+loads only as far as that clock is. The window opens before the definition is
+read and closes once the destination write has finished — the rejected
+records are streamed inside it, but assembling and writing the report itself
+falls outside it, so `duration_ms` measures the load, not the reporting.
 
 ## `rejected_records`
 
@@ -586,7 +580,6 @@ Governing ADRs:
 | `count` | How many records were rejected. Mirrors `row_counts.rejected`. |
 | `artifact` | The rejected-records file, or `null` when nothing was rejected. |
 
-<!-- proof: case=rejected path=rejected_records -->
 ```json
 {
   "count": 1,
@@ -598,16 +591,9 @@ The artifact is `rejected-records.jsonl` inside this load's artifact
 directory, one JSON object per rejected record. It is streamed while the
 source is read, so it exists before the report that names it — including on
 failures. A load that rejected more records than `reject_threshold` tolerates
-fails with `reject_threshold_exceeded`, and still reports the records it had
-rejected and the artifact it wrote them to:
-
-<!-- proof: case=threshold path=rejected_records -->
-```json
-{
-  "count": 1,
-  "artifact": ".data-spark/runs/<load_id>/rejected-records.jsonl"
-}
-```
+fails with `reject_threshold_exceeded`, and reports exactly the same two
+fields: the records it had rejected before it stopped, and the artifact it
+wrote them to.
 
 ## `destination_write`
 
@@ -643,7 +629,6 @@ A full refresh commits once, terminally, so a full refresh that failed before
 that commit leaves the destination dataset unchanged and reports
 `not_applicable`:
 
-<!-- proof: case=drift-failure path=destination_write -->
 ```json
 {
   "atomicity": "not_applicable"
@@ -655,7 +640,6 @@ An append commits per chunk
 so a failure after the first commit has genuinely changed the destination
 dataset, and says so:
 
-<!-- proof: case=duckdb-prefix path=destination_write -->
 ```json
 {
   "atomicity": "best_effort",
@@ -697,7 +681,6 @@ The load entered the write phase: records were exchanged as Arrow
 Every successful load has this posture, and so does every failure that
 happened once the destination session was open.
 
-<!-- proof: case=parquet-append path=execution -->
 ```json
 {
   "record_format": "arrow_record_batch",
@@ -748,7 +731,6 @@ not be written, a destination session that would not open. The chunk bound,
 parallelism, and limit are omitted rather than reported as values that never
 took effect:
 
-<!-- proof: case=threshold path=execution -->
 ```json
 {
   "record_format": "not_started",
@@ -776,7 +758,7 @@ classified transient
 so nothing is ever retried, and the `not_started` posture therefore never
 carries `retry` at all today. The entry shape below is part of the version 1
 contract for the connectors that will — it is the only block in this
-reference no run can currently produce:
+reference no load can currently produce:
 
 ```json
 {
@@ -826,7 +808,6 @@ its artifacts at all.
 | `code` | The stable machine-readable failure code. |
 | `message` | The human-readable message, also printed by the load summary. |
 
-<!-- proof: case=unsupported-mode path=error_summary -->
 ```json
 {
   "code": "unsupported_load_mode",
@@ -839,7 +820,9 @@ is not a contract. A load reports the first failure it hit: checks run in a
 fixed order and the first one to fail ends the load
 ([ADR-0019](../adr/0019-validate-schema-and-load-rules-before-writing.md)).
 
-The codes this binary emits, in the order their checks run:
+The codes this binary emits, in the order their checks run. The
+definition-level codes are explained in context, key by key, in the
+[Load Definition Reference](load-definition.md):
 
 | Phase | `code` | Raised when |
 | --- | --- | --- |
@@ -880,8 +863,10 @@ are not `error_summary` codes.
 
 ## Compatibility within `report_version: 1`
 
-Governing ADR:
-[ADR-0026](../adr/0026-version-load-definitions-and-reports.md).
+[ADR-0026](../adr/0026-version-load-definitions-and-reports.md) fixes the
+versioning contract: a report declares the version that decides how it is
+read. What follows is not a further decision but a description — how version
+1 has actually been extended so far, and what a reader can therefore lean on.
 
 A reader of version 1 reports may rely on:
 
@@ -922,9 +907,10 @@ a breaking change, and would come with a new `report_version`.
 
 ## Complete examples
 
-Both reports below come from real runs of the same load definition, one after
+Both reports below come from two real loads of the same definition, one after
 the other. Only `load_id`, the `artifact_dir` that embeds it, and the three
-`timings` values are specific to those runs; everything else is reproducible.
+`timings` values are specific to those two loads; everything else is
+reproducible.
 
 The definition pins its schema and fails on drift:
 
@@ -946,10 +932,9 @@ schema:
 
 ### A load that succeeded
 
-The first run: three JSONL records into a DuckDB table, with the pin
+The first load: three JSONL records into a DuckDB table, with the pin
 bootstrapped from this load's own inference.
 
-<!-- proof: case=success -->
 ```json
 {
   "report_version": 1,
@@ -1037,11 +1022,10 @@ bootstrapped from this load's own inference.
 
 ### A load that failed
 
-The next run of the same definition, after the source file lost `placed_at`
+The next load of the same definition, after the source file lost `placed_at`
 and gained `channel`. The pin is unchanged, the destination table is
 untouched, and the drift detail says exactly what moved.
 
-<!-- proof: case=drift-failure -->
 ```json
 {
   "report_version": 1,
