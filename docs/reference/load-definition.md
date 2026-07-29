@@ -110,9 +110,11 @@ version: 1
 ```
 
 - Omitting `version` fails the load with `missing_load_definition_version`.
-- Any other integer fails with `unsupported_load_definition_version` and a
-  message naming the declared version.
-- A non-integer value fails YAML parsing (`invalid_load_definition_yaml`).
+- Any other non-negative integer fails with
+  `unsupported_load_definition_version` and a message naming the declared
+  version.
+- A negative or non-integer value fails YAML parsing
+  (`invalid_load_definition_yaml`).
 
 A newer definition that carries keys this contract does not declare fails on
 the unknown key first (see [Strictness](#strictness-unknown-keys-are-rejected)),
@@ -372,7 +374,7 @@ Governing ADRs:
 [ADR-0034](../adr/0034-validate-pinned-schemas-by-name-with-lattice-widening.md),
 [ADR-0035](../adr/0035-reject-pinned-value-misfits-per-record.md).
 
-The path of the pinned schema file the load reuses across runs to keep a
+The path of the pinned schema file the load reuses across loads to keep a
 BI-ready dataset stable.
 
 ```yaml
@@ -389,9 +391,9 @@ The file works like a lockfile, bootstrapped by the first load:
   load never persists a pin for records it refused.
 - **File present**: the load parses it and validates observed records
   against it by field name, not position. A field's observed type is
-  accepted when it widens to the pinned type under the inference lattice: an
-  all-null field matches any pinned type, `int64` widens to `float64`, and
-  anything widens to `utf8`. Declared types are exactly equal or different —
+  accepted when it widens to the pinned type under the same lattice
+  [inference](#schema) uses: an all-null field matches any pinned type,
+  `int64` widens to `float64`, and anything widens to `utf8`. Declared types are exactly equal or different —
   no widening involves them. Matching loads materialize records in the pin's
   field order, so the destination keeps a stable field order even when the
   source reorders fields.
@@ -606,8 +608,8 @@ carrying at least one digit on each side (`1.` and `.5` reject): no exponent
 notation, no thousands separators, no whitespace. Fewer fractional digits
 than the scale rescale losslessly (`1.2` into `decimal(10,2)` stores
 `1.20`); more fractional digits reject per record, because rounding never
-happens in a load; a magnitude of `p` or more digits after scaling rejects
-as overflow. In JSONL, strings and integers fit, while JSON floats reject
+happens in a load; a magnitude of more than `p` digits after scaling rejects
+as overflow (exactly `p` digits fits). In JSONL, strings and integers fit, while JSON floats reject
 per record — their exact digits were already lost to IEEE parsing before the
 load saw them — and booleans, arrays, and objects reject as shape misfits.
 
