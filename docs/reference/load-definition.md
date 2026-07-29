@@ -15,11 +15,13 @@ A definition runs with:
 data-spark load [--output-dir <dir>] <definition.yml>
 ```
 
-Every load — success or failure — writes a JSON load report
+A load — success or failure — writes a JSON load report
 (`load-report.json`) into its artifact directory and exits `0` on success or
-`1` on failure. The failure codes named throughout this reference appear in
-the report's `error_summary.code`. The load report contract is documented
-separately.
+`1` on failure. The one exception is a failure to produce the load artifacts
+themselves — an artifact directory that cannot be created, or an artifact
+write that fails — which aborts the load with exit code `1` and no report.
+The failure codes named throughout this reference appear in the report's
+`error_summary.code`. The load report contract is documented separately.
 
 ## Conventions in this reference
 
@@ -741,9 +743,11 @@ artifacts:
 
 Every load creates its own artifact directory, `<root>/<load-id>/`, and
 writes `load-report.json` there — plus `rejected-records.jsonl` when any
-records were rejected, and nothing else. The `--output-dir` command-line
-option is the one-off override: it redirects the artifact root for that
-invocation and takes precedence over `artifacts.dir`.
+records were rejected, and nothing else. A load that cannot create its
+artifact directory or write its artifacts aborts with exit code `1` and no
+report. The `--output-dir` command-line option is the one-off override: it
+redirects the artifact root for that invocation and takes precedence over
+`artifacts.dir`.
 
 ## Strictness: unknown keys are rejected
 
