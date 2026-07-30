@@ -725,6 +725,66 @@ The threshold interacts with the rejected-records artifact
 - The artifact is written for failing and completing loads alike, and the
   load report states the rejected-record count and the artifact path.
 
+### When every record is rejected
+
+The gate is judged over the whole input, so a source whose every record
+rejects is not a special case of it. What the load does after the gate
+depends on whether a dataset schema can be resolved with no record left to
+observe, and that differs by source format.
+
+| Source | Threshold | Outcome |
+| --- | --- | --- |
+| CSV or JSONL | does not tolerate them | Fails with `reject_threshold_exceeded`, the message naming the full-input counts: `rejected 2 of 2 records, exceeding the reject threshold of 0`. |
+| JSONL | tolerates them all | Fails with `malformed_jsonl`. JSONL carries no header, so a file with no parseable record offers no field names, and no schema can be inferred. |
+| CSV | tolerates them all | **Succeeds.** The header resolves the dataset schema without needing a record, so the load completes and materializes that schema with no records in it. |
+
+Both failing rows leave the destination untouched —
+`destination_write.atomicity` is `not_applicable` and
+`execution.record_format` is `not_started` — and both write the
+rejected-records artifact, as any load that rejects a record does.
+
+`schema_decision.mode` on those failures states what the load had resolved
+when it stopped, which is a different question from which code fired. A CSV
+threshold breach reports `inferred` (or `pinned`) and carries the `fields` it
+had resolved, because the header resolves a schema whatever the records do —
+and so does a JSONL threshold breach that had at least one parseable record
+to infer from. `not_evaluated` belongs to the source that offered no shape at
+all, an all-unparseable JSONL file, under either code.
+
+### When a load completes with no surviving records
+
+The CSV row above enters the write phase like any other load:
+`execution.record_format` is `arrow_record_batch` and `batch_count` is `1`,
+because an empty surviving run still yields one empty chunk, so an empty
+dataset materializes its schema
+([ADR-0046](../adr/0046-resolve-then-stream-connector-ports-with-chunked-sessions.md)).
+[`load_mode`](#load_mode) decides what that does to the destination dataset:
+
+| `load_mode` | Effect |
+| --- | --- |
+| `full_refresh` | The dataset is replaced by an empty one — a populated dataset loses every record it held. |
+| `append` | No records are added, so the dataset keeps every record it already held. |
+
+Both are ordinary writes, reporting the write posture their
+[destination](#destination) and mode always report — `atomic` /
+`transactional_replace` for a `duckdb` full refresh, and so on. The
+materialization is destination-independent: `duckdb` creates or replaces the
+table with no rows, and `parquet` writes a real part file holding zero
+records and the dataset's full field list, including on the append that added
+nothing, which lands one more empty part beside the dataset's existing ones.
+
+A `full_refresh` whose delivery arrived entirely unloadable therefore empties
+a dataset and exits `0`. The schema it leaves behind is the one this load
+resolved, not the one the dataset had: a field no surviving record observed
+infers as `utf8`, like any [all-null field](#schema), so an emptied dataset
+can come back with wider types than the populated one had. A
+[pinned schema](#schemapinned_path) holds the types — a CSV header still
+carries every pinned field, so a zero-survivor load against a pin reports
+`pinned` with `drift_status: none` rather than drift. Keeping
+`reject_threshold` at its default `0`, or well below one delivery's record
+count, is what keeps a dataset that must never go empty from being emptied
+this way.
+
 ## `artifacts`
 
 Governing ADR:

@@ -189,7 +189,7 @@ can reach — plus the declared types `timestamp`, `timestamptz`, and
 | --- | --- |
 | `inferred` | The schema came from the observed source records ([ADR-0006](../adr/0006-infer-schemas-by-default.md)). A load that bootstraps a pin is `inferred`: it is this load's inference that becomes the pin. |
 | `pinned` | The schema came from an existing pinned schema file ([ADR-0033](../adr/0033-persist-pinned-schemas-as-versioned-yaml-files.md)). |
-| `not_evaluated` | The load failed before any schema work started. |
+| `not_evaluated` | The load reached no schema decision: it failed before schema resolution, or its source offered no shape to resolve one from — an all-unparseable JSONL file, which has no header to fall back on. |
 
 ### `drift_status`
 
@@ -461,7 +461,7 @@ the `override` — which lists only the properties the override actually set:
 When the definition declared a structural transform or per-field overrides,
 every schema decision the load reached echoes them as written, with unset
 keys omitted — the decisions its failures carry included, which is what makes
-a failed load's decision readable. A load that failed before any schema work
+a failed load's decision readable. A load that reached no schema decision
 reports `mode: not_evaluated`, and that decision carries no echoes. The
 transform echo carries `flatten`, `select`, and `rename` exactly as the
 definition set them:
@@ -845,7 +845,7 @@ definition-level codes are explained in context, key by key, in the
 | Read | `unsupported_source_format` | The resolved source format is neither `csv` nor `jsonl`. |
 | Read | `source_read_failed` | The source file could not be opened or read. |
 | Read | `malformed_csv` | The CSV header could not be parsed, or names no fields. |
-| Read | `malformed_jsonl` | No JSONL record has any field, so no schema can be inferred. |
+| Read | `malformed_jsonl` | No JSONL record has any field, so no schema can be inferred. When the records were rejected rather than absent, this code is reached only if `reject_threshold` tolerates every rejection; otherwise the threshold gate fires first ([all-rejected outcomes](load-definition.md#when-every-record-is-rejected)). |
 | Read | `unknown_transform_field` | The transform names a field absent from the observed source shape. |
 | Read | `transform_name_collision` | Two dataset fields would end up with the same name. |
 | Read | `unknown_override_field` | An override names a field absent from the dataset shape. |
