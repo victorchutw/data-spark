@@ -31,6 +31,17 @@ this repository's use of pull requests, and link their commit instead.
 
 ## [Unreleased]
 
+### Added
+
+- `data-spark --version` (and `-V`) prints the binary's version, and
+  `data-spark --help` now describes the `load` subcommand. **[contract]**
+  Every load report also names the binary that wrote it in a new top-level
+  `binary_version` string, on the success and the failure path alike, so an
+  archived report can be attributed to the release that produced it;
+  `report_version` stays `1`
+  ([ADR-0055](docs/adr/0055-surface-the-binary-version-as-version-output-and-top-level-report-provenance.md)).
+  ([#95])
+
 ### Fixed
 
 - The README's feature list presented retry and parallelism as active. No
@@ -289,3 +300,4 @@ one carried is listed under the stable release that followed — `0.1.0` and
 [#87]: https://github.com/victorchutw/data-spark/pull/87
 [#88]: https://github.com/victorchutw/data-spark/pull/88
 [#94]: https://github.com/victorchutw/data-spark/pull/94
+[#95]: https://github.com/victorchutw/data-spark/pull/95

@@ -15,6 +15,10 @@ A definition runs with:
 data-spark load [--output-dir <dir>] <definition.yml>
 ```
 
+`data-spark --version` (or `-V`) prints the binary's version — the value
+every load report echoes as its top-level `binary_version`
+([Load Report Reference](load-report.md#binary_version)).
+
 A load — success or failure — writes a JSON load report
 (`load-report.json`) into its artifact directory and exits `0` on success or
 `1` on failure. The one exception is a failure to produce the load artifacts

@@ -621,6 +621,11 @@ fn run_example(example: &Example) {
 
 fn assert_report(context: &str, stdout: &str, report: &Value, load: &Load) {
     assert_eq!(report["report_version"], 1, "{context}");
+    assert_eq!(
+        report["binary_version"],
+        env!("CARGO_PKG_VERSION"),
+        "{context}: the report names the binary version that wrote it"
+    );
     match load.failure_code {
         None => {
             assert_eq!(report["exit_status"], "succeeded", "{context}");

@@ -80,6 +80,11 @@ jobs:
           strip dist/data-spark-linux-x86_64
           chmod +x dist/data-spark-linux-x86_64
           ./dist/data-spark-linux-x86_64 --help
+          version_output="$(./dist/data-spark-linux-x86_64 --version)"
+          if [ "$version_output" != "data-spark ${GITHUB_REF_NAME#v}" ]; then
+            echo "Shipped binary reports '$version_output'; expected 'data-spark ${GITHUB_REF_NAME#v}'" >&2
+            exit 1
+          fi
           sha256sum dist/data-spark-linux-x86_64 | tee dist/SHA256SUMS
 
       - name: Create GitHub Release

@@ -13,6 +13,41 @@ use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 #[test]
+fn version_flags_print_the_package_version_and_exit_zero() {
+    for flag in ["--version", "-V"] {
+        let assert = Command::cargo_bin("data-spark")
+            .expect("binary")
+            .arg(flag)
+            .assert()
+            .success();
+        let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+        assert_eq!(
+            stdout.trim(),
+            format!("data-spark {}", env!("CARGO_PKG_VERSION")),
+            "{flag} names the binary and the version it was built from"
+        );
+    }
+}
+
+#[test]
+fn help_describes_the_load_subcommand() {
+    let assert = Command::cargo_bin("data-spark")
+        .expect("binary")
+        .arg("--help")
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let load_line = stdout
+        .lines()
+        .find(|line| line.trim_start().starts_with("load"))
+        .expect("--help lists the load subcommand");
+    assert!(
+        load_line.contains("Run a load from a YAML load definition"),
+        "the load subcommand carries a description, got: {load_line:?}"
+    );
+}
+
+#[test]
 fn local_csv_full_refresh_writes_readable_parquet_directory_report_and_summary() {
     let work = TempDir::new().expect("tempdir");
     let source_path = work.path().join("customers.csv");
@@ -97,6 +132,11 @@ load_mode: full_refresh
     assert_eq!(totals.value(1), 7.25);
 
     assert_eq!(report["report_version"], 1);
+    assert_eq!(
+        report["binary_version"],
+        env!("CARGO_PKG_VERSION"),
+        "the report names the binary version that wrote it"
+    );
     assert_eq!(report["exit_status"], "succeeded");
     assert_eq!(report["process_exit_code"], 0);
     assert_eq!(report["dataset"], "customers");
@@ -1218,6 +1258,11 @@ load_mode: full_refresh
     );
 
     assert_eq!(report["report_version"], 1);
+    assert_eq!(
+        report["binary_version"],
+        env!("CARGO_PKG_VERSION"),
+        "a failure report names the binary version that wrote it"
+    );
     assert_eq!(report["exit_status"], "failed");
     assert_eq!(report["process_exit_code"], 1);
     assert_eq!(report["error_summary"]["code"], "source_read_failed");

@@ -31,6 +31,9 @@ documented in the [Load Definition Reference](load-definition.md).
   every load, and the one value that embeds them — the `rejected_records`
   artifact path — is shown with `<load_id>` standing in for the id. Every
   other value shown is exactly what the binary wrote.
+- `binary_version` is different in every release: it names the binary that
+  wrote the block it appears in, so it tracks the release the examples were
+  captured against rather than the release you run.
 
 ## Where the report is written
 
@@ -67,6 +70,7 @@ from an empty one at the top level.
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `report_version` | integer | The load report version. Always `1`. |
+| `binary_version` | string | The version of the binary that wrote the report. |
 | `load_id` | string | The load's unique id. |
 | `artifact_dir` | string | The artifact directory this report was written into. |
 | `source_summary` | object | The definition's `source` block, echoed. |
@@ -93,6 +97,16 @@ the document is interpreted
 ([ADR-0026](../adr/0026-version-load-definitions-and-reports.md)). The only
 value this binary writes is `1`. A reader should check it first and refuse a
 report whose version it does not know.
+
+### `binary_version`
+
+The version of the Data Spark binary that wrote the report — the value
+`data-spark --version` prints, baked in at build time
+([ADR-0055](../adr/0055-surface-the-binary-version-as-version-output-and-top-level-report-provenance.md)).
+It is provenance, not contract: `report_version` says how to read the
+report, `binary_version` says which build wrote it, and the two are
+versioned independently. An archived report can be attributed to its
+release long after the load that wrote it.
 
 ### `load_id`
 
@@ -894,8 +908,10 @@ A reader should tolerate, without failing:
   the chunking and retry keys
   ([ADR-0046](../adr/0046-resolve-then-stream-connector-ports-with-chunked-sessions.md),
   [ADR-0050](../adr/0050-report-retry-as-a-policy-echo-with-per-failed-attempt-entries.md)),
-  and the parallelism keys
-  ([ADR-0053](../adr/0053-report-parallelism-as-the-effective-value-beside-the-connector-limit.md))
+  the parallelism keys
+  ([ADR-0053](../adr/0053-report-parallelism-as-the-effective-value-beside-the-connector-limit.md)),
+  and the binary-version provenance
+  ([ADR-0055](../adr/0055-surface-the-binary-version-as-version-output-and-top-level-report-provenance.md))
   were all added this way, without a version bump.
 - New values in `mode`, `drift_status`, `atomicity`, `strategy`,
   `record_format`, and `error_summary.code` — for instance, the strategy name
@@ -912,7 +928,7 @@ a breaking change, and would come with a new `report_version`.
 Both reports below come from two real loads of the same definition, one after
 the other. Only `load_id`, the `artifact_dir` that embeds it, and the three
 `timings` values are specific to those two loads; everything else is
-reproducible.
+reproducible from the definition and the two source snapshots shown.
 
 The definition pins its schema and fails on drift:
 
@@ -935,13 +951,20 @@ schema:
 ### A load that succeeded
 
 The first load: three JSONL records into a DuckDB table, with the pin
-bootstrapped from this load's own inference.
+bootstrapped from this load's own inference. `orders.jsonl` holds:
+
+```json
+{"order_id": 1001, "customer": "Ada", "amount": 42.5, "placed_at": "2026-01-05T09:30:00Z"}
+{"order_id": 1002, "customer": "Grace", "amount": 7.25, "placed_at": "2026-01-06T14:00:00Z"}
+{"order_id": 1003, "customer": "Edsger", "amount": 19.99, "placed_at": "2026-01-07T11:15:00Z"}
+```
 
 ```json
 {
   "report_version": 1,
-  "load_id": "0a44bd34-205a-4dbe-bef0-72a03ae50464",
-  "artifact_dir": ".data-spark/runs/0a44bd34-205a-4dbe-bef0-72a03ae50464",
+  "binary_version": "0.2.1",
+  "load_id": "c9ec9c01-8ce3-454a-b536-d8c0c71b4765",
+  "artifact_dir": ".data-spark/runs/c9ec9c01-8ce3-454a-b536-d8c0c71b4765",
   "source_summary": {
     "connector": "local_file",
     "path": "orders.jsonl",
@@ -987,7 +1010,7 @@ bootstrapped from this load's own inference.
     "rejected": 0
   },
   "byte_counts": {
-    "source": 284,
+    "source": 279,
     "destination": null
   },
   "rejected_records": {
@@ -1012,9 +1035,9 @@ bootstrapped from this load's own inference.
     }
   },
   "timings": {
-    "started_unix_ms": 1785311868200,
-    "finished_unix_ms": 1785311868380,
-    "duration_ms": 180
+    "started_unix_ms": 1785396627637,
+    "finished_unix_ms": 1785396627896,
+    "duration_ms": 259
   },
   "exit_status": "succeeded",
   "process_exit_code": 0,
@@ -1025,14 +1048,23 @@ bootstrapped from this load's own inference.
 ### A load that failed
 
 The next load of the same definition, after the source file lost `placed_at`
-and gained `channel`. The pin is unchanged, the destination table is
-untouched, and the drift detail says exactly what moved.
+and gained `channel`. `orders.jsonl` now holds:
+
+```json
+{"order_id": 1004, "customer": "Alan", "amount": 3.5, "channel": "web"}
+{"order_id": 1005, "customer": "Barbara", "amount": 120.0, "channel": "store"}
+{"order_id": 1006, "customer": "Donald", "amount": 55.25, "channel": "web"}
+```
+
+The pin is unchanged, the destination table is untouched, and the drift
+detail says exactly what moved.
 
 ```json
 {
   "report_version": 1,
-  "load_id": "18f3af28-7910-4e75-8deb-9797745fead3",
-  "artifact_dir": ".data-spark/runs/18f3af28-7910-4e75-8deb-9797745fead3",
+  "binary_version": "0.2.1",
+  "load_id": "4d07ddaf-2731-4e8f-8b4a-518093a781b0",
+  "artifact_dir": ".data-spark/runs/4d07ddaf-2731-4e8f-8b4a-518093a781b0",
   "source_summary": {
     "connector": "local_file",
     "path": "orders.jsonl",
@@ -1100,9 +1132,9 @@ untouched, and the drift detail says exactly what moved.
     "batch_count": 0
   },
   "timings": {
-    "started_unix_ms": 1785311877759,
-    "finished_unix_ms": 1785311877759,
-    "duration_ms": 0
+    "started_unix_ms": 1785396634976,
+    "finished_unix_ms": 1785396634977,
+    "duration_ms": 1
   },
   "exit_status": "failed",
   "process_exit_code": 1,

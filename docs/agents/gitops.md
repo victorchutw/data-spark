@@ -199,7 +199,7 @@ git tag -a v0.1.0-alpha.1 -m "Release v0.1.0-alpha.1"
 git push origin v0.1.0-alpha.1
 ```
 
-The release workflow validates that the tag version matches `Cargo.toml`, runs the Rust checks, builds one Linux x86_64 release binary, smoke-tests `--help`, and publishes a GitHub Release with a single binary asset named `data-spark-linux-x86_64`. Stable tags such as `v0.1.0` are marked latest; prerelease tags such as `v0.1.0-alpha.1` are marked prerelease and are not latest.
+The release workflow validates that the tag version matches `Cargo.toml`, runs the Rust checks, builds one Linux x86_64 release binary, smoke-tests `--help` and that the built binary's `--version` output carries the tag's version, and publishes a GitHub Release with a single binary asset named `data-spark-linux-x86_64`. Stable tags such as `v0.1.0` are marked latest; prerelease tags such as `v0.1.0-alpha.1` are marked prerelease and are not latest.
 
 The release workflow never saves a build cache: its `Swatinem/rust-cache@v2`
 step is restore-only (`save-if: "false"`, with a `shared-key` equal to the
