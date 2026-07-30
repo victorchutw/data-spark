@@ -22,6 +22,10 @@ use connector::{
 use dispatch::WritePhaseFailure;
 
 const LOAD_REPORT_VERSION: u8 = 1;
+/// The version of the binary itself (`CARGO_PKG_VERSION`), printed by
+/// `--version` and echoed in every load report as the top-level
+/// `binary_version` provenance field (ADR-0055).
+const BINARY_VERSION: &str = env!("CARGO_PKG_VERSION");
 const LOAD_REPORT_FILENAME: &str = "load-report.json";
 const SUPPORTED_LOAD_DEFINITION_VERSION: u64 = 1;
 /// The default chunk bound of `execution.chunk_rows` (ADR-0046): loads
@@ -30,6 +34,7 @@ const DEFAULT_CHUNK_ROWS: u64 = 65536;
 
 #[derive(Parser)]
 #[command(name = "data-spark")]
+#[command(version)]
 #[command(about = "Portable data movement CLI")]
 struct Cli {
     #[command(subcommand)]
@@ -38,6 +43,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run a load from a YAML load definition
     Load(LoadArgs),
 }
 
@@ -51,6 +57,7 @@ struct LoadArgs {
 #[derive(Serialize)]
 struct LoadReport {
     report_version: u8,
+    binary_version: &'static str,
     load_id: String,
     artifact_dir: String,
     source_summary: Value,
@@ -80,6 +87,7 @@ impl LoadReport {
         let rejected_records = RejectedRecordFacts::facts(details.rejected_count, &artifact_dir);
         LoadReport {
             report_version: LOAD_REPORT_VERSION,
+            binary_version: BINARY_VERSION,
             load_id,
             artifact_dir,
             source_summary: details.source_summary,
@@ -138,6 +146,7 @@ impl LoadReport {
         };
         LoadReport {
             report_version: LOAD_REPORT_VERSION,
+            binary_version: BINARY_VERSION,
             load_id,
             artifact_dir,
             source_summary: failure.source_summary,
@@ -1137,6 +1146,7 @@ mod tests {
         );
 
         assert_eq!(report.report_version, LOAD_REPORT_VERSION);
+        assert_eq!(report.binary_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(report.load_id, "load-under-test");
         assert_eq!(report.artifact_dir, "artifacts/load-under-test");
         assert_eq!(report.source_summary, json!({ "connector": "local_file" }));
@@ -1233,6 +1243,7 @@ mod tests {
         );
 
         assert_eq!(report.report_version, LOAD_REPORT_VERSION);
+        assert_eq!(report.binary_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(report.load_id, "load-under-test");
         assert_eq!(report.artifact_dir, "artifacts/load-under-test");
         assert_eq!(report.source_summary, json!({ "connector": "local_file" }));

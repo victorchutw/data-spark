@@ -104,6 +104,10 @@ _Avoid_: Run report, log, audit file
 The declared contract version that determines how a load report is interpreted by readers.
 _Avoid_: Report schema, output version
 
+**Binary Version**:
+The version of the Data Spark binary itself, printed by `--version` and echoed in every load report as provenance for the build that wrote it.
+_Avoid_: App version, build number, release version
+
 **Load Summary**:
 A human-readable description of a load's outcome.
 _Avoid_: Console report, status output

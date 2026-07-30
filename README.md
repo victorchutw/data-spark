@@ -48,13 +48,13 @@ gh release download --repo victorchutw/data-spark --pattern data-spark-linux-x86
 ```
 
 Verify the download against the SHA256 published in the release notes, make it
-executable, and check that it runs:
+executable, and check that it runs and which version it is:
 
 ```bash
 sha256sum data-spark-linux-x86_64
 # compare the output with the SHA256 line in the release notes
 chmod +x data-spark-linux-x86_64
-./data-spark-linux-x86_64 --help
+./data-spark-linux-x86_64 --version
 ```
 
 Optionally install it into a directory on your `PATH` (the quickstart below
@@ -128,8 +128,9 @@ Each load writes its artifacts to its own artifact directory —
 `.data-spark/runs/<load-id>/` by default, or under the directory given with
 `data-spark load --output-dir <dir>` — and the load report lands there as
 `load-report.json`. A trimmed example of the report above (the full report
-also records source and destination summaries, byte counts, rejected-record
-facts, execution details, and timings):
+also records the producing binary's version, source and destination
+summaries, byte counts, rejected-record facts, execution details, and
+timings):
 
 ```json
 {
@@ -191,7 +192,10 @@ and says which audience each one is for.
 Releases follow [SemVer](https://semver.org/) and are cut from `v`-prefixed
 tags. The load definition contract (`version` in the YAML) and the load report
 contract (`report_version` in the JSON) are versioned independently of the
-binary, so both writers and readers can rely on the declared version.
+binary, so both writers and readers can rely on the declared version. The
+binary names its own version too: `data-spark --version` prints it, and every
+load report echoes it as a top-level `binary_version` field, so an archived
+report can be attributed to the release that wrote it.
 
 ## License
 
