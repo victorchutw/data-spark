@@ -8,16 +8,23 @@ and this project adheres to
 
 ## Scope of these entries
 
-An entry describes something a user of the CLI can observe: a feature, a
-behavior change, a fix, or a change to one of the versioned contracts.
-Behavior-preserving refactors and repository automation — CI and release
-workflow changes — are deliberately absent.
+An entry describes something a user of Data Spark can observe: a feature, a
+behavior change, a fix, a change to one of the versioned contracts, or a
+change to what the project publishes about itself — its documentation, its
+examples, and its license. Behavior-preserving refactors and repository
+automation — CI and release workflow changes — are deliberately absent.
 
-Entries marked **[contract]** add or change a key in a versioned contract: the
-[load definition YAML](docs/reference/load-definition.md), the
+Entries marked **[contract]** add or change a *key* in a versioned contract:
+the [load definition YAML](docs/reference/load-definition.md), the
 [load report JSON](docs/reference/load-report.md), the pinned schema file, or
-the rejected-records artifact. Every such change so far has been additive, so
-no contract version has been bumped past `1`.
+the rejected-records artifact. A new failure code is a new *value* of
+`error_summary.code`, which a version 1 reader is already required to
+tolerate, so failure codes are named in the prose without the mark.
+
+Every key added so far has been additive, which is why no contract version has
+been bumped past `1`. One change tightened an existing contract rather than
+extending it: rejecting unknown keys ([#54]) fails load definitions that older
+binaries accepted.
 
 Each entry links the pull request that made the change. The two entries from
 before this repository used pull requests link their commit instead.
@@ -104,10 +111,11 @@ through bounded-memory chunks instead of materializing the whole source.
 
 ### Changed
 
-- `execution.batch_count` now counts the chunks committed to the destination
-  rather than always being `1`. Write-phase failures report the committed
-  chunk count and an honest `row_counts.written`; pre-write failures keep
-  their `not_started` posture unchanged. **[contract]** ([#64])
+- `execution.batch_count` counts the chunks committed to the destination, as it
+  always did, but a load can now commit more than one, so the value varies with
+  `chunk_rows` instead of always being `1`. Write-phase failures report the
+  committed chunk count and an honest `row_counts.written`; pre-write failures
+  keep their `not_started` posture unchanged. ([#64])
 - A source that changes between the resolution pass and the write pass fails
   the load with the new `source_changed_during_load` code instead of writing
   records the resolved plan never saw. ([#64])
@@ -132,7 +140,7 @@ pinning, rejected records, and a JSON load report for every load.
   `byte_counts`, `destination_write`, and `execution` report fields.
   ([`a31287d`], issue [#3])
 - Local JSONL source: one record per line, blank lines skipped, fields in
-  first-seen key order across the batch, and JSON's native types honored — so
+  first-seen key order over the full input, and JSON's native types honored — so
   a JSON string such as `"01234"` stays text instead of being retyped as a
   number. ([#19])
 - DuckDB destination connector (`connector: duckdb`), with the engine
@@ -195,15 +203,15 @@ pinning, rejected records, and a JSON load report for every load.
   failing the whole read, so the records around it still load. ([#45])
 - A source failure that happens before any schema is decided now reports the
   source and rejection counts already established, and applies
-  `reject_threshold` to them, instead of falling back to the not-run posture.
-  ([#45])
+  `reject_threshold` to them, instead of falling back to the `not_started`
+  posture. ([#45])
 
 ## Prerelease validation tags
 
-`v0.1.0-alpha.1` and `v0.1.1-alpha.1` exist only to validate the tag-driven
-release pipeline end to end; each was cut from `main` and carries no change of
-its own, so their contents are listed under the stable release that followed —
-`0.1.0` and `0.2.0` respectively.
+`v0.1.0-alpha.1` and `v0.1.1-alpha.1` were cut from `main` only to exercise the
+tag-driven release pipeline end to end, not to ship a milestone, so what each
+one carried is listed under the stable release that followed — `0.1.0` and
+`0.2.0` respectively.
 
 [Unreleased]: https://github.com/victorchutw/data-spark/compare/v0.2.0...main
 [0.2.0]: https://github.com/victorchutw/data-spark/releases/tag/v0.2.0
