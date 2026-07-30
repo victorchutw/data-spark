@@ -64,6 +64,18 @@ impl DestinationWrite {
     }
 }
 
+/// The report's `execution`: how the load ran, for the examples whose README
+/// documents it.
+struct Execution {
+    batch_count: u64,
+    chunk_rows: u64,
+    parallelism: u64,
+    connector_parallelism_limit: u64,
+    retry_max_attempts: u64,
+    retry_initial_delay_ms: u64,
+    retry_max_delay_ms: u64,
+}
+
 struct Example {
     /// The directory name under `examples/`.
     name: &'static str,
@@ -93,6 +105,11 @@ struct Load {
     rejection_codes: &'static [&'static str],
     /// Records the destination dataset holds once this load has finished.
     destination_records: u64,
+    /// Part files a Parquet dataset directory holds afterwards, for the examples
+    /// whose README counts them.
+    destination_parts: Option<u64>,
+    /// `execution`, where the README states how the load ran.
+    execution: Option<Execution>,
 }
 
 impl Load {
@@ -112,6 +129,8 @@ impl Load {
             drift_fields: &[],
             rejection_codes: &[],
             destination_records: 0,
+            destination_parts: None,
+            execution: None,
         }
     }
 
@@ -155,6 +174,16 @@ impl Load {
 
     fn destination_records(mut self, destination_records: u64) -> Self {
         self.destination_records = destination_records;
+        self
+    }
+
+    fn destination_parts(mut self, destination_parts: u64) -> Self {
+        self.destination_parts = Some(destination_parts);
+        self
+    }
+
+    fn execution(mut self, execution: Execution) -> Self {
+        self.execution = Some(execution);
         self
     }
 }
@@ -397,6 +426,34 @@ fn examples() -> Vec<Example> {
                 .rejection_codes(&["missing_required_field", "type_coercion_failed"])
                 .destination_records(2)],
         },
+        Example {
+            name: "chunked-execution",
+            destination: Destination::Parquet {
+                path: "readings-dataset",
+            },
+            // Five records under a chunk bound of two commit as three chunks,
+            // and an append commits one part file per chunk.
+            loads: vec![Load::succeeds("load.yml")
+                .row_counts(RowCounts {
+                    source: 5,
+                    written: 5,
+                    rejected: 0,
+                })
+                .write(DestinationWrite::best_effort("staged_part_append"))
+                .execution(Execution {
+                    batch_count: 3,
+                    chunk_rows: 2,
+                    // The definition asks for 4 and the connector's limit for
+                    // this mode is 1, so the clamp is what ran.
+                    parallelism: 1,
+                    connector_parallelism_limit: 1,
+                    retry_max_attempts: 5,
+                    retry_initial_delay_ms: 100,
+                    retry_max_delay_ms: 1000,
+                })
+                .destination_records(5)
+                .destination_parts(3)],
+        },
     ]
 }
 
@@ -538,6 +595,16 @@ fn run_example(example: &Example) {
             load.destination_records,
             "{context}: records the destination dataset holds afterwards"
         );
+        if let Some(parts) = load.destination_parts {
+            let Destination::Parquet { path } = &example.destination else {
+                panic!("{context}: only a Parquet dataset directory holds part files");
+            };
+            assert_eq!(
+                parquet_part_files(&example_dir.join(path)).len() as u64,
+                parts,
+                "{context}: part files the dataset directory holds afterwards"
+            );
+        }
     }
 
     assert_eq!(
@@ -620,6 +687,50 @@ fn assert_report(context: &str, stdout: &str, report: &Value, load: &Load) {
             "{context}: the dataset schema in output order"
         );
     }
+    if let Some(execution) = &load.execution {
+        let reported = &report["execution"];
+        assert_eq!(
+            reported["record_format"], "arrow_record_batch",
+            "{context}: a load that reached the write phase exchanged record batches"
+        );
+        assert_eq!(
+            reported["batch_count"], execution.batch_count,
+            "{context}: the chunks the destination committed"
+        );
+        assert_eq!(
+            reported["chunk_rows"], execution.chunk_rows,
+            "{context}: the effective chunk bound"
+        );
+        assert_eq!(
+            reported["parallelism"], execution.parallelism,
+            "{context}: the effective load parallelism"
+        );
+        assert_eq!(
+            reported["connector_parallelism_limit"], execution.connector_parallelism_limit,
+            "{context}: the connector's parallelism limit for this load mode"
+        );
+        let retry = &reported["retry"];
+        assert_eq!(
+            retry["max_attempts"], execution.retry_max_attempts,
+            "{context}: the retry policy echo"
+        );
+        assert_eq!(
+            retry["initial_delay_ms"], execution.retry_initial_delay_ms,
+            "{context}: the retry policy echo"
+        );
+        assert_eq!(
+            retry["max_delay_ms"], execution.retry_max_delay_ms,
+            "{context}: the retry policy echo"
+        );
+        // No shipped connector classifies a failure transient, so nothing is
+        // ever retried.
+        assert_eq!(
+            retry["attempts"].as_array().map(Vec::len),
+            Some(0),
+            "{context}: no attempt was retried"
+        );
+    }
+
     if !load.drift_fields.is_empty() {
         let named = match load.drift_status {
             "additive_fields_added" => field_pairs(&schema_decision["added_fields"], context)
@@ -751,25 +862,32 @@ fn duckdb_records(database_path: &Path, dataset: &str) -> u64 {
 }
 
 fn parquet_records(destination_path: &Path) -> u64 {
+    parquet_part_files(destination_path)
+        .iter()
+        .map(|path| {
+            let file = File::open(path).expect("open parquet file");
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("parquet reader");
+            builder.metadata().file_metadata().num_rows() as u64
+        })
+        .sum()
+}
+
+/// The part files a Parquet dataset directory holds, in name order.
+fn parquet_part_files(destination_path: &Path) -> Vec<PathBuf> {
     let mut files = fs::read_dir(destination_path)
         .expect("parquet destination directory")
         .map(|entry| entry.expect("destination entry").path())
         .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("parquet"))
         .collect::<Vec<_>>();
     files.sort();
+    for path in &files {
+        assert!(
+            file_name(path).starts_with("part-"),
+            "records land as part-*.parquet files: {}",
+            path.display()
+        );
+    }
     files
-        .iter()
-        .map(|path| {
-            assert!(
-                file_name(path).starts_with("part-"),
-                "records land as part-*.parquet files: {}",
-                path.display()
-            );
-            let file = File::open(path).expect("open parquet file");
-            let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("parquet reader");
-            builder.metadata().file_metadata().num_rows() as u64
-        })
-        .sum()
 }
 
 fn read_single_report(artifacts_dir: &Path, context: &str) -> Value {

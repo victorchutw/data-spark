@@ -165,8 +165,16 @@ source and destination pairs, both load modes, schema pinning and drift
 policies, structural transforms, declared types, and rejected records — and the
 test suite loads every one of them, so none of them can rot.
 
-User-facing reference documentation is being built out issue by issue. Today
-the repository carries maintainer- and agent-facing documentation:
+[docs/guides/](docs/guides/) works through one feature at a time, each guide
+starting from one of those examples: [schema
+pinning](docs/guides/schema-pinning.md), [rejected
+records](docs/guides/rejected-records.md), [declared
+types](docs/guides/declared-types.md), and [execution
+tuning](docs/guides/execution-tuning.md). Both contracts are documented key by
+key in the [Load Definition Reference](docs/reference/load-definition.md) and
+the [Load Report Reference](docs/reference/load-report.md).
+
+The repository also carries maintainer- and agent-facing documentation:
 [CONTEXT.md](CONTEXT.md) defines the ubiquitous language used throughout this
 README, and [docs/adr/](docs/adr/) records the architecture decisions behind
 the behavior described above.
