@@ -9,7 +9,7 @@ automation alike.
 
 ## Features
 
-As of v0.2.1:
+As of v0.3.0:
 
 - **Sources**: local CSV and JSONL files.
 - **Destinations**: DuckDB databases and Parquet datasets.
