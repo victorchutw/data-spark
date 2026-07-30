@@ -22,8 +22,8 @@ cd /tmp/pinned-schema-additive-drift
 data-spark load load-day-1.yml
 ```
 
-Every command, YAML fragment, and report excerpt below is real output, checked
-against the release binary.
+Every command below was run, and every YAML fragment and report excerpt is
+taken from a real load against the release binary.
 
 Pinning is two keys in the load definition:
 

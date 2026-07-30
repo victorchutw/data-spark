@@ -23,8 +23,9 @@ cd /tmp/chunked-execution
 data-spark load load.yml
 ```
 
-Every command, YAML fragment, and report excerpt below is real output, checked
-against the release binary. The `execution` block is the whole subject:
+Every command below was run, and every YAML fragment and report excerpt is
+taken from a real load against the release binary. The `execution` block is the
+whole subject:
 
 ```yaml
 execution:

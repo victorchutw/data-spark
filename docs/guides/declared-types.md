@@ -22,8 +22,8 @@ cd /tmp/declared-types
 data-spark load load.yml
 ```
 
-Every command, YAML fragment, and report excerpt below is real output, checked
-against the release binary.
+Every command below was run, and every YAML fragment and report excerpt is
+taken from a real load against the release binary.
 
 `payments.csv` holds three payments, two timestamps apart:
 

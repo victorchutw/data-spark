@@ -23,8 +23,8 @@ cd /tmp/rejected-records
 data-spark load load.yml
 ```
 
-Every command, YAML fragment, and report excerpt below is real output, checked
-against the release binary.
+Every command below was run, and every YAML fragment and report excerpt is
+taken from a real load against the release binary.
 
 `measurements.csv` is where the trouble is — one reading spelled `n/a`, one
 record with no station:
