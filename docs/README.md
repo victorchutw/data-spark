@@ -12,9 +12,9 @@ install the single binary, and a quickstart load. From there:
 
 | Where | What it holds |
 | --- | --- |
-| [../examples/](../examples/) | Small, self-contained, runnable load definitions with their fixture files, one per feature area. `cargo test --locked` runs every one of them against the built binary, so an example that stops working fails CI. |
+| [../examples/](../examples/) | Small, self-contained, runnable examples: a fixture, its load definitions, and a README saying what each demonstrates. `cargo test --locked` runs every one of them against the built binary ([tests/examples.rs](../tests/examples.rs)), so an example that stops working fails CI. |
 | [guides/](guides/) | Task-oriented walkthroughs, each starting from one of those examples and working through one feature at a time: [schema pinning](guides/schema-pinning.md), [rejected records](guides/rejected-records.md), [declared types](guides/declared-types.md), and [execution tuning](guides/execution-tuning.md). |
-| [reference/](reference/) | The two versioned contracts documented key by key: the [Load Definition Reference](reference/load-definition.md) (the YAML you write) and the [Load Report Reference](reference/load-report.md) (the JSON every load writes). |
+| [reference/](reference/) | The two contracts you write and read, documented key by key: the [Load Definition Reference](reference/load-definition.md) (the YAML you write) and the [Load Report Reference](reference/load-report.md) (the JSON every load writes). |
 
 What changed between releases is in [../CHANGELOG.md](../CHANGELOG.md).
 
@@ -33,9 +33,9 @@ What changed between releases is in [../CHANGELOG.md](../CHANGELOG.md).
 numbered in the order it was taken and named after the decision itself — so
 [`0033-persist-pinned-schemas-as-versioned-yaml-files.md`](adr/0033-persist-pinned-schemas-as-versioned-yaml-files.md)
 states its position in its filename, while the body carries the reasoning and
-the alternatives rejected. Each file carries a `status` field, and every decision
-so far is `accepted`. The reference and guide pages link the ADRs that govern
-the behavior they describe, which is the usual way in.
+the alternatives rejected, and a `status` field says whether it still stands.
+The reference and guide pages link the ADRs that govern the behavior they
+describe, which is the usual way in.
 
 [research/](research/) holds dated background notes written while making some
 of those decisions — a
