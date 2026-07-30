@@ -26,10 +26,13 @@ As of v0.2.1:
   configurable reject threshold that decides when the load fails.
 - **Chunked execution**: loads read, validate, and write in bounded chunks, so
   memory stays flat regardless of source size.
-- **Retry**: transient write failures are retried with backoff, and every
-  attempt is recorded in the load report.
-- **Parallelism**: chunk writes can run in parallel, capped by the limit each
-  destination connector declares per load mode.
+- **Retry**: write failures the destination connector classifies as transient
+  are re-attempted with exponential backoff, and every failed attempt is
+  recorded in the load report. No shipped connector classifies any failure as
+  transient, so nothing is retried on the sources and destinations above.
+- **Parallelism**: a bound on how many chunk writes a load may have in flight,
+  capped by the limit each destination connector declares per load mode. Both
+  shipped destinations declare a limit of 1, so every load ships serial today.
 - **Versioned contracts**: load definitions (YAML) and load reports (JSON)
   each carry an explicit contract version.
 
