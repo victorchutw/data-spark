@@ -54,6 +54,10 @@ this repository's use of pull requests, and link their commit instead.
   declared types, and execution tuning. ([#84])
 - This changelog, backfilled from the merged pull request history, plus a
   changelog step in the release flow in `docs/agents/gitops.md`. ([#86])
+- `docs/README.md` — a documentation index mapping each documentation tree to
+  the audience it serves, linked from the README so the front page reaches all
+  of them. `CONTEXT.md` gains the schema directive, schema decision, and drift
+  status terms that schema pinning left undefined. ([#87])
 
 ## [0.2.0] - 2026-07-22
 
@@ -244,3 +248,4 @@ one carried is listed under the stable release that followed — `0.1.0` and
 [#83]: https://github.com/victorchutw/data-spark/pull/83
 [#84]: https://github.com/victorchutw/data-spark/pull/84
 [#86]: https://github.com/victorchutw/data-spark/pull/86
+[#87]: https://github.com/victorchutw/data-spark/pull/87

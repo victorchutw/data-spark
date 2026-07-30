@@ -214,6 +214,14 @@ _Avoid_: Bad row, error row, dead letter
 A temporary data object prepared so a destination can load records through its native batch loading path.
 _Avoid_: Temp file, intermediate file, upload
 
+**Schema Directive**:
+The instruction a load definition gives about how a load arrives at its dataset schema: infer it, infer it and persist it as a new pinned schema, or validate observed records against an existing pinned schema.
+_Avoid_: Schema mode, schema config, schema strategy
+
+**Schema Decision**:
+The record of which dataset schema a load resolved, how it reached it, and what schema drift it found, reported as the load report's `schema_decision`.
+_Avoid_: Schema result, schema outcome, resolved schema
+
 **Inferred Schema**:
 A dataset schema produced from observed source records.
 _Avoid_: Auto schema, detected schema
@@ -257,6 +265,10 @@ _Avoid_: Drift handling, schema behavior
 **Additive Schema Drift**:
 Schema drift where the source has additional fields that can be added without changing existing fields.
 _Avoid_: Safe drift, new columns
+
+**Drift Status**:
+The outcome of comparing a load's observed record shape against its pinned schema: `not_applicable` when no comparison ran, `none` when the shapes matched, `additive_fields_added` when the drift policy admitted new fields, or `failed_on_drift` when it did not.
+_Avoid_: Drift result, drift state, drift outcome
 
 **BI-Ready Dataset**:
 A dataset that is typed, queryable, and stable enough for business intelligence tools.
