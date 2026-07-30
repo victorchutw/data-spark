@@ -39,9 +39,10 @@ this repository's use of pull requests, and link their commit instead.
   a local CSV or JSONL load into DuckDB or Parquet; both bullets now carry the
   shipped-matrix caveat the guides and the load definition reference already
   carried. Two decision records are corrected in place alongside it: ADR-0044
-  stated the decimal overflow bound off by one, when exactly `p` digits is what
-  `decimal(p,s)` holds, and ADR-0031 still deferred a question ADR-0035 had
-  answered. The behavior was always this; only the prose was wrong. ([#94])
+  stated the decimal overflow bound off by one, when exactly `p` digits is
+  what `decimal(p,s)` holds, and ADR-0031 still deferred a question that
+  ADR-0035 and ADR-0038 had since answered. The behavior was always this;
+  only the prose was wrong. ([#94])
 
 ## [0.2.1] - 2026-07-30
 

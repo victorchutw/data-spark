@@ -10,4 +10,4 @@ Accepted consequences:
 
 - A column that legitimately carries non-finite floats infers as text by default; loading it as Float64 requires a schema override or pinned schema (ADR-0006).
 - Text that saturates `f64` to infinity, such as `1e400`, degrades its column to text instead of silently becoming an infinite float.
-- How non-finite text behaves under a pinned or overridden Float64 schema — stored non-finite value versus a Rejected Record per `CONTEXT.md` — was out of scope here; ADR-0035 resolved it as a rejected record rather than a stored non-finite value.
+- How non-finite text behaves under a pinned or overridden Float64 schema — stored non-finite value versus a Rejected Record per `CONTEXT.md` — was out of scope here; ADR-0035 resolved it for pinned schemas and ADR-0038 for overrides, in both cases as a rejected record rather than a stored non-finite value.
