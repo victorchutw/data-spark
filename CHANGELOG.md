@@ -35,9 +35,9 @@ this repository's use of pull requests, and link their commit instead.
 
 Documentation, license, and examples. The binary behaves exactly as `0.2.0`
 does; what changes is what the project publishes about itself — the terms it
-is licensed under, a front page, a key-by-key reference for each of the two
-contracts you write and read, ten runnable examples, and a guide per feature
-area.
+is licensed under, a front page and a documentation index, a key-by-key
+reference for the load definition YAML and the load report JSON, ten runnable
+examples, a guide per feature area, and this changelog.
 
 ### Added
 
@@ -71,15 +71,17 @@ area.
   tolerate the rejections, `malformed_jsonl` for a JSONL source when it does,
   and a succeeding load for CSV, whose header resolves a schema without a
   record — and what a load that completes with no surviving records does to
-  each load mode's destination. ([#88])
+  each load mode's destination. The load report reference's `malformed_jsonl`
+  failure code points at that interaction. ([#88])
 
 ### Fixed
 
 - The load report reference described `schema_decision.mode: not_evaluated` as
   a load that failed before any schema work started. A CSV load that breaches
-  `reject_threshold` reports `inferred` instead, carrying the fields resolved
-  from its header, so the reference now states which failures reach which mode.
-  The behavior was always this; only the reference was wrong. ([#88])
+  `reject_threshold` reports `inferred` — or `pinned` under a pin — instead,
+  carrying the fields its header resolved, so the reference now states which
+  failures reach which mode. The behavior was always this; only the reference
+  was wrong. ([#88])
 
 ## [0.2.0] - 2026-07-22
 

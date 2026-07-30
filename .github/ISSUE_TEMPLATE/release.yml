@@ -30,6 +30,8 @@ body:
           required: true
         - label: Cargo.toml version matches the planned release version.
           required: true
+        - label: Every other place naming the version is updated — the data-spark entry in Cargo.lock and the README feature summary's "As of" line.
+          required: true
         - label: CHANGELOG.md has the Unreleased entries moved under the new version heading, with its Release link added and Unreleased re-pointed.
           required: true
         - label: CI is green on main.

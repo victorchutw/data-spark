@@ -167,7 +167,10 @@ Releases are tag-driven. Do not build and upload release binaries manually.
 
 1. Open a release issue using the release issue template.
 2. Confirm every included issue is closed or explicitly deferred.
-3. Update `Cargo.toml` to the release version.
+3. Update every place that names the version: `Cargo.toml`, the `data-spark`
+   entry in `Cargo.lock` — run any `cargo` command to regenerate it, or
+   `cargo build --locked` fails — and the `As of v<version>:` line above the
+   README's feature summary.
 4. Move every `Unreleased` entry in `CHANGELOG.md` under a new
    `## [<version>] - <YYYY-MM-DD>` heading dated with the release date, leaving
    `Unreleased` empty. In the link definitions at the bottom of the file, add
