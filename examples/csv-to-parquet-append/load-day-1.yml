@@ -1,0 +1,9 @@
+version: 1
+source:
+  connector: local_file
+  path: events-day-1.csv
+destination:
+  connector: parquet
+  path: events-dataset
+dataset: events
+load_mode: append

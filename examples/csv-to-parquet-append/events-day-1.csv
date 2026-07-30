@@ -1,0 +1,4 @@
+event_id,event_type,occurred_on,duration_seconds
+101,checkout,2026-03-01,12.5
+102,signup,2026-03-01,3.0
+103,checkout,2026-03-01,20.25

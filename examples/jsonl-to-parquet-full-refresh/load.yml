@@ -1,0 +1,10 @@
+version: 1
+source:
+  connector: local_file
+  path: inventory.jsonl
+  format: jsonl
+destination:
+  connector: parquet
+  path: inventory-dataset
+dataset: inventory
+load_mode: full_refresh

@@ -1,8 +1,8 @@
 # Rust build output
 /target/
 
-# Data Spark local load artifacts
-/.data-spark/
+# Data Spark local load artifacts, wherever a load ran from
+.data-spark/
 
 # Local scratch files; issues live in GitHub Issues.
 /.scratch/

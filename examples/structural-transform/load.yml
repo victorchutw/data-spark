@@ -1,0 +1,17 @@
+version: 1
+source:
+  connector: local_file
+  path: orders.jsonl
+  format: jsonl
+destination:
+  connector: duckdb
+  path: analytics.duckdb
+dataset: orders
+load_mode: full_refresh
+transform:
+  flatten:
+    customer.id: customer_id
+    customer.name: customer_name
+  select: [order_id, customer_id, customer_name, amount, placed_at]
+  rename:
+    placed_at: placed_on

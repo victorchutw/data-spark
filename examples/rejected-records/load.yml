@@ -1,0 +1,17 @@
+version: 1
+source:
+  connector: local_file
+  path: measurements.csv
+  format: csv
+destination:
+  connector: parquet
+  path: measurements-dataset
+dataset: measurements
+load_mode: full_refresh
+schema:
+  overrides:
+    - name: station
+      nullable: false
+    - name: reading
+      type: float64
+reject_threshold: 2

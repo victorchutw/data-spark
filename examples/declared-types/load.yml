@@ -1,0 +1,17 @@
+version: 1
+source:
+  connector: local_file
+  path: payments.csv
+  format: csv
+destination:
+  connector: duckdb
+  path: payments.duckdb
+dataset: payments
+schema:
+  overrides:
+    - name: paid_at
+      type: timestamp
+    - name: recorded_at
+      type: timestamptz
+    - name: amount
+      type: decimal(12,2)

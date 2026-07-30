@@ -1,0 +1,10 @@
+version: 1
+source:
+  connector: local_file
+  path: orders-day-1.jsonl
+  format: jsonl
+destination:
+  connector: duckdb
+  path: analytics.duckdb
+dataset: orders
+load_mode: full_refresh
