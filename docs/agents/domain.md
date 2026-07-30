@@ -31,7 +31,7 @@ Current contexts:
 
 | Context | Context doc | ADRs | Applies to |
 | ------- | ----------- | ---- | ---------- |
-| CLI/core | `CONTEXT.md` | `docs/adr/` | `src/`, `tests/`, `Cargo.toml`, `Cargo.lock`, `docs/`, repository workflows, release process |
+| CLI/core | `CONTEXT.md` | `docs/adr/` | `src/`, `tests/`, `examples/`, `Cargo.toml`, `Cargo.lock`, `docs/`, repository workflows, release process |
 
 For the current repository shape, most work is in `CLI/core`. If a future
 context is added, update `CONTEXT-MAP.md` first, then update this table.

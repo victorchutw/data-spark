@@ -64,6 +64,10 @@ install -D -m 0755 data-spark-linux-x86_64 ~/.local/bin/data-spark
 
 ## Quickstart: your first load
 
+This quickstart is also a runnable example —
+[examples/csv-to-duckdb-full-refresh](examples/csv-to-duckdb-full-refresh/) holds
+the same two files, and the test suite runs them on every build.
+
 Create a small CSV source:
 
 ```bash
@@ -155,6 +159,11 @@ facts, execution details, and timings):
 ```
 
 ## Documentation
+
+[examples/](examples/) holds small, self-contained, runnable examples — the four
+source and destination pairs, both load modes, schema pinning and drift
+policies, structural transforms, declared types, and rejected records — and the
+test suite loads every one of them, so none of them can rot.
 
 User-facing reference documentation is being built out issue by issue. Today
 the repository carries maintainer- and agent-facing documentation:

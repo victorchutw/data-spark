@@ -1,0 +1,13 @@
+version: 1
+source:
+  connector: local_file
+  path: invoices-day-2.csv
+  format: csv
+destination:
+  connector: duckdb
+  path: billing.duckdb
+dataset: invoices
+load_mode: full_refresh
+schema:
+  pinned_path: invoices.schema.yml
+  drift_policy: fail

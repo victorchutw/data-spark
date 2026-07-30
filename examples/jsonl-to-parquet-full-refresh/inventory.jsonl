@@ -1,0 +1,3 @@
+{"sku": "A-100", "warehouse": "berlin", "on_hand": 12, "counted_on": "2026-05-01"}
+{"sku": "A-200", "warehouse": "berlin", "on_hand": 0, "counted_on": "2026-05-01"}
+{"sku": "B-300", "warehouse": "lisbon", "on_hand": 45, "counted_on": "2026-05-01"}

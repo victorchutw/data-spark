@@ -1,0 +1,13 @@
+version: 1
+source:
+  connector: local_file
+  path: shipments-day-2.csv
+  format: csv
+destination:
+  connector: parquet
+  path: shipments-dataset
+dataset: shipments
+load_mode: full_refresh
+schema:
+  pinned_path: shipments.schema.yml
+  drift_policy: allow_additive_nullable

@@ -1,0 +1,10 @@
+version: 1
+source:
+  connector: local_file
+  path: customers.csv
+  format: csv
+destination:
+  connector: duckdb
+  path: customers.duckdb
+dataset: customers
+load_mode: full_refresh

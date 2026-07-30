@@ -1,0 +1,3 @@
+{"order_id": 3001, "customer": {"id": 88, "name": "Ada"}, "amount": 42.50, "placed_at": "2026-06-01", "channel": "web"}
+{"order_id": 3002, "customer": {"id": 91, "name": "Grace"}, "amount": 7.25, "placed_at": "2026-06-02", "channel": "web"}
+{"order_id": 3003, "customer": {"id": 88, "name": "Ada"}, "amount": 120.00, "placed_at": "2026-06-03", "channel": "store"}
