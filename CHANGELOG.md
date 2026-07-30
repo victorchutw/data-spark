@@ -31,6 +31,13 @@ this repository's use of pull requests, and link their commit instead.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-30
+
+The binary can now say which release it is: `--version` prints it, and every
+load report names the binary that wrote it. The documentation corrections
+ride along — the README's feature list and two decision records no longer
+contradict the shipped code.
+
 ### Added
 
 - `data-spark --version` (and `-V`) prints the binary's version, and
@@ -265,7 +272,8 @@ tag-driven release pipeline end to end, not to ship a milestone, so what each
 one carried is listed under the stable release that followed — `0.1.0` and
 `0.2.0` respectively.
 
-[Unreleased]: https://github.com/victorchutw/data-spark/compare/v0.2.1...main
+[Unreleased]: https://github.com/victorchutw/data-spark/compare/v0.3.0...main
+[0.3.0]: https://github.com/victorchutw/data-spark/releases/tag/v0.3.0
 [0.2.1]: https://github.com/victorchutw/data-spark/releases/tag/v0.2.1
 [0.2.0]: https://github.com/victorchutw/data-spark/releases/tag/v0.2.0
 [0.1.0]: https://github.com/victorchutw/data-spark/releases/tag/v0.1.0
