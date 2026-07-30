@@ -31,6 +31,14 @@ this repository's use of pull requests, and link their commit instead.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-07-30
+
+Documentation, license, and examples. The binary behaves exactly as `0.2.0`
+does; what changes is what the project publishes about itself — the terms it
+is licensed under, a front page, a key-by-key reference for each of the two
+contracts you write and read, ten runnable examples, and a guide per feature
+area.
+
 ### Added
 
 - Dual MIT OR Apache-2.0 licensing and Cargo package metadata, so the source
@@ -58,6 +66,20 @@ this repository's use of pull requests, and link their commit instead.
   the audience it serves, linked from the README so the front page reaches all
   of them. `CONTEXT.md` gains the schema directive, schema decision, and drift
   status terms that schema pinning left undefined. ([#87])
+- The load definition reference documents what a load does when every record is
+  rejected — `reject_threshold_exceeded` under a threshold that does not
+  tolerate the rejections, `malformed_jsonl` for a JSONL source when it does,
+  and a succeeding load for CSV, whose header resolves a schema without a
+  record — and what a load that completes with no surviving records does to
+  each load mode's destination. ([#88])
+
+### Fixed
+
+- The load report reference described `schema_decision.mode: not_evaluated` as
+  a load that failed before any schema work started. A CSV load that breaches
+  `reject_threshold` reports `inferred` instead, carrying the fields resolved
+  from its header, so the reference now states which failures reach which mode.
+  The behavior was always this; only the reference was wrong. ([#88])
 
 ## [0.2.0] - 2026-07-22
 
@@ -217,7 +239,8 @@ tag-driven release pipeline end to end, not to ship a milestone, so what each
 one carried is listed under the stable release that followed — `0.1.0` and
 `0.2.0` respectively.
 
-[Unreleased]: https://github.com/victorchutw/data-spark/compare/v0.2.0...main
+[Unreleased]: https://github.com/victorchutw/data-spark/compare/v0.2.1...main
+[0.2.1]: https://github.com/victorchutw/data-spark/releases/tag/v0.2.1
 [0.2.0]: https://github.com/victorchutw/data-spark/releases/tag/v0.2.0
 [0.1.0]: https://github.com/victorchutw/data-spark/releases/tag/v0.1.0
 [`0e4b7c9`]: https://github.com/victorchutw/data-spark/commit/0e4b7c971ee8d82a9114c22ff9d3175c1447c49f
@@ -249,3 +272,4 @@ one carried is listed under the stable release that followed — `0.1.0` and
 [#84]: https://github.com/victorchutw/data-spark/pull/84
 [#86]: https://github.com/victorchutw/data-spark/pull/86
 [#87]: https://github.com/victorchutw/data-spark/pull/87
+[#88]: https://github.com/victorchutw/data-spark/pull/88
