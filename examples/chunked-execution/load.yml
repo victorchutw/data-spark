@@ -1,0 +1,17 @@
+version: 1
+source:
+  connector: local_file
+  path: readings.csv
+  format: csv
+destination:
+  connector: parquet
+  path: readings-dataset
+dataset: readings
+load_mode: append
+execution:
+  chunk_rows: 2
+  parallelism: 4
+  retry:
+    max_attempts: 5
+    initial_delay_ms: 100
+    max_delay_ms: 1000

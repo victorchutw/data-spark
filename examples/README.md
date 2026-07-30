@@ -17,6 +17,7 @@ real binary and checks its load report, so an example that stops working fails C
 | [structural-transform](structural-transform/) | Flatten mapping, field selection, and rename mapping together. |
 | [declared-types](declared-types/) | Wall-clock timestamps, instant timestamps, and exact decimals declared through `schema.overrides`. |
 | [rejected-records](rejected-records/) | A nonzero `reject_threshold` and the `rejected-records.jsonl` artifact. |
+| [chunked-execution](chunked-execution/) | A small `chunk_rows` bound committing three chunks, the parallelism clamp, and the retry policy echo. |
 
 ## Running them
 
@@ -40,4 +41,6 @@ not scale.
 
 The keys these definitions use are documented in the [Load Definition
 Reference](../docs/reference/load-definition.md), and the reports they produce in
-the [Load Report Reference](../docs/reference/load-report.md).
+the [Load Report Reference](../docs/reference/load-report.md). The
+[guides](../docs/guides/) start from these examples and work through one feature
+at a time.
