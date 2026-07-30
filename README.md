@@ -178,7 +178,10 @@ the [Load Report Reference](docs/reference/load-report.md).
 The repository also carries maintainer- and agent-facing documentation:
 [CONTEXT.md](CONTEXT.md) defines the ubiquitous language used throughout this
 README, and [docs/adr/](docs/adr/) records the architecture decisions behind
-the behavior described above.
+the behavior described above. [docs/README.md](docs/README.md) indexes every
+documentation tree — the user-facing pages above, the working agreements in
+[docs/agents/](docs/agents/), the decision records, and the research notes —
+and says which audience each one is for.
 
 ## Versioning
 
