@@ -23,6 +23,9 @@ cd /tmp/rejected-records
 data-spark load load.yml
 ```
 
+Every command, YAML fragment, and report excerpt below is real output, checked
+against the release binary.
+
 `measurements.csv` is where the trouble is — one reading spelled `n/a`, one
 record with no station:
 
@@ -47,7 +50,7 @@ reject_threshold: 2
 ```
 
 Without the overrides this loads clean: inference would read `reading` as
-`utf8` because `n/a` is in the column, and a null station would be an
+`utf8` because `n/a` is one of its values, and a null station would be an
 ordinary null. Narrowing `reading` to its true type and declaring `station`
 required is exactly what makes two records unloadable — and narrowing on
 purpose, then rejecting the few values that made inference widen, is what
@@ -101,7 +104,7 @@ The example produces exactly two lines:
 
 `record` holds whatever survived parsing, which is not always an object: a
 malformed CSV record carries the fields it did find as a list
-(`"record":["4","1","234.00"]` for a row with one field too many), and a
+(`"record":["4","1","234.00"]` for a record with one field too many), and a
 truncated JSON line carries the raw text.
 
 No records rejected means no artifact — the report's
@@ -113,8 +116,8 @@ want it.
 
 `reject_threshold` is a top-level count and defaults to `0`
 ([ADR-0020](../adr/0020-default-reject-threshold-zero.md)), so out of the box
-a single unloadable record fails the load. That default is deliberate: a BI
-pipeline that quietly drops records is worse than one that stops.
+a single unloadable record fails the load. That default is deliberate: a
+dataset that quietly lost records is worse than a load that stopped.
 
 ```yaml
 reject_threshold: 2

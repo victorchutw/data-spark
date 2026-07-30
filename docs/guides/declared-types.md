@@ -22,6 +22,11 @@ cd /tmp/declared-types
 data-spark load load.yml
 ```
 
+Every command, YAML fragment, and report excerpt below is real output, checked
+against the release binary.
+
+`payments.csv` holds three payments, two timestamps apart:
+
 ```text
 payment_id,paid_at,recorded_at,amount
 4001,2026-07-01 09:30:00,2026-07-01T07:30:00Z,120.00
@@ -29,8 +34,8 @@ payment_id,paid_at,recorded_at,amount
 4003,2026-07-03 08:00:00,2026-07-03T06:00:00+02:00,1450.75
 ```
 
-Left to inference, all three of those columns would land as `utf8`, `utf8`,
-and `float64`. Three overrides say what they actually are:
+Left to inference, all three of those fields would land as `utf8`, `utf8`, and
+`float64`. Three overrides say what they actually are:
 
 ```yaml
 schema:
@@ -140,7 +145,7 @@ ORDER BY payment_id;
 | 4002 | 2026-07-02 14:05:30.25 | 2026-07-02 12:05:30.25+00 | 7.25 |
 | 4003 | 2026-07-03 08:00:00 | 2026-07-03 04:00:00+00 | 1450.75 |
 
-Two things to read out of that table. An instant renders in whatever
+Two things to read out of those values. An instant renders in whatever
 timezone the client is set to, so set it explicitly when comparing text; and
 `14:05:30.250` came back as `14:05:30.25` because the storage is microseconds,
 where a trailing zero carries no information.

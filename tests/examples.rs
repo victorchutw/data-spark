@@ -71,9 +71,14 @@ struct Execution {
     chunk_rows: u64,
     parallelism: u64,
     connector_parallelism_limit: u64,
-    retry_max_attempts: u64,
-    retry_initial_delay_ms: u64,
-    retry_max_delay_ms: u64,
+    retry: Retry,
+}
+
+/// The report's `execution.retry`: the policy echo, as the report names it.
+struct Retry {
+    max_attempts: u64,
+    initial_delay_ms: u64,
+    max_delay_ms: u64,
 }
 
 struct Example {
@@ -447,9 +452,11 @@ fn examples() -> Vec<Example> {
                     // this mode is 1, so the clamp is what ran.
                     parallelism: 1,
                     connector_parallelism_limit: 1,
-                    retry_max_attempts: 5,
-                    retry_initial_delay_ms: 100,
-                    retry_max_delay_ms: 1000,
+                    retry: Retry {
+                        max_attempts: 5,
+                        initial_delay_ms: 100,
+                        max_delay_ms: 1000,
+                    },
                 })
                 .destination_records(5)
                 .destination_parts(3)],
@@ -596,12 +603,9 @@ fn run_example(example: &Example) {
             "{context}: records the destination dataset holds afterwards"
         );
         if let Some(parts) = load.destination_parts {
-            let Destination::Parquet { path } = &example.destination else {
-                panic!("{context}: only a Parquet dataset directory holds part files");
-            };
             assert_eq!(
-                parquet_part_files(&example_dir.join(path)).len() as u64,
-                parts,
+                destination_parts(&example_dir, &example.destination),
+                Some(parts),
                 "{context}: part files the dataset directory holds afterwards"
             );
         }
@@ -711,16 +715,16 @@ fn assert_report(context: &str, stdout: &str, report: &Value, load: &Load) {
         );
         let retry = &reported["retry"];
         assert_eq!(
-            retry["max_attempts"], execution.retry_max_attempts,
-            "{context}: the retry policy echo"
+            retry["max_attempts"], execution.retry.max_attempts,
+            "{context}: the attempts the retry policy allows per retry unit"
         );
         assert_eq!(
-            retry["initial_delay_ms"], execution.retry_initial_delay_ms,
-            "{context}: the retry policy echo"
+            retry["initial_delay_ms"], execution.retry.initial_delay_ms,
+            "{context}: the retry policy's first backoff"
         );
         assert_eq!(
-            retry["max_delay_ms"], execution.retry_max_delay_ms,
-            "{context}: the retry policy echo"
+            retry["max_delay_ms"], execution.retry.max_delay_ms,
+            "{context}: the retry policy's backoff ceiling"
         );
         // No shipped connector classifies a failure transient, so nothing is
         // ever retried.
@@ -841,6 +845,17 @@ fn destination_records(example_dir: &Path, destination: &Destination) -> u64 {
     match destination {
         Destination::DuckDb { path, dataset } => duckdb_records(&example_dir.join(path), dataset),
         Destination::Parquet { path } => parquet_records(&example_dir.join(path)),
+    }
+}
+
+/// The part files the destination holds, where the destination is made of part
+/// files at all — a DuckDB table has none to count.
+fn destination_parts(example_dir: &Path, destination: &Destination) -> Option<u64> {
+    match destination {
+        Destination::DuckDb { .. } => None,
+        Destination::Parquet { path } => {
+            Some(parquet_part_files(&example_dir.join(path)).len() as u64)
+        }
     }
 }
 

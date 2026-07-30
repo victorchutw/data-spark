@@ -23,6 +23,9 @@ cd /tmp/chunked-execution
 data-spark load load.yml
 ```
 
+Every command, YAML fragment, and report excerpt below is real output, checked
+against the release binary. The `execution` block is the whole subject:
+
 ```yaml
 execution:
   chunk_rows: 2
@@ -151,6 +154,10 @@ happened.
 | `parquet` | `full_refresh` | `best_effort` | `staging_then_replace` |
 | `parquet` | `append` | `best_effort` | `staged_part_append` |
 
+Those four are the contract, stated in full — including what each value means
+and what a failure reports — under
+[`destination_write`](../reference/load-report.md#destination_write).
+
 The practical consequence: a `full_refresh` that fails costs you nothing but
 time, while a failed `append` leaves a committed prefix that loading the same
 source again would duplicate. Read `batch_count` and `row_counts.written`
@@ -159,7 +166,9 @@ from the failed load's report before re-loading an append.
 ## `retry`: what happens to a failed write
 
 The retry policy has three knobs, all optional
-([ADR-0049](../adr/0049-configure-retry-as-per-unit-attempts-with-fixed-exponential-backoff.md)):
+([ADR-0049](../adr/0049-configure-retry-as-per-unit-attempts-with-fixed-exponential-backoff.md),
+and documented as a contract under
+[`execution.retry`](../reference/load-definition.md#executionretry)):
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -236,7 +245,7 @@ All of it lands in the report's `execution` object
 
 The `not_started` posture omits `chunk_rows`, `parallelism`, and the limit
 rather than reporting values that never took effect, so a report with no
-`chunk_rows` is a load that never reached its destination.
+`chunk_rows` is a load that never reached its write phase.
 
 ## Where to look next
 

@@ -162,8 +162,9 @@ facts, execution details, and timings):
 
 [examples/](examples/) holds small, self-contained, runnable examples — the four
 source and destination pairs, both load modes, schema pinning and drift
-policies, structural transforms, declared types, and rejected records — and the
-test suite loads every one of them, so none of them can rot.
+policies, structural transforms, declared types, rejected records, and chunked
+execution — and the test suite loads every one of them, so none of them can
+rot.
 
 [docs/guides/](docs/guides/) works through one feature at a time, each guide
 starting from one of those examples: [schema

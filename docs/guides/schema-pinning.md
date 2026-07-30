@@ -22,6 +22,9 @@ cd /tmp/pinned-schema-additive-drift
 data-spark load load-day-1.yml
 ```
 
+Every command, YAML fragment, and report excerpt below is real output, checked
+against the release binary.
+
 Pinning is two keys in the load definition:
 
 ```yaml
@@ -106,7 +109,7 @@ these: selection makes it invisible, so it yields no drift under any policy.
 
 Failing is the default because a BI-ready dataset changing shape silently is
 worse than a load stopping ([ADR-0007](../adr/0007-fail-fast-on-schema-drift.md)).
-Choose `allow_additive_nullable` when the source is expected to grow columns
+Choose `allow_additive_nullable` when the source is expected to grow fields
 you want the destination dataset to grow with — and keep in mind that it
 admits *additions* only.
 
