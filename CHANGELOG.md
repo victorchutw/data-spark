@@ -26,8 +26,8 @@ been bumped past `1`. One change tightened an existing contract rather than
 extending it: rejecting unknown keys ([#54]) fails load definitions that older
 binaries accepted.
 
-Each entry links the pull request that made the change. The two entries from
-before this repository used pull requests link their commit instead.
+Each entry links the pull request that made the change. Two entries predate
+this repository's use of pull requests, and link their commit instead.
 
 ## [Unreleased]
 
