@@ -31,6 +31,19 @@ this repository's use of pull requests, and link their commit instead.
 
 ## [Unreleased]
 
+### Fixed
+
+- The README's feature list presented retry and parallelism as active. No
+  shipped connector classifies a failure as transient, and every shipped
+  destination declares a parallelism limit of `1`, so neither does anything on
+  a local CSV or JSONL load into DuckDB or Parquet; both bullets now carry the
+  shipped-matrix caveat the guides and the load definition reference already
+  carried. Two decision records are corrected in place alongside it: ADR-0044
+  stated the decimal overflow bound off by one, when exactly `p` digits is
+  what `decimal(p,s)` holds, and ADR-0031 still deferred a question that
+  ADR-0035 and ADR-0038 had since answered. The behavior was always this;
+  only the prose was wrong. ([#94])
+
 ## [0.2.1] - 2026-07-30
 
 Documentation, license, and examples. The binary behaves exactly as `0.2.0`
@@ -275,3 +288,4 @@ one carried is listed under the stable release that followed — `0.1.0` and
 [#86]: https://github.com/victorchutw/data-spark/pull/86
 [#87]: https://github.com/victorchutw/data-spark/pull/87
 [#88]: https://github.com/victorchutw/data-spark/pull/88
+[#94]: https://github.com/victorchutw/data-spark/pull/94

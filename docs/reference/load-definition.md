@@ -612,9 +612,10 @@ notation, no thousands separators, no whitespace. Fewer fractional digits
 than the scale rescale losslessly (`1.2` into `decimal(10,2)` stores
 `1.20`); more fractional digits reject per record, because rounding never
 happens in a load; a magnitude of more than `p` digits after scaling rejects
-as overflow (exactly `p` digits fits). In JSONL, strings and integers fit, while JSON floats reject
-per record — their exact digits were already lost to IEEE parsing before the
-load saw them — and booleans, arrays, and objects reject as shape misfits.
+as overflow (exactly `p` digits fits). In JSONL, strings and integers fit,
+while JSON floats reject per record — their exact digits were already lost
+to IEEE parsing before the load saw them — and booleans, arrays, and objects
+reject as shape misfits.
 
 ## `execution`
 
