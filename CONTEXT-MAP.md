@@ -20,6 +20,7 @@ Applies to files and topics under:
 
 - `src/`
 - `tests/`
+- `examples/`
 - `Cargo.toml`
 - `Cargo.lock`
 - `docs/`

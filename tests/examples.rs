@@ -2,11 +2,11 @@
 //!
 //! Every directory under `examples/` is a self-contained runnable example: a
 //! fixture, one or more load definitions, and a `README.md` stating what the
-//! example demonstrates. This test is what keeps them runnable — each example
-//! is copied into a temp directory, run against the real binary, and checked
-//! against the load report facts its README documents. The two negative
-//! examples are checked the same way: their documented failure is the expected
-//! outcome.
+//! example demonstrates. This test is what keeps them runnable — each example is
+//! copied into a temp directory, loaded with the real binary, and checked
+//! against the load report facts its README states, down to the write atomicity
+//! and strategy the prose names. The two negative examples are checked the same
+//! way: their documented failure is the expected outcome.
 
 use assert_cmd::Command;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -27,22 +27,59 @@ enum Destination {
     },
 }
 
+/// The report's `row_counts`, named at the call site as the report names them.
+struct RowCounts {
+    source: u64,
+    written: u64,
+    rejected: u64,
+}
+
+/// The report's `destination_write`: the write atomicity and the strategy that
+/// reached it, which a load that never got to its destination has neither of.
+struct DestinationWrite {
+    atomicity: &'static str,
+    strategy: Option<&'static str>,
+}
+
+impl DestinationWrite {
+    fn atomic(strategy: &'static str) -> Self {
+        Self {
+            atomicity: "atomic",
+            strategy: Some(strategy),
+        }
+    }
+
+    fn best_effort(strategy: &'static str) -> Self {
+        Self {
+            atomicity: "best_effort",
+            strategy: Some(strategy),
+        }
+    }
+
+    fn not_applicable() -> Self {
+        Self {
+            atomicity: "not_applicable",
+            strategy: None,
+        }
+    }
+}
+
 struct Example {
     /// The directory name under `examples/`.
     name: &'static str,
     destination: Destination,
-    /// The documented runs, in the order the README tells a reader to run them.
-    runs: Vec<Run>,
+    /// The documented loads, in the order the README tells a reader to run them.
+    loads: Vec<Load>,
 }
 
-/// The load report facts one documented run must produce.
-struct Run {
+/// The load report facts one documented load must produce.
+struct Load {
     definition: &'static str,
-    /// `error_summary.code`; `None` for a run the README documents as succeeding.
+    /// `error_summary.code`; `None` for a load the README documents as
+    /// succeeding.
     failure_code: Option<&'static str>,
-    source_records: u64,
-    written_records: u64,
-    rejected_records: u64,
+    row_counts: RowCounts,
+    write: Option<DestinationWrite>,
     schema_mode: &'static str,
     drift_status: &'static str,
     /// `schema_decision.fields` as `(name, type)` pairs in output order; empty
@@ -54,18 +91,21 @@ struct Run {
     drift_fields: &'static [&'static str],
     /// The rejection codes `rejected-records.jsonl` carries, sorted.
     rejection_codes: &'static [&'static str],
-    /// Records the destination dataset holds once this run has finished.
+    /// Records the destination dataset holds once this load has finished.
     destination_records: u64,
 }
 
-impl Run {
+impl Load {
     fn succeeds(definition: &'static str) -> Self {
         Self {
             definition,
             failure_code: None,
-            source_records: 0,
-            written_records: 0,
-            rejected_records: 0,
+            row_counts: RowCounts {
+                source: 0,
+                written: 0,
+                rejected: 0,
+            },
+            write: None,
             schema_mode: "inferred",
             drift_status: "not_applicable",
             fields: &[],
@@ -82,10 +122,13 @@ impl Run {
         }
     }
 
-    fn records(mut self, source: u64, written: u64, rejected: u64) -> Self {
-        self.source_records = source;
-        self.written_records = written;
-        self.rejected_records = rejected;
+    fn row_counts(mut self, row_counts: RowCounts) -> Self {
+        self.row_counts = row_counts;
+        self
+    }
+
+    fn write(mut self, write: DestinationWrite) -> Self {
+        self.write = Some(write);
         self
     }
 
@@ -116,8 +159,8 @@ impl Run {
     }
 }
 
-/// Every example and the outcome each of its documented runs must produce.
-/// A directory added under `examples/` without an entry here fails
+/// Every example and the outcome each of its documented loads must produce. A
+/// directory added under `examples/` without an entry here fails
 /// `every_example_directory_is_declared_and_self_contained`.
 fn examples() -> Vec<Example> {
     vec![
@@ -127,8 +170,13 @@ fn examples() -> Vec<Example> {
                 path: "customers.duckdb",
                 dataset: "customers",
             },
-            runs: vec![Run::succeeds("customers-load.yml")
-                .records(3, 3, 0)
+            loads: vec![Load::succeeds("customers-load.yml")
+                .row_counts(RowCounts {
+                    source: 3,
+                    written: 3,
+                    rejected: 0,
+                })
+                .write(DestinationWrite::atomic("transactional_replace"))
                 .fields(&[
                     ("customer_id", "int64"),
                     ("name", "utf8"),
@@ -142,13 +190,23 @@ fn examples() -> Vec<Example> {
             destination: Destination::Parquet {
                 path: "events-dataset",
             },
-            runs: vec![
-                Run::succeeds("load-day-1.yml")
-                    .records(3, 3, 0)
+            loads: vec![
+                Load::succeeds("load-day-1.yml")
+                    .row_counts(RowCounts {
+                        source: 3,
+                        written: 3,
+                        rejected: 0,
+                    })
+                    .write(DestinationWrite::best_effort("staged_part_append"))
                     .destination_records(3),
-                // Append adds day 2 without touching day 1's records.
-                Run::succeeds("load-day-2.yml")
-                    .records(2, 2, 0)
+                // Append adds day 2 without changing day 1's records.
+                Load::succeeds("load-day-2.yml")
+                    .row_counts(RowCounts {
+                        source: 2,
+                        written: 2,
+                        rejected: 0,
+                    })
+                    .write(DestinationWrite::best_effort("staged_part_append"))
                     .destination_records(5),
             ],
         },
@@ -158,12 +216,24 @@ fn examples() -> Vec<Example> {
                 path: "analytics.duckdb",
                 dataset: "orders",
             },
-            runs: vec![
-                Run::succeeds("load-day-1.yml")
-                    .records(3, 3, 0)
+            loads: vec![
+                // A DuckDB append writes into a table that exists, so the first
+                // load is the full refresh that creates it.
+                Load::succeeds("load-day-1.yml")
+                    .row_counts(RowCounts {
+                        source: 3,
+                        written: 3,
+                        rejected: 0,
+                    })
+                    .write(DestinationWrite::atomic("transactional_replace"))
                     .destination_records(3),
-                Run::succeeds("load-day-2.yml")
-                    .records(2, 2, 0)
+                Load::succeeds("load-day-2.yml")
+                    .row_counts(RowCounts {
+                        source: 2,
+                        written: 2,
+                        rejected: 0,
+                    })
+                    .write(DestinationWrite::best_effort("insert"))
                     .destination_records(5),
             ],
         },
@@ -172,14 +242,24 @@ fn examples() -> Vec<Example> {
             destination: Destination::Parquet {
                 path: "inventory-dataset",
             },
-            runs: vec![
-                Run::succeeds("load.yml")
-                    .records(3, 3, 0)
+            loads: vec![
+                Load::succeeds("load.yml")
+                    .row_counts(RowCounts {
+                        source: 3,
+                        written: 3,
+                        rejected: 0,
+                    })
+                    .write(DestinationWrite::best_effort("staging_then_replace"))
                     .destination_records(3),
-                // Full refresh replaces the dataset, so a second run of the
-                // same definition leaves three records, not six.
-                Run::succeeds("load.yml")
-                    .records(3, 3, 0)
+                // Full refresh replaces the dataset, so loading the same
+                // definition again leaves three records, not six.
+                Load::succeeds("load.yml")
+                    .row_counts(RowCounts {
+                        source: 3,
+                        written: 3,
+                        rejected: 0,
+                    })
+                    .write(DestinationWrite::best_effort("staging_then_replace"))
                     .destination_records(3),
             ],
         },
@@ -188,10 +268,15 @@ fn examples() -> Vec<Example> {
             destination: Destination::Parquet {
                 path: "shipments-dataset",
             },
-            runs: vec![
+            loads: vec![
                 // The first load bootstraps the pin from its own inference.
-                Run::succeeds("load-day-1.yml")
-                    .records(3, 3, 0)
+                Load::succeeds("load-day-1.yml")
+                    .row_counts(RowCounts {
+                        source: 3,
+                        written: 3,
+                        rejected: 0,
+                    })
+                    .write(DestinationWrite::best_effort("staging_then_replace"))
                     .fields(&[
                         ("shipment_id", "int64"),
                         ("city", "utf8"),
@@ -200,8 +285,13 @@ fn examples() -> Vec<Example> {
                     .destination_records(3),
                 // Day 2 carries one added nullable field, which the policy
                 // admits and the pin is extended to carry.
-                Run::succeeds("load-day-2.yml")
-                    .records(2, 2, 0)
+                Load::succeeds("load-day-2.yml")
+                    .row_counts(RowCounts {
+                        source: 2,
+                        written: 2,
+                        rejected: 0,
+                    })
+                    .write(DestinationWrite::best_effort("staging_then_replace"))
                     .schema("pinned", "additive_fields_added")
                     .fields(&[
                         ("shipment_id", "int64"),
@@ -219,13 +309,26 @@ fn examples() -> Vec<Example> {
                 path: "billing.duckdb",
                 dataset: "invoices",
             },
-            runs: vec![
-                Run::succeeds("load-day-1.yml")
-                    .records(2, 2, 0)
+            loads: vec![
+                Load::succeeds("load-day-1.yml")
+                    .row_counts(RowCounts {
+                        source: 2,
+                        written: 2,
+                        rejected: 0,
+                    })
+                    .write(DestinationWrite::atomic("transactional_replace"))
                     .destination_records(2),
-                // The same added field the additive example admits fails here,
-                // before the destination is touched: it still holds day 1.
-                Run::fails("load-day-2.yml", "schema_drift")
+                // The added field the additive example admits fails here, and it
+                // fails before the destination is touched: no write was
+                // attempted, no record counts were reached, and the table still
+                // holds day 1.
+                Load::fails("load-day-2.yml", "schema_drift")
+                    .row_counts(RowCounts {
+                        source: 0,
+                        written: 0,
+                        rejected: 0,
+                    })
+                    .write(DestinationWrite::not_applicable())
                     .schema("pinned", "failed_on_drift")
                     .drift_fields(&["currency"])
                     .destination_records(2),
@@ -237,8 +340,13 @@ fn examples() -> Vec<Example> {
                 path: "analytics.duckdb",
                 dataset: "orders",
             },
-            runs: vec![Run::succeeds("load.yml")
-                .records(3, 3, 0)
+            loads: vec![Load::succeeds("load.yml")
+                .row_counts(RowCounts {
+                    source: 3,
+                    written: 3,
+                    rejected: 0,
+                })
+                .write(DestinationWrite::atomic("transactional_replace"))
                 .fields(&[
                     ("order_id", "int64"),
                     ("customer_id", "int64"),
@@ -254,8 +362,13 @@ fn examples() -> Vec<Example> {
                 path: "payments.duckdb",
                 dataset: "payments",
             },
-            runs: vec![Run::succeeds("load.yml")
-                .records(3, 3, 0)
+            loads: vec![Load::succeeds("load.yml")
+                .row_counts(RowCounts {
+                    source: 3,
+                    written: 3,
+                    rejected: 0,
+                })
+                .write(DestinationWrite::atomic("transactional_replace"))
                 .fields(&[
                     ("payment_id", "int64"),
                     ("paid_at", "timestamp"),
@@ -269,8 +382,13 @@ fn examples() -> Vec<Example> {
             destination: Destination::Parquet {
                 path: "measurements-dataset",
             },
-            runs: vec![Run::succeeds("load.yml")
-                .records(4, 2, 2)
+            loads: vec![Load::succeeds("load.yml")
+                .row_counts(RowCounts {
+                    source: 4,
+                    written: 2,
+                    rejected: 2,
+                })
+                .write(DestinationWrite::best_effort("staging_then_replace"))
                 .fields(&[
                     ("station", "utf8"),
                     ("reading", "float64"),
@@ -283,14 +401,14 @@ fn examples() -> Vec<Example> {
 }
 
 #[test]
-fn every_example_runs_as_its_readme_documents() {
+fn every_example_loads_as_its_readme_documents() {
     for example in examples() {
         run_example(&example);
     }
 }
 
-/// The directory listing is the source of truth for what exists; this test
-/// keeps the table above and the READMEs honest about it.
+/// The directory listing is the source of truth for what exists; this test keeps
+/// the table above and the READMEs honest about it.
 #[test]
 fn every_example_directory_is_declared_and_self_contained() {
     let examples = examples();
@@ -325,28 +443,27 @@ fn every_example_directory_is_declared_and_self_contained() {
             .unwrap_or_else(|_| panic!("{}: README.md states what it demonstrates", example.name));
 
         let mut definitions = example
-            .runs
+            .loads
             .iter()
-            .map(|run| run.definition.to_string())
+            .map(|load| load.definition.to_string())
             .collect::<Vec<_>>();
         definitions.sort();
         definitions.dedup();
-        let mut yaml_files = fs::read_dir(&example_dir)
-            .expect("example directory")
-            .map(|entry| entry.expect("example entry").path())
+        let mut yaml_files = example_files(&example_dir)
+            .iter()
             .filter(|path| {
                 matches!(
                     path.extension().and_then(|extension| extension.to_str()),
                     Some("yml") | Some("yaml")
                 )
             })
-            .map(|path| file_name(&path))
+            .map(|path| file_name(path))
             .collect::<Vec<_>>();
         yaml_files.sort();
         assert_eq!(
             yaml_files, definitions,
-            "{}: every load definition in the directory must be run by this \
-             test, and every run must name a definition that exists",
+            "{}: every load definition in the directory must be loaded by this \
+             test, and every declared load must name a definition that exists",
             example.name
         );
 
@@ -361,7 +478,7 @@ fn every_example_directory_is_declared_and_self_contained() {
 }
 
 /// The quickstart is the front page's promise, so it is the example the test
-/// suite runs, byte for byte.
+/// suite loads, byte for byte.
 #[test]
 fn the_readme_quickstart_is_the_csv_to_duckdb_example() {
     let readme = fs::read_to_string(repository_root().join("README.md")).expect("README.md");
@@ -386,14 +503,15 @@ fn run_example(example: &Example) {
     let source_dir = examples_dir().join(example.name);
     let tracked_files = directory_snapshot(&source_dir);
 
-    // Examples run against a copy, so a load's destination, artifacts, and
-    // pinned schema file land outside the repository tree.
+    // Examples are loaded from a copy, so a destination, an artifact directory,
+    // and a bootstrapped pinned schema file all land outside the repository
+    // tree.
     let work = TempDir::new().expect("tempdir");
     let example_dir = work.path().join(example.name);
     copy_directory(&source_dir, &example_dir);
 
-    for (index, run) in example.runs.iter().enumerate() {
-        let context = format!("{}: run {} ({})", example.name, index + 1, run.definition);
+    for (index, load) in example.loads.iter().enumerate() {
+        let context = format!("{}: load {} ({})", example.name, index + 1, load.definition);
         let artifacts_dir = work.path().join(format!("artifacts-{}", index + 1));
         let assert = Command::cargo_bin("data-spark")
             .expect("binary")
@@ -401,35 +519,35 @@ fn run_example(example: &Example) {
             .arg("load")
             .arg("--output-dir")
             .arg(&artifacts_dir)
-            .arg(run.definition)
+            .arg(load.definition)
             .assert();
-        let assert = match run.failure_code {
+        let assert = match load.failure_code {
             None => assert.success(),
             Some(_) => assert.failure(),
         };
         let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
         let report = read_single_report(&artifacts_dir, &context);
 
-        assert_report(&context, &stdout, &report, run);
-        assert_rejected_records(&context, &example_dir, &report, run);
+        assert_report(&context, &stdout, &report, load);
+        assert_rejected_records(&context, &example_dir, &report, load);
         assert_eq!(
             destination_records(&example_dir, &example.destination),
-            run.destination_records,
-            "{context}: records the destination dataset holds after this run"
+            load.destination_records,
+            "{context}: records the destination dataset holds afterwards"
         );
     }
 
     assert_eq!(
         directory_snapshot(&source_dir),
         tracked_files,
-        "{}: running an example must leave the repository tree untouched",
+        "{}: loading an example must leave the repository tree untouched",
         example.name
     );
 }
 
-fn assert_report(context: &str, stdout: &str, report: &Value, run: &Run) {
+fn assert_report(context: &str, stdout: &str, report: &Value, load: &Load) {
     assert_eq!(report["report_version"], 1, "{context}");
-    match run.failure_code {
+    match load.failure_code {
         None => {
             assert_eq!(report["exit_status"], "succeeded", "{context}");
             assert_eq!(report["process_exit_code"], 0, "{context}");
@@ -451,39 +569,56 @@ fn assert_report(context: &str, stdout: &str, report: &Value, run: &Run) {
     }
 
     assert_eq!(
-        report["row_counts"]["source"], run.source_records,
+        report["row_counts"]["source"], load.row_counts.source,
         "{context}: records read"
     );
     assert_eq!(
-        report["row_counts"]["written"], run.written_records,
+        report["row_counts"]["written"], load.row_counts.written,
         "{context}: records written"
     );
     assert_eq!(
-        report["row_counts"]["rejected"], run.rejected_records,
+        report["row_counts"]["rejected"], load.row_counts.rejected,
         "{context}: records rejected"
     );
 
+    if let Some(write) = &load.write {
+        assert_eq!(
+            report["destination_write"]["atomicity"], write.atomicity,
+            "{context}: the write atomicity the README names"
+        );
+        match write.strategy {
+            Some(strategy) => assert_eq!(
+                report["destination_write"]["strategy"], strategy,
+                "{context}: the write strategy the README names"
+            ),
+            None => assert!(
+                report["destination_write"]["strategy"].is_null(),
+                "{context}: a load that reached no destination write has no strategy"
+            ),
+        }
+    }
+
     let schema_decision = &report["schema_decision"];
     assert_eq!(
-        schema_decision["mode"], run.schema_mode,
+        schema_decision["mode"], load.schema_mode,
         "{context}: how the schema was decided"
     );
     assert_eq!(
-        schema_decision["drift_status"], run.drift_status,
+        schema_decision["drift_status"], load.drift_status,
         "{context}: the drift outcome"
     );
-    if !run.fields.is_empty() {
+    if !load.fields.is_empty() {
         assert_eq!(
             field_pairs(&schema_decision["fields"], context),
-            run.fields
+            load.fields
                 .iter()
                 .map(|(name, field_type)| (name.to_string(), field_type.to_string()))
                 .collect::<Vec<_>>(),
             "{context}: the dataset schema in output order"
         );
     }
-    if !run.drift_fields.is_empty() {
-        let named = match run.drift_status {
+    if !load.drift_fields.is_empty() {
+        let named = match load.drift_status {
             "additive_fields_added" => field_pairs(&schema_decision["added_fields"], context)
                 .into_iter()
                 .map(|(name, _)| name)
@@ -498,7 +633,7 @@ fn assert_report(context: &str, stdout: &str, report: &Value, run: &Run) {
         };
         assert_eq!(
             named,
-            run.drift_fields
+            load.drift_fields
                 .iter()
                 .map(|name| name.to_string())
                 .collect::<Vec<_>>(),
@@ -507,14 +642,14 @@ fn assert_report(context: &str, stdout: &str, report: &Value, run: &Run) {
     }
 }
 
-fn assert_rejected_records(context: &str, example_dir: &Path, report: &Value, run: &Run) {
+fn assert_rejected_records(context: &str, example_dir: &Path, report: &Value, load: &Load) {
     assert_eq!(
-        report["rejected_records"]["count"], run.rejected_records,
+        report["rejected_records"]["count"], load.row_counts.rejected,
         "{context}: the rejected-record count mirrors row_counts.rejected"
     );
 
     let artifact = &report["rejected_records"]["artifact"];
-    if run.rejected_records == 0 {
+    if load.row_counts.rejected == 0 {
         assert!(
             artifact.is_null(),
             "{context}: no rejected records means no artifact"
@@ -522,6 +657,8 @@ fn assert_rejected_records(context: &str, example_dir: &Path, report: &Value, ru
         return;
     }
 
+    // The report states the path as the load resolved it, so joining covers both
+    // the relative default and the absolute path `--output-dir` produces here.
     let artifact_path = example_dir.join(
         artifact
             .as_str()
@@ -531,7 +668,24 @@ fn assert_rejected_records(context: &str, example_dir: &Path, report: &Value, ru
         .unwrap_or_else(|_| panic!("{context}: read {}", artifact_path.display()))
         .lines()
         .map(|line| {
-            serde_json::from_str::<Value>(line).expect("artifact line is json")["code"]
+            let rejection = serde_json::from_str::<Value>(line).expect("artifact line is json");
+            // Every rejected record can be traced back to the source line it
+            // came from, with the content the load could recover.
+            assert!(
+                rejection["line"].as_u64().is_some_and(|line| line > 0),
+                "{context}: a rejected record states its source line number"
+            );
+            assert!(
+                rejection["message"]
+                    .as_str()
+                    .is_some_and(|message| !message.is_empty()),
+                "{context}: a rejected record states why it was rejected"
+            );
+            assert!(
+                rejection["record"].is_object(),
+                "{context}: a rejected record carries the record content"
+            );
+            rejection["code"]
                 .as_str()
                 .expect("rejection code")
                 .to_string()
@@ -539,14 +693,14 @@ fn assert_rejected_records(context: &str, example_dir: &Path, report: &Value, ru
         .collect::<Vec<_>>();
     assert_eq!(
         codes.len() as u64,
-        run.rejected_records,
+        load.row_counts.rejected,
         "{context}: one artifact line per rejected record"
     );
-    if !run.rejection_codes.is_empty() {
+    if !load.rejection_codes.is_empty() {
         codes.sort();
         assert_eq!(
             codes,
-            run.rejection_codes
+            load.rejection_codes
                 .iter()
                 .map(|code| code.to_string())
                 .collect::<Vec<_>>(),
@@ -603,6 +757,11 @@ fn parquet_records(destination_path: &Path) -> u64 {
     files
         .iter()
         .map(|path| {
+            assert!(
+                file_name(path).starts_with("part-"),
+                "records land as part-*.parquet files: {}",
+                path.display()
+            );
             let file = File::open(path).expect("open parquet file");
             let builder = ParquetRecordBatchReaderBuilder::try_new(file).expect("parquet reader");
             builder.metadata().file_metadata().num_rows() as u64
@@ -611,46 +770,56 @@ fn parquet_records(destination_path: &Path) -> u64 {
 }
 
 fn read_single_report(artifacts_dir: &Path, context: &str) -> Value {
-    let run_dirs = fs::read_dir(artifacts_dir)
+    let artifact_dirs = fs::read_dir(artifacts_dir)
         .expect("artifact root")
         .map(|entry| entry.expect("artifact entry").path())
         .collect::<Vec<_>>();
     assert_eq!(
-        run_dirs.len(),
+        artifact_dirs.len(),
         1,
         "{context}: a load writes one artifact directory"
     );
-    let report_path = run_dirs[0].join("load-report.json");
+    let report_path = artifact_dirs[0].join("load-report.json");
     serde_json::from_slice(&fs::read(&report_path).expect("load report")).expect("json report")
 }
 
-/// The example directory's files and their contents, so the test can prove a
-/// run changed none of them.
-fn directory_snapshot(directory: &Path) -> Vec<(String, String)> {
+/// The files an example is made of. An example directory holds nothing else, so
+/// a load's leftovers have to be cleaned up before this test can pass.
+fn example_files(directory: &Path) -> Vec<PathBuf> {
     let mut files = fs::read_dir(directory)
         .expect("example directory")
         .map(|entry| entry.expect("example entry").path())
-        .map(|path| {
-            assert!(
-                path.is_file(),
-                "an example holds only its own files, so a load's leftovers have \
-                 to be cleaned up: {}",
-                path.display()
-            );
-            (
-                file_name(&path),
-                fs::read_to_string(&path).expect("example file is text"),
-            )
-        })
         .collect::<Vec<_>>();
     files.sort();
+    for path in &files {
+        assert!(
+            path.is_file(),
+            "an example holds only its own files, so a load's leftovers have to \
+             be cleaned up: {}",
+            path.display()
+        );
+    }
     files
+}
+
+/// The example's files and their contents, so the test can prove a load changed
+/// none of them.
+fn directory_snapshot(directory: &Path) -> Vec<(String, String)> {
+    example_files(directory)
+        .iter()
+        .map(|path| {
+            (
+                file_name(path),
+                fs::read_to_string(path).expect("example file is text"),
+            )
+        })
+        .collect()
 }
 
 fn copy_directory(source: &Path, destination: &Path) {
     fs::create_dir_all(destination).expect("create example copy");
-    for (name, contents) in directory_snapshot(source) {
-        fs::write(destination.join(name), contents).expect("copy example file");
+    for path in example_files(source) {
+        fs::copy(&path, destination.join(file_name(&path))).expect("copy example file");
     }
 }
 

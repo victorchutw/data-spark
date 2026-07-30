@@ -160,16 +160,13 @@ facts, execution details, and timings):
 
 ## Documentation
 
-- [examples/](examples/) — small, self-contained, runnable examples: the four
-  source and destination pairs, both load modes, schema pinning and drift
-  policies, structural transforms, declared types, and rejected records. Every
-  example is run by the test suite, so none of them can rot.
-- [docs/reference/load-definition.md](docs/reference/load-definition.md) — every
-  key of the load definition YAML contract.
-- [docs/reference/load-report.md](docs/reference/load-report.md) — every field of
-  the load report JSON contract.
+[examples/](examples/) holds small, self-contained, runnable examples — the four
+source and destination pairs, both load modes, schema pinning and drift
+policies, structural transforms, declared types, and rejected records — and the
+test suite loads every one of them, so none of them can rot.
 
-The repository also carries maintainer- and agent-facing documentation:
+User-facing reference documentation is being built out issue by issue. Today
+the repository carries maintainer- and agent-facing documentation:
 [CONTEXT.md](CONTEXT.md) defines the ubiquitous language used throughout this
 README, and [docs/adr/](docs/adr/) records the architecture decisions behind
 the behavior described above.
