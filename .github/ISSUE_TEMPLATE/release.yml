@@ -30,6 +30,8 @@ body:
           required: true
         - label: Cargo.toml version matches the planned release version.
           required: true
+        - label: CHANGELOG.md has the Unreleased entries moved under the new version heading, with its Release link added and Unreleased re-pointed.
+          required: true
         - label: CI is green on main.
           required: true
         - label: The release tag will be annotated and pushed from main.

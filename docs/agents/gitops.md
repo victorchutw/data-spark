@@ -168,11 +168,17 @@ Releases are tag-driven. Do not build and upload release binaries manually.
 1. Open a release issue using the release issue template.
 2. Confirm every included issue is closed or explicitly deferred.
 3. Update `Cargo.toml` to the release version.
-4. Confirm local checks pass.
-5. Merge the release PR into `main`.
-6. Wait for the post-merge `main` CI run to finish; it saves the Rust build
+4. Move every `Unreleased` entry in `CHANGELOG.md` under a new
+   `## [<version>] - <YYYY-MM-DD>` heading dated with the release date, leaving
+   `Unreleased` empty. In the link definitions at the bottom of the file, add
+   the new version's GitHub Release link and re-point `[Unreleased]` at the new
+   tag, so its compare link starts from the release being cut. The release PR
+   carries this change, so the tagged commit already describes what it ships.
+5. Confirm local checks pass.
+6. Merge the release PR into `main`.
+7. Wait for the post-merge `main` CI run to finish; it saves the Rust build
    cache that the tag run restores.
-7. Create and push an annotated tag:
+8. Create and push an annotated tag:
 
 ```bash
 git checkout main
