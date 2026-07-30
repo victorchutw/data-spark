@@ -928,7 +928,7 @@ a breaking change, and would come with a new `report_version`.
 Both reports below come from two real loads of the same definition, one after
 the other. Only `load_id`, the `artifact_dir` that embeds it, and the three
 `timings` values are specific to those two loads; everything else is
-reproducible.
+reproducible from the definition and the two source snapshots shown.
 
 The definition pins its schema and fails on drift:
 
@@ -951,7 +951,13 @@ schema:
 ### A load that succeeded
 
 The first load: three JSONL records into a DuckDB table, with the pin
-bootstrapped from this load's own inference.
+bootstrapped from this load's own inference. `orders.jsonl` holds:
+
+```json
+{"order_id": 1001, "customer": "Ada", "amount": 42.5, "placed_at": "2026-01-05T09:30:00Z"}
+{"order_id": 1002, "customer": "Grace", "amount": 7.25, "placed_at": "2026-01-06T14:00:00Z"}
+{"order_id": 1003, "customer": "Edsger", "amount": 19.99, "placed_at": "2026-01-07T11:15:00Z"}
+```
 
 ```json
 {
@@ -1042,8 +1048,16 @@ bootstrapped from this load's own inference.
 ### A load that failed
 
 The next load of the same definition, after the source file lost `placed_at`
-and gained `channel`. The pin is unchanged, the destination table is
-untouched, and the drift detail says exactly what moved.
+and gained `channel`. `orders.jsonl` now holds:
+
+```json
+{"order_id": 1004, "customer": "Alan", "amount": 3.5, "channel": "web"}
+{"order_id": 1005, "customer": "Barbara", "amount": 120.0, "channel": "store"}
+{"order_id": 1006, "customer": "Donald", "amount": 55.25, "channel": "web"}
+```
+
+The pin is unchanged, the destination table is untouched, and the drift
+detail says exactly what moved.
 
 ```json
 {
