@@ -523,7 +523,10 @@ fn run_example(example: &Example) {
             .assert();
         let assert = match load.failure_code {
             None => assert.success(),
-            Some(_) => assert.failure(),
+            // A failed load exits 1, so assert the code the contract names
+            // rather than any nonzero one: the process and the report's
+            // `process_exit_code` have to keep agreeing.
+            Some(_) => assert.failure().code(1),
         };
         let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
         let report = read_single_report(&artifacts_dir, &context);
