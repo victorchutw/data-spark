@@ -167,9 +167,10 @@ and says how complete the damage is:
 Error: rejected 2 of 2 records, exceeding the reject threshold of 0
 ```
 
-**Raise the threshold above the whole file and the source format decides.**
-JSONL carries no header, so a file with no parseable record offers no field
-names to infer a schema from, and the load fails for that reason instead:
+**Raise the threshold above the whole file and what decides is whether the
+source still offers a shape.** JSONL carries no header, so a file with no
+parseable record offers no field names to infer a schema from, and the load
+fails for that reason instead:
 
 ```text
 Error: JSONL source bad.jsonl must include at least one record with fields
@@ -178,12 +179,27 @@ Error: JSONL source bad.jsonl must include at least one record with fields
 That is `malformed_jsonl`, with `schema_decision.mode: not_evaluated` — and
 the artifact still holds every rejected line.
 
-CSV behaves differently, and this is the trap: the header carries the shape,
-so a schema is resolvable even when no record survives. A CSV load whose
-threshold tolerates every rejection **succeeds**, materializing the schema
-with no records in it — which for `full_refresh` means replacing the
-destination dataset with an empty one. Keep `reject_threshold` at `0`, or
-comfortably below a whole delivery, for any dataset that must never go empty.
+Every other all-rejected source still offers a shape, and this is the trap: a
+CSV header carries the field names whatever the records do, and JSONL records
+that parse but reject carry their own. Such a load, under a threshold that
+tolerates every rejection, **succeeds**, materializing the schema with no
+records in it — which for `full_refresh` means replacing the destination
+dataset with an empty one. Keep `reject_threshold` at `0`, or comfortably
+below a whole delivery, and a dataset cannot be emptied *by rejection* — the
+default is exactly this guard
+([ADR-0020](../adr/0020-default-reject-threshold-zero.md)).
+
+The threshold promises no more than that, because rejection is not the only
+route to an empty full refresh. A delivery that is empty to begin with — a
+header-only CSV — rejects nothing, so it completes at any threshold,
+including `0`, and empties the dataset the same way. That is not a gap in the
+gate but the mode's meaning
+([ADR-0056](../adr/0056-mirror-the-source-on-zero-survivor-full-refreshes.md)):
+a full refresh replaces the destination dataset with the source's current
+records, and a source whose current records are zero is faithfully mirrored
+by an empty dataset. The load cannot tell that case from a delivery that went
+missing upstream — so when an empty delivery is abnormal for your pipeline,
+guard it upstream, before the load runs.
 
 ## Rejections are not drift
 

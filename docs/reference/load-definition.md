@@ -734,14 +734,14 @@ The threshold interacts with the rejected-records artifact
 
 The gate is judged over the whole input, so a source whose every record
 rejects is not a special case of it. What the load does after the gate
-depends on whether a dataset schema can be resolved with no record left to
-observe, and that differs by source format.
+depends on whether the source still offers a shape — field names a dataset
+schema can be resolved from with no record left to observe.
 
 | Source | Threshold | Outcome |
 | --- | --- | --- |
 | CSV or JSONL | does not tolerate them | Fails with `reject_threshold_exceeded`, the message naming the full-input counts: `rejected 2 of 2 records, exceeding the reject threshold of 0`. |
-| JSONL | tolerates them all | Fails with `malformed_jsonl`. JSONL carries no header, so a file with no parseable record offers no field names, and no schema can be inferred. |
-| CSV | tolerates them all | **Succeeds.** The header resolves the dataset schema without needing a record, so the load completes and materializes that schema with no records in it. |
+| JSONL with no parseable record | tolerates them all | Fails with `malformed_jsonl`. JSONL carries no header, so a file with no parseable record offers no field names, and no schema can be inferred. |
+| CSV, or JSONL whose records parse but reject | tolerates them all | **Succeeds.** The CSV header — or the rejected records' own field names — resolves the dataset schema without needing a survivor, so the load completes and materializes that schema with no records in it. |
 
 Both failures leave the destination untouched —
 `destination_write.atomicity` is `not_applicable` and
@@ -758,9 +758,10 @@ all, an all-unparseable JSONL file, under either code.
 
 ### When a load completes with no surviving records
 
-A load that completes with no survivor — the succeeding CSV case above, or
-any other load whose surviving records are zero — enters the write phase like
-any other: `execution.record_format` is `arrow_record_batch` and
+A load that completes with no survivor — the succeeding all-rejected cases
+above, or an empty delivery: a header-only CSV, which rejects nothing and so
+completes at any threshold, including the default `0` — enters the write
+phase like any other: `execution.record_format` is `arrow_record_batch` and
 `batch_count` is `1`, because an empty surviving run still yields one empty
 chunk, so an empty dataset materializes its schema
 ([ADR-0046](../adr/0046-resolve-then-stream-connector-ports-with-chunked-sessions.md)).
@@ -798,9 +799,17 @@ the no-op above. An append whose resolved schema still matches — because a
 pin or an override declares the types, or because the destination's fields
 are `utf8` anyway — adds nothing and leaves the dataset as it was.
 
-Keeping `reject_threshold` at its default `0`, or well below one delivery's
-record count, is what keeps a dataset that must never go empty from being
-emptied this way.
+That a full refresh may complete empty is a decision, not an oversight
+([ADR-0056](../adr/0056-mirror-the-source-on-zero-survivor-full-refreshes.md)):
+the mode replaces the destination dataset with the source's current records,
+and when those are zero — an empty delivery — an empty dataset is the
+faithful mirror, so no setting refuses it. What `reject_threshold` guards is
+the unfaithful route into the same outcome, the delivery whose records were
+there but unloadable: keeping it at its default `0`, or well below one
+delivery's record count, keeps a dataset from being emptied by rejection. It
+does not apply to an empty delivery, which rejects nothing; when an empty
+delivery is abnormal for a pipeline, guard it upstream, before the load is
+invoked.
 
 ## `artifacts`
 
