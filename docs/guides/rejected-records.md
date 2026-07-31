@@ -75,9 +75,11 @@ Records rejected: 2
 | `malformed_jsonl_record` | A JSONL line is not a JSON object. |
 | `type_coercion_failed` | A value does not fit the pinned or overridden type of its field — including a declared timestamp or decimal that does not parse. |
 | `missing_required_field` | A field declared `nullable: false` is null, or absent, in this record. |
+| `null_merge_key` | A merge key field is null, or absent, in this record — merge keys are implicitly non-null, because a null never equals anything under key equality (see the [merge loads guide](merge-loads.md)). |
 
 Judgement is per record and the first violation wins, so one record yields at
-most one rejection even when two of its fields are unloadable. These codes
+most one rejection even when two of its fields are unloadable — a null in a
+field that is both a merge key and schema-required names the merge-key rule. These codes
 live in the artifact, not in the report's `error_summary` — a load that
 rejects records within its threshold has no error at all.
 

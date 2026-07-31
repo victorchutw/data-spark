@@ -9222,6 +9222,64 @@ fn a_zero_survivor_merge_commits_a_no_op_and_exits_zero() {
 }
 
 #[test]
+fn a_multi_chunk_merge_stages_every_chunk_and_commits_once() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    fs::write(&source_path, "customer_id,name\n1,Ada\n2,Grace\n").expect("write bootstrap csv");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "full_refresh",
+        "",
+    );
+    run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-1"),
+        &definition_path,
+        true,
+    );
+
+    // Three records under a chunk bound of one stage as three chunks inside
+    // the same transaction and commit together at the terminal commit.
+    fs::write(
+        &source_path,
+        "customer_id,name\n2,Grace Hopper\n3,Katherine\n4,Edsger\n",
+    )
+    .expect("write merge csv");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "merge",
+        "merge:\n  keys: [customer_id]\nexecution:\n  chunk_rows: 1\n",
+    );
+    let merge = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-2"),
+        &definition_path,
+        true,
+    );
+
+    assert_eq!(merge.report["execution"]["batch_count"], 3);
+    assert_eq!(merge.report["execution"]["chunk_rows"], 1);
+    assert_eq!(
+        merge.report["destination_write"]["merge"],
+        serde_json::json!({ "updated": 1, "inserted": 2 })
+    );
+    assert_eq!(merge.report["row_counts"]["written"], 3);
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 4);
+}
+
+#[test]
 fn duplicate_merge_keys_fail_the_load_and_leave_the_destination_byte_identical() {
     let work = TempDir::new().expect("tempdir");
     let source_path = work.path().join("customers.csv");

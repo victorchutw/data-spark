@@ -77,6 +77,7 @@ from an empty one at the top level.
 | `destination_summary` | object | The definition's `destination` block, echoed. |
 | `dataset` | string or null | The dataset name, echoed. |
 | `load_mode` | string | The load mode, echoed. |
+| `merge` | object or null | The definition's `merge` block, echoed; `null` when it declared none. |
 | `schema_decision` | object | What schema the load resolved, and what drift it found. |
 | `row_counts` | object | Records read, written, and rejected. |
 | `byte_counts` | object | Source and destination bytes. |
@@ -163,6 +164,16 @@ The load mode as written, or `full_refresh` when the definition omitted it.
 This is an echo, not a validation result: a definition naming a mode this
 binary does not support still reports that mode, alongside an
 `unsupported_load_mode` error summary.
+
+### `merge`
+
+The definition's `merge` block echoed back — `{"keys": [...]}` with the
+keys in declaration order — or `null` when the definition declared none,
+which is every non-merge load. Like `load_mode`, this is an echo, not a
+validation result: a merge block that failed cross-validation is still
+echoed as written, beside its `invalid_merge_config` error summary. How a
+committed merge actually partitioned its records is a write fact and lives
+in [`destination_write.merge`](#destination_write).
 
 ## `schema_decision`
 
@@ -615,7 +626,8 @@ wrote them to.
 
 Governing ADRs:
 [ADR-0021](../adr/0021-report-destination-write-atomicity.md),
-[ADR-0047](../adr/0047-commit-full-refresh-terminally-and-append-per-chunk.md).
+[ADR-0047](../adr/0047-commit-full-refresh-terminally-and-append-per-chunk.md),
+[ADR-0059](../adr/0059-execute-duckdb-merge-as-a-staged-terminal-transaction.md).
 
 What the destination can say about the visibility of what it wrote. Write
 atomicity is a property of the destination and the load mode, so the
@@ -625,6 +637,7 @@ destination itself states it and the report carries it verbatim.
 | --- | --- | --- |
 | `atomicity` | always | `atomic`, `best_effort`, or `not_applicable`. |
 | `strategy` | `atomicity` is not `not_applicable` | The named write strategy the destination used. |
+| `merge` | a merge load committed | How the surviving records partitioned: `{"updated": M, "inserted": N}`. |
 
 | `atomicity` | Meaning |
 | --- | --- |
@@ -638,6 +651,7 @@ The strategies the shipped destinations report:
 | --- | --- | --- | --- |
 | `duckdb` | `full_refresh` | `atomic` | `transactional_replace` |
 | `duckdb` | `append` | `best_effort` | `insert` |
+| `duckdb` | `merge` | `atomic` | `transactional_merge` |
 | `parquet` | `full_refresh` | `best_effort` | `staging_then_replace` |
 | `parquet` | `append` | `best_effort` | `staged_part_append` |
 
@@ -668,6 +682,31 @@ any other untouched destination, and a full refresh that fails *after* its
 terminal commit — a connection that would not close cleanly, say — still
 reports the `atomic` write it had already made. The commit boundary, not the
 load mode, decides what this field says.
+
+A merge commits once, terminally, like a full refresh
+([ADR-0059](../adr/0059-execute-duckdb-merge-as-a-staged-terminal-transaction.md)),
+and a committed merge additionally states how the surviving records
+partitioned — `updated` counts the records whose merge key tuple matched an
+existing destination record (replaced whole), `inserted` the unmatched
+remainder, and `updated + inserted` always equals `row_counts.written`:
+
+```json
+{
+  "atomicity": "atomic",
+  "strategy": "transactional_merge",
+  "merge": {
+    "updated": 1,
+    "inserted": 1
+  }
+}
+```
+
+The `merge` key is absent on every failed merge — the terminal commit means
+a failure committed nothing to count. A merge that fails inside its open
+transaction (a duplicate-key failure, say) reports the `atomic` /
+`transactional_merge` facts without counts; one that fails before the
+session opened reports `not_applicable` like any other untouched
+destination.
 
 ## `execution`
 
@@ -827,7 +866,7 @@ its artifacts at all.
 ```json
 {
   "code": "unsupported_load_mode",
-  "message": "unsupported load mode: merge"
+  "message": "unsupported load mode: sideload"
 }
 ```
 
@@ -848,10 +887,13 @@ definition-level codes are explained in context, key by key, in the
 | Definition | `unsupported_load_definition_version` | A `version` other than `1`. |
 | Definition | `missing_source` | No `source` block. |
 | Definition | `missing_destination` | No `destination` block. |
-| Definition | `unsupported_load_mode` | The load mode is unknown, or the destination does not support it. |
+| Definition | `unsupported_load_mode` | The load mode string is unknown ([ADR-0057](../adr/0057-land-merge-loads-on-duckdb-only-and-decline-elsewhere.md) splits the destination case out). |
+| Definition | `missing_merge_keys` | `load_mode: merge` without a `merge` block. |
+| Definition | `invalid_merge_config` | A `merge` block outside a merge load, an empty `keys` list, or a duplicated key name. |
 | Definition | `unsupported_source_connector` | The source connector is not `local_file`. |
 | Definition | `unsupported_destination_connector` | The destination connector is neither `duckdb` nor `parquet`. |
 | Definition | `missing_dataset` | A `duckdb` destination without a `dataset`. |
+| Definition | `unsupported_load_mode_for_destination` | The destination declines a known load mode — today, `merge` anywhere but `duckdb`. |
 | Definition | `invalid_transform_config` | The `transform` block is empty or malformed. |
 | Definition | `invalid_schema_config` | The `schema` block is empty, incomplete, or contradictory. |
 | Definition | `unsupported_drift_policy` | A `drift_policy` other than `fail` or `allow_additive_nullable`. |
@@ -865,6 +907,7 @@ definition-level codes are explained in context, key by key, in the
 | Read | `unknown_transform_field` | The transform names a field absent from the observed source shape. |
 | Read | `transform_name_collision` | Two dataset fields would end up with the same name. |
 | Read | `unknown_override_field` | An override names a field absent from the dataset shape. |
+| Read | `unknown_merge_key_field` | A merge key names a field absent from the resolved dataset schema. |
 | Read | `schema_override_conflict` | An override contradicts the pinned field it names. |
 | Read | `schema_drift` | The source shape drifted from the pin in a way the policy forbids. |
 | Read | `reject_threshold_exceeded` | More records were rejected than `reject_threshold` tolerates. |
@@ -872,6 +915,7 @@ definition-level codes are explained in context, key by key, in the
 | Write | `record_batch_creation_failed` | A chunk could not be assembled from its records. |
 | Write | `schema_coercion_failed` | A value could not be materialized as its planned type. |
 | Write | `source_changed_during_load` | The second source pass saw a source that no longer matches the first. |
+| Write | `duplicate_merge_keys` | Two or more surviving records of a merge load share one key tuple ([ADR-0058](../adr/0058-fail-merge-loads-on-duplicate-merge-keys.md)); the transaction rolled back. |
 | Write | `destination_write_failed` | The destination refused or failed a write, commit, or session. |
 
 Rejected records carry their own codes inside `rejected-records.jsonl`; they
@@ -910,8 +954,10 @@ A reader should tolerate, without failing:
   [ADR-0050](../adr/0050-report-retry-as-a-policy-echo-with-per-failed-attempt-entries.md)),
   the parallelism keys
   ([ADR-0053](../adr/0053-report-parallelism-as-the-effective-value-beside-the-connector-limit.md)),
-  and the binary-version provenance
-  ([ADR-0055](../adr/0055-surface-the-binary-version-as-version-output-and-top-level-report-provenance.md))
+  the binary-version provenance
+  ([ADR-0055](../adr/0055-surface-the-binary-version-as-version-output-and-top-level-report-provenance.md)),
+  and the merge echo and write counts
+  ([ADR-0059](../adr/0059-execute-duckdb-merge-as-a-staged-terminal-transaction.md))
   were all added this way, without a version bump.
 - New values in `mode`, `drift_status`, `atomicity`, `strategy`,
   `record_format`, and `error_summary.code` — for instance, the strategy name
@@ -962,9 +1008,9 @@ bootstrapped from this load's own inference. `orders.jsonl` holds:
 ```json
 {
   "report_version": 1,
-  "binary_version": "0.2.1",
-  "load_id": "c9ec9c01-8ce3-454a-b536-d8c0c71b4765",
-  "artifact_dir": ".data-spark/runs/c9ec9c01-8ce3-454a-b536-d8c0c71b4765",
+  "binary_version": "0.3.0",
+  "load_id": "767bbafd-5874-4ccc-aa52-2423a7482fa4",
+  "artifact_dir": ".data-spark/runs/767bbafd-5874-4ccc-aa52-2423a7482fa4",
   "source_summary": {
     "connector": "local_file",
     "path": "orders.jsonl",
@@ -976,6 +1022,7 @@ bootstrapped from this load's own inference. `orders.jsonl` holds:
   },
   "dataset": "orders",
   "load_mode": "full_refresh",
+  "merge": null,
   "schema_decision": {
     "mode": "inferred",
     "fields": [
@@ -1035,9 +1082,9 @@ bootstrapped from this load's own inference. `orders.jsonl` holds:
     }
   },
   "timings": {
-    "started_unix_ms": 1785396627637,
-    "finished_unix_ms": 1785396627896,
-    "duration_ms": 259
+    "started_unix_ms": 1785467945932,
+    "finished_unix_ms": 1785467946300,
+    "duration_ms": 368
   },
   "exit_status": "succeeded",
   "process_exit_code": 0,
@@ -1062,9 +1109,9 @@ detail says exactly what moved.
 ```json
 {
   "report_version": 1,
-  "binary_version": "0.2.1",
-  "load_id": "4d07ddaf-2731-4e8f-8b4a-518093a781b0",
-  "artifact_dir": ".data-spark/runs/4d07ddaf-2731-4e8f-8b4a-518093a781b0",
+  "binary_version": "0.3.0",
+  "load_id": "abf37645-fc81-4777-8273-70d50e7ab7dc",
+  "artifact_dir": ".data-spark/runs/abf37645-fc81-4777-8273-70d50e7ab7dc",
   "source_summary": {
     "connector": "local_file",
     "path": "orders.jsonl",
@@ -1076,6 +1123,7 @@ detail says exactly what moved.
   },
   "dataset": "orders",
   "load_mode": "full_refresh",
+  "merge": null,
   "schema_decision": {
     "mode": "pinned",
     "fields": [
@@ -1132,8 +1180,8 @@ detail says exactly what moved.
     "batch_count": 0
   },
   "timings": {
-    "started_unix_ms": 1785396634976,
-    "finished_unix_ms": 1785396634977,
+    "started_unix_ms": 1785467946341,
+    "finished_unix_ms": 1785467946342,
     "duration_ms": 1
   },
   "exit_status": "failed",
