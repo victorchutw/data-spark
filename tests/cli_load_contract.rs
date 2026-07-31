@@ -8403,14 +8403,19 @@ fn invalid_parallelism_values_fail_before_source_or_destination_work() {
 
 // ---- Merge loads (ADR-0057, ADR-0058, ADR-0059) ----
 
-/// Writes a merge-shaped load definition: the standard blocks plus a raw
-/// trailing block for `merge:`, `transform:`, or `reject_threshold:` lines.
-fn write_merge_definition(
+/// Writes the shared load-definition template every helper below fills in:
+/// the standard blocks plus a raw trailing block for `schema:`, `merge:`,
+/// `transform:`, or `reject_threshold:` lines.
+// One parameter per definition key it fills, in definition order — a
+// bundling struct would just restate the template.
+#[allow(clippy::too_many_arguments)]
+fn write_definition_for_dataset(
     definition_path: &Path,
     source_path: &Path,
     source_format: &str,
     destination_connector: &str,
     destination_path: &Path,
+    dataset: &str,
     load_mode: &str,
     extra_blocks: &str,
 ) {
@@ -8425,7 +8430,7 @@ fn write_merge_definition(
              destination:\n\
              \x20 connector: {destination_connector}\n\
              \x20 path: {}\n\
-             dataset: customers\n\
+             dataset: {dataset}\n\
              load_mode: {load_mode}\n\
              {extra_blocks}",
             source_path.display(),
@@ -8433,6 +8438,28 @@ fn write_merge_definition(
         ),
     )
     .expect("write load definition");
+}
+
+/// Writes a merge-shaped load definition against the `customers` dataset.
+fn write_merge_definition(
+    definition_path: &Path,
+    source_path: &Path,
+    source_format: &str,
+    destination_connector: &str,
+    destination_path: &Path,
+    load_mode: &str,
+    extra_blocks: &str,
+) {
+    write_definition_for_dataset(
+        definition_path,
+        source_path,
+        source_format,
+        destination_connector,
+        destination_path,
+        "customers",
+        load_mode,
+        extra_blocks,
+    );
 }
 
 #[test]
@@ -9151,24 +9178,16 @@ fn a_zero_survivor_merge_commits_a_no_op_and_exits_zero() {
 
     // Text-typed columns keep the header-only day aligned with the table.
     fs::write(&source_path, "station,city\nS-1,Berlin\n").expect("write bootstrap csv");
-    fs::write(
+    write_definition_for_dataset(
         &definition_path,
-        format!(
-            "version: 1\n\
-             source:\n\
-             \x20 connector: local_file\n\
-             \x20 path: {}\n\
-             \x20 format: csv\n\
-             destination:\n\
-             \x20 connector: duckdb\n\
-             \x20 path: {}\n\
-             dataset: readings\n\
-             load_mode: full_refresh\n",
-            source_path.display(),
-            database_path.display(),
-        ),
-    )
-    .expect("write bootstrap definition");
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "readings",
+        "full_refresh",
+        "",
+    );
     run_cli_load(
         work.path(),
         &work.path().join("artifacts-day-1"),
@@ -9179,26 +9198,16 @@ fn a_zero_survivor_merge_commits_a_no_op_and_exits_zero() {
     // A header-only day has zero survivors: the stage stays empty, the merge
     // is a no-op, and the terminal commit still completes the load.
     fs::write(&source_path, "station,city\n").expect("write empty csv");
-    fs::write(
+    write_definition_for_dataset(
         &definition_path,
-        format!(
-            "version: 1\n\
-             source:\n\
-             \x20 connector: local_file\n\
-             \x20 path: {}\n\
-             \x20 format: csv\n\
-             destination:\n\
-             \x20 connector: duckdb\n\
-             \x20 path: {}\n\
-             dataset: readings\n\
-             load_mode: merge\n\
-             merge:\n\
-             \x20 keys: [station]\n",
-            source_path.display(),
-            database_path.display(),
-        ),
-    )
-    .expect("write merge definition");
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "readings",
+        "merge",
+        "merge:\n  keys: [station]\n",
+    );
     let merge = run_cli_load(
         work.path(),
         &work.path().join("artifacts-day-2"),
@@ -9436,25 +9445,16 @@ fn write_load_definition(
     let schema_block = pinned_path
         .map(|path| format!("schema:\n  pinned_path: {}\n", path.display()))
         .unwrap_or_default();
-    fs::write(
+    write_definition_for_dataset(
         definition_path,
-        format!(
-            "version: 1\n\
-             source:\n\
-             \x20 connector: local_file\n\
-             \x20 path: {}\n\
-             \x20 format: {source_format}\n\
-             destination:\n\
-             \x20 connector: {destination_connector}\n\
-             \x20 path: {}\n\
-             dataset: customers\n\
-             load_mode: {load_mode}\n\
-             {schema_block}",
-            source_path.display(),
-            destination_path.display(),
-        ),
-    )
-    .expect("write load definition");
+        source_path,
+        source_format,
+        destination_connector,
+        destination_path,
+        "customers",
+        load_mode,
+        &schema_block,
+    );
 }
 
 fn run_cli_load(

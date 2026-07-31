@@ -622,6 +622,12 @@ fails with `reject_threshold_exceeded`, and reports exactly the same two
 fields: the records it had rejected before it stopped, and the artifact it
 wrote them to.
 
+Each artifact line carries its own rejection code — `malformed_csv_record`,
+`malformed_jsonl_record`, `type_coercion_failed`, `missing_required_field`,
+or `null_merge_key` (a null in a merge key field) — distinct from the
+report's `error_summary` codes; the
+[rejected records guide](../guides/rejected-records.md) documents each.
+
 ## `destination_write`
 
 Governing ADRs:
@@ -701,12 +707,16 @@ remainder, and `updated + inserted` always equals `row_counts.written`:
 }
 ```
 
-The `merge` key is absent on every failed merge — the terminal commit means
-a failure committed nothing to count. A merge that fails inside its open
-transaction (a duplicate-key failure, say) reports the `atomic` /
-`transactional_merge` facts without counts; one that fails before the
-session opened reports `not_applicable` like any other untouched
-destination.
+The `merge` key is absent on every failed merge. Almost always that is
+because the terminal commit never ran, so nothing was committed to count: a
+merge that fails inside its open transaction (a duplicate-key failure, say)
+reports the `atomic` / `transactional_merge` facts without counts, and one
+that fails before the session opened reports `not_applicable` like any
+other untouched destination. On the one failure past the commit — a
+connection that would not close cleanly — the write had landed and
+`row_counts.written` says so, but the counts are still withheld: a failed
+report never states a partition it could not deliver with a completed
+load.
 
 ## `execution`
 
@@ -1009,8 +1019,8 @@ bootstrapped from this load's own inference. `orders.jsonl` holds:
 {
   "report_version": 1,
   "binary_version": "0.3.0",
-  "load_id": "767bbafd-5874-4ccc-aa52-2423a7482fa4",
-  "artifact_dir": ".data-spark/runs/767bbafd-5874-4ccc-aa52-2423a7482fa4",
+  "load_id": "9038568a-a568-4c76-aa84-d44b88728a59",
+  "artifact_dir": ".data-spark/runs/9038568a-a568-4c76-aa84-d44b88728a59",
   "source_summary": {
     "connector": "local_file",
     "path": "orders.jsonl",
@@ -1082,9 +1092,9 @@ bootstrapped from this load's own inference. `orders.jsonl` holds:
     }
   },
   "timings": {
-    "started_unix_ms": 1785467945932,
-    "finished_unix_ms": 1785467946300,
-    "duration_ms": 368
+    "started_unix_ms": 1785468428671,
+    "finished_unix_ms": 1785468428855,
+    "duration_ms": 184
   },
   "exit_status": "succeeded",
   "process_exit_code": 0,
@@ -1110,8 +1120,8 @@ detail says exactly what moved.
 {
   "report_version": 1,
   "binary_version": "0.3.0",
-  "load_id": "abf37645-fc81-4777-8273-70d50e7ab7dc",
-  "artifact_dir": ".data-spark/runs/abf37645-fc81-4777-8273-70d50e7ab7dc",
+  "load_id": "cab6269a-2c14-4060-bdcf-1b3d860fa6e6",
+  "artifact_dir": ".data-spark/runs/cab6269a-2c14-4060-bdcf-1b3d860fa6e6",
   "source_summary": {
     "connector": "local_file",
     "path": "orders.jsonl",
@@ -1180,9 +1190,9 @@ detail says exactly what moved.
     "batch_count": 0
   },
   "timings": {
-    "started_unix_ms": 1785467946341,
-    "finished_unix_ms": 1785467946342,
-    "duration_ms": 1
+    "started_unix_ms": 1785468428860,
+    "finished_unix_ms": 1785468428860,
+    "duration_ms": 0
   },
   "exit_status": "failed",
   "process_exit_code": 1,

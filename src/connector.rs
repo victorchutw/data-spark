@@ -1222,6 +1222,32 @@ impl DuckDbTable {
         Ok(connection)
     }
 
+    /// Probes the destination table's Arrow schema with a `LIMIT 0` select —
+    /// the shared session-start step of the modes that write into an
+    /// existing table (append and merge): the table must exist, and the
+    /// probed schema is what every chunk aligns against. `operation` names
+    /// the mode in the failure message ("before append" / "before merge").
+    fn inspect_schema(
+        &self,
+        connection: &Connection,
+        operation: &'static str,
+    ) -> Result<SchemaRef, LoadFailure> {
+        let statement = format!("SELECT * FROM {} LIMIT 0", self.quoted_dataset());
+        let inspect_failure = |error: duckdb::Error| LoadFailure {
+            code: "destination_write_failed",
+            message: format!(
+                "failed to inspect DuckDB table {} in {} before {operation}: {error}",
+                self.dataset,
+                self.path.display()
+            ),
+        };
+        let mut statement = connection.prepare(&statement).map_err(inspect_failure)?;
+        Ok(statement
+            .query_arrow([])
+            .map_err(inspect_failure)?
+            .get_schema())
+    }
+
     fn close_failure(&self, error: duckdb::Error) -> LoadFailure {
         LoadFailure {
             code: "destination_write_failed",
@@ -1438,22 +1464,7 @@ impl DuckDbAppendSession {
 impl DuckDbAppendWriter {
     fn begin(table: DuckDbTable) -> Result<Self, DestinationWriteFailure> {
         let connection = table.open_arrow_connection()?;
-        let statement = format!("SELECT * FROM {} LIMIT 0", table.quoted_dataset());
-        let inspect_failure = |error: duckdb::Error| LoadFailure {
-            code: "destination_write_failed",
-            message: format!(
-                "failed to inspect DuckDB table {} in {} before append: {error}",
-                table.dataset,
-                table.path.display()
-            ),
-        };
-        let destination_schema = {
-            let mut statement = connection.prepare(&statement).map_err(inspect_failure)?;
-            statement
-                .query_arrow([])
-                .map_err(inspect_failure)?
-                .get_schema()
-        };
+        let destination_schema = table.inspect_schema(&connection, "append")?;
         Ok(DuckDbAppendWriter {
             table,
             destination_schema,
@@ -1579,22 +1590,7 @@ impl DuckDbMergeWriter {
         // merge session always has at least one.
         assert!(!merge_keys.is_empty(), "merge session without merge keys");
         let connection = table.open_arrow_connection()?;
-        let statement = format!("SELECT * FROM {} LIMIT 0", table.quoted_dataset());
-        let inspect_failure = |error: duckdb::Error| LoadFailure {
-            code: "destination_write_failed",
-            message: format!(
-                "failed to inspect DuckDB table {} in {} before merge: {error}",
-                table.dataset,
-                table.path.display()
-            ),
-        };
-        let destination_schema = {
-            let mut statement = connection.prepare(&statement).map_err(inspect_failure)?;
-            statement
-                .query_arrow([])
-                .map_err(inspect_failure)?
-                .get_schema()
-        };
+        let destination_schema = table.inspect_schema(&connection, "merge")?;
         connection
             .execute_batch("BEGIN")
             .map_err(|error| LoadFailure {
