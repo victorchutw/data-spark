@@ -214,6 +214,10 @@ _Avoid_: Key inference, automatic key selection
 A source record that cannot be written to the destination dataset without violating the chosen schema or load rules.
 _Avoid_: Bad row, error row, dead letter
 
+**Surviving Record**:
+A source record that can be written to the destination dataset while honoring the chosen schema and load rules.
+_Avoid_: Good row, valid row, kept record
+
 **Staging Object**:
 A temporary data object prepared so a destination can load records through its native batch loading path.
 _Avoid_: Temp file, intermediate file, upload
