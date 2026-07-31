@@ -9354,8 +9354,10 @@ fn duplicate_merge_keys_fail_the_load_and_leave_the_destination_byte_identical()
         report["destination_write"]["strategy"],
         "transactional_merge"
     );
+    // Truly absent, not `null` by another name: indexing would conflate
+    // the two, and the contract promises absence on failure.
     assert!(
-        report["destination_write"]["merge"].is_null(),
+        report["destination_write"].get("merge").is_none(),
         "a failed merge reports no merge counts"
     );
     assert_eq!(report["execution"]["record_format"], "arrow_record_batch");

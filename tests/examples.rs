@@ -724,8 +724,10 @@ fn assert_report(context: &str, stdout: &str, report: &Value, load: &Load) {
                 serde_json::json!({ "updated": updated, "inserted": inserted }),
                 "{context}: the merge partition the README names"
             ),
+            // Truly absent, not `null` by another name: indexing would
+            // conflate the two, and the contract promises absence.
             None => assert!(
-                report["destination_write"]["merge"].is_null(),
+                report["destination_write"].get("merge").is_none(),
                 "{context}: only a committed merge reports merge counts"
             ),
         }
