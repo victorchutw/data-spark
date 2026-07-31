@@ -13,7 +13,7 @@ install the single binary, and a quickstart load. From there:
 | Where | What it holds |
 | --- | --- |
 | [../examples/](../examples/) | Small, self-contained, runnable examples: a fixture, its load definitions, and a README saying what each demonstrates. `cargo test --locked` runs every one of them against the built binary ([tests/examples.rs](../tests/examples.rs)), so an example that stops working fails CI. |
-| [guides/](guides/) | Task-oriented walkthroughs, each starting from one of those examples and working through one feature at a time: [schema pinning](guides/schema-pinning.md), [rejected records](guides/rejected-records.md), [declared types](guides/declared-types.md), and [execution tuning](guides/execution-tuning.md). |
+| [guides/](guides/) | Task-oriented walkthroughs, each starting from one of those examples and working through one feature at a time: [schema pinning](guides/schema-pinning.md), [rejected records](guides/rejected-records.md), [declared types](guides/declared-types.md), [execution tuning](guides/execution-tuning.md), and [merge loads](guides/merge-loads.md). |
 | [reference/](reference/) | The two contracts you write and read, documented key by key: the [Load Definition Reference](reference/load-definition.md) (the YAML you write) and the [Load Report Reference](reference/load-report.md) (the JSON every load writes). |
 
 What changed between releases is in [../CHANGELOG.md](../CHANGELOG.md).

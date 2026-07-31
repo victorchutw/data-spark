@@ -11,6 +11,7 @@ real binary and checks its load report, so an example that stops working fails C
 | [csv-to-duckdb-full-refresh](csv-to-duckdb-full-refresh/) | The README quickstart: CSV into a DuckDB table, full refresh, inferred schema. |
 | [csv-to-parquet-append](csv-to-parquet-append/) | Two days of CSV appended to a Parquet dataset directory, format resolved from the path extension. |
 | [jsonl-to-duckdb-append](jsonl-to-duckdb-append/) | Two days of JSONL appended to a DuckDB table, with types inferred from JSON values. |
+| [csv-to-duckdb-merge](csv-to-duckdb-merge/) | Two days of CSV merged into a DuckDB table by `customer_id`: day 2 updates one record whole and inserts another. |
 | [jsonl-to-parquet-full-refresh](jsonl-to-parquet-full-refresh/) | JSONL into a Parquet dataset directory; a second load replaces rather than accumulates. |
 | [pinned-schema-additive-drift](pinned-schema-additive-drift/) | A pinned schema bootstrapped by the first load, then extended by `drift_policy: allow_additive_nullable`. |
 | [pinned-schema-fail-on-drift](pinned-schema-fail-on-drift/) | The same drift under the default `fail` policy — **a documented failure**: the second load exits 1 with `schema_drift`. |

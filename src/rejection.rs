@@ -38,6 +38,9 @@ pub(crate) const MALFORMED_JSONL_RECORD: &str = "malformed_jsonl_record";
 pub(crate) const TYPE_COERCION_FAILED: &str = "type_coercion_failed";
 /// A null or absent value in a `nullable: false` pinned field.
 pub(crate) const MISSING_REQUIRED_FIELD: &str = "missing_required_field";
+/// A null or absent value in a merge key field: merge keys are implicitly
+/// non-null, since a null never equals anything under key equality.
+pub(crate) const NULL_MERGE_KEY: &str = "null_merge_key";
 
 /// One rejected record: the source context and error information a
 /// troubleshooter needs to find and fix the record (issue #8). `field` names

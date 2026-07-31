@@ -71,6 +71,21 @@ pub(crate) type SourceChunks = Box<dyn Iterator<Item = Result<RecordBatch, LoadF
 pub(crate) struct DestinationWriteFacts {
     atomicity: &'static str,
     strategy: Option<&'static str>,
+    /// A committed merge session's record partition (ADR-0059); `None`
+    /// everywhere else, including every failure path — a terminal-commit
+    /// failure committed nothing to count.
+    merge: Option<MergeWriteCounts>,
+}
+
+/// How a committed merge partitioned its surviving records (ADR-0059):
+/// `updated` counts the records whose key tuple matched an existing
+/// destination record — replaced whole — and `inserted` the unmatched
+/// remainder, so `updated + inserted` always equals the written record
+/// count.
+#[derive(Clone, Copy, Debug)]
+struct MergeWriteCounts {
+    updated: u64,
+    inserted: u64,
 }
 
 impl DestinationWriteFacts {
@@ -78,6 +93,7 @@ impl DestinationWriteFacts {
         DestinationWriteFacts {
             atomicity: "not_applicable",
             strategy: None,
+            merge: None,
         }
     }
 
@@ -85,6 +101,7 @@ impl DestinationWriteFacts {
         DestinationWriteFacts {
             atomicity: "atomic",
             strategy: Some(strategy),
+            merge: None,
         }
     }
 
@@ -92,19 +109,33 @@ impl DestinationWriteFacts {
         DestinationWriteFacts {
             atomicity: "best_effort",
             strategy: Some(strategy),
+            merge: None,
+        }
+    }
+
+    fn with_merge_counts(self, updated: u64, inserted: u64) -> Self {
+        DestinationWriteFacts {
+            merge: Some(MergeWriteCounts { updated, inserted }),
+            ..self
         }
     }
 
     pub(crate) fn report_value(self) -> Value {
-        match self.strategy {
-            Some(strategy) => serde_json::json!({
-                "atomicity": self.atomicity,
-                "strategy": strategy
-            }),
-            None => serde_json::json!({
-                "atomicity": self.atomicity
-            }),
+        let mut facts = serde_json::Map::new();
+        facts.insert("atomicity".to_string(), Value::from(self.atomicity));
+        if let Some(strategy) = self.strategy {
+            facts.insert("strategy".to_string(), Value::from(strategy));
         }
+        if let Some(merge) = self.merge {
+            facts.insert(
+                "merge".to_string(),
+                serde_json::json!({
+                    "updated": merge.updated,
+                    "inserted": merge.inserted
+                }),
+            );
+        }
+        Value::Object(facts)
     }
 }
 
@@ -192,20 +223,27 @@ impl From<LoadFailure> for DestinationWriteFailure {
 
 /// The rule that decides how a load changes the destination dataset. Parsed once
 /// from the raw load-definition string at the write-dispatch boundary; the
-/// report still carries the raw string. Full refresh and append exist today;
-/// merge follows them (ADR-0008).
+/// report still carries the raw string. Full refresh, append, and merge — the
+/// complete v1 mode set of ADR-0008 — exist today; merge lands on DuckDB
+/// only, and every other destination declines it through its declared mode
+/// support (ADR-0057).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoadMode {
     FullRefresh,
     Append,
+    Merge,
 }
 
 impl LoadMode {
-    /// Parses the load mode, the single validation point for the raw string.
+    /// Parses the load mode, the single validation point for the raw string:
+    /// `unsupported_load_mode` means exactly "this mode string is unknown" —
+    /// a known mode a destination declines fails as
+    /// `unsupported_load_mode_for_destination` instead (ADR-0057).
     pub(crate) fn parse(load_mode: &str) -> Result<Self, LoadFailure> {
         match load_mode {
             "full_refresh" => Ok(LoadMode::FullRefresh),
             "append" => Ok(LoadMode::Append),
+            "merge" => Ok(LoadMode::Merge),
             other => Err(LoadFailure {
                 code: "unsupported_load_mode",
                 message: format!("unsupported load mode: {other}"),
@@ -217,11 +255,14 @@ impl LoadMode {
         match self {
             LoadMode::FullRefresh => "full_refresh",
             LoadMode::Append => "append",
+            LoadMode::Merge => "merge",
         }
     }
 }
 
 const FULL_REFRESH_AND_APPEND_LOAD_MODES: &[LoadMode] = &[LoadMode::FullRefresh, LoadMode::Append];
+
+const ALL_LOAD_MODES: &[LoadMode] = &[LoadMode::FullRefresh, LoadMode::Append, LoadMode::Merge];
 
 /// A named capability for reading records from a source. Resolves the load
 /// under its schema directive — completing every whole-input decision before
@@ -236,6 +277,7 @@ pub(crate) trait Source {
     fn read(
         &self,
         directive: &SchemaDirective,
+        merge_keys: &schema::MergeKeys,
         chunk_rows: usize,
         sink: &mut RejectionSink,
     ) -> Result<SourceRead, ExecutionFailure>;
@@ -246,6 +288,10 @@ pub(crate) trait Source {
 /// ([`Destination::begin`]), owns how that session commits (ADR-0047), and
 /// reports its own write facts.
 pub(crate) trait Destination {
+    /// The connector name the definition selects this destination by, so a
+    /// declined load mode can name the destination that declined it.
+    fn connector_name(&self) -> &'static str;
+
     fn supported_load_modes(&self) -> &'static [LoadMode];
 
     /// The Connector Parallelism Limit of one load mode (ADR-0051): the
@@ -261,13 +307,28 @@ pub(crate) trait Destination {
         NonZeroU64::MIN
     }
 
+    /// Declines a known load mode this destination does not support, before
+    /// any I/O. Distinct from `unsupported_load_mode`, which names an
+    /// unknown mode string: a declined mode names the destination and what
+    /// it does support, so narrowing the matrix stays a per-destination
+    /// declaration (ADR-0057).
     fn validate_mode(&self, mode: LoadMode) -> Result<(), LoadFailure> {
         if self.supported_load_modes().contains(&mode) {
             Ok(())
         } else {
+            let supported = self
+                .supported_load_modes()
+                .iter()
+                .map(|supported| supported.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             Err(LoadFailure {
-                code: "unsupported_load_mode",
-                message: format!("destination does not support load mode: {}", mode.as_str()),
+                code: "unsupported_load_mode_for_destination",
+                message: format!(
+                    "{} destination does not support load mode: {} (supported load modes: {supported})",
+                    self.connector_name(),
+                    mode.as_str()
+                ),
             })
         }
     }
@@ -336,10 +397,13 @@ pub(crate) fn source_connector(
 /// connector name plus the addressing the connector needs — for `duckdb`, a
 /// present `dataset` naming the destination table (ADR-0030) — doing no I/O,
 /// so an unsupported or incomplete definition fails before any destination
-/// write (ADR-0019).
+/// write (ADR-0019). `merge_keys` are the definition's already-validated
+/// merge keys — empty for every non-merge load — which a merge session
+/// upserts on (ADR-0059); destinations that decline merge ignore them.
 pub(crate) fn destination_connector(
     definition: &DestinationDefinition,
     dataset: Option<&str>,
+    merge_keys: &[String],
 ) -> Result<Box<dyn Destination>, LoadFailure> {
     match definition.connector.as_str() {
         "parquet" => Ok(Box::new(ParquetDestination {
@@ -361,6 +425,7 @@ pub(crate) fn destination_connector(
                     path: definition.path.clone(),
                     dataset: dataset.to_string(),
                 },
+                merge_keys: merge_keys.to_vec(),
             }))
         }
         other => Err(LoadFailure {
@@ -382,6 +447,7 @@ impl Source for LocalFileSource {
     fn read(
         &self,
         directive: &SchemaDirective,
+        merge_keys: &schema::MergeKeys,
         chunk_rows: usize,
         sink: &mut RejectionSink,
     ) -> Result<SourceRead, ExecutionFailure> {
@@ -390,8 +456,8 @@ impl Source for LocalFileSource {
         // stays after the destination-connector check for a doubly-invalid
         // definition (the check lives here, not in the factory).
         match self.resolved_format().as_str() {
-            "csv" => self.read_csv(directive, chunk_rows, sink),
-            "jsonl" => self.read_jsonl(directive, chunk_rows, sink),
+            "csv" => self.read_csv(directive, merge_keys, chunk_rows, sink),
+            "jsonl" => self.read_jsonl(directive, merge_keys, chunk_rows, sink),
             _ => Err(LoadFailure {
                 code: "unsupported_source_format",
                 message: "only local CSV and JSONL sources are supported by this load path"
@@ -420,6 +486,7 @@ impl LocalFileSource {
     fn read_csv(
         &self,
         directive: &SchemaDirective,
+        merge_keys: &schema::MergeKeys,
         chunk_rows: usize,
         sink: &mut RejectionSink,
     ) -> Result<SourceRead, ExecutionFailure> {
@@ -428,7 +495,7 @@ impl LocalFileSource {
         let mut reader = csv_source_reader(HashingReader::new(file, hash.clone()));
         let field_names = read_csv_header(&mut reader, &self.path)?;
 
-        let mut observer = schema::TextObserver::new(directive, &field_names);
+        let mut observer = schema::TextObserver::new(directive, merge_keys, &field_names);
         let mut parsed_records = 0_u64;
         let mut parse_rejected = 0_u64;
         for record in reader.records() {
@@ -490,6 +557,7 @@ impl LocalFileSource {
     fn read_jsonl(
         &self,
         directive: &SchemaDirective,
+        merge_keys: &schema::MergeKeys,
         chunk_rows: usize,
         sink: &mut RejectionSink,
     ) -> Result<SourceRead, ExecutionFailure> {
@@ -497,7 +565,7 @@ impl LocalFileSource {
         let hash = HashState::new();
         let mut reader = BufReader::new(HashingReader::new(file, hash.clone()));
 
-        let mut observer = schema::JsonObserver::new(directive);
+        let mut observer = schema::JsonObserver::new(directive, merge_keys);
         let mut spill = sink.spill();
         let mut field_names: Vec<String> = Vec::new();
         let mut seen_fields: HashSet<String> = HashSet::new();
@@ -647,6 +715,10 @@ struct ParquetDestination {
 }
 
 impl Destination for ParquetDestination {
+    fn connector_name(&self) -> &'static str {
+        "parquet"
+    }
+
     fn supported_load_modes(&self) -> &'static [LoadMode] {
         FULL_REFRESH_AND_APPEND_LOAD_MODES
     }
@@ -657,6 +729,13 @@ impl Destination for ParquetDestination {
                 self.path.clone(),
             )?)),
             LoadMode::Append => Ok(Box::new(ParquetAppendWriter::begin(self.path.clone())?)),
+            LoadMode::Merge => {
+                // Parquet declines merge (ADR-0057); the orchestrator's
+                // validate_mode call fails the load before begin, and a
+                // directly-driven session reports the same declination.
+                self.validate_mode(mode)?;
+                unreachable!("parquet validate_mode declines merge");
+            }
         }
     }
 }
@@ -1090,6 +1169,10 @@ fn write_parquet_batch(path: &Path, batch: &RecordBatch) -> Result<u64, LoadFail
 /// Arrow-to-DuckDB type mapping stays delegated to DuckDB (ADR-0030).
 struct DuckDbDestination {
     table: DuckDbTable,
+    // The definition's validated merge keys — empty for non-merge loads,
+    // non-empty whenever a merge session begins (the definition boundary
+    // rejects a merge load without keys).
+    merge_keys: Vec<String>,
 }
 
 /// The table a DuckDB session addresses: the database file plus the dataset
@@ -1101,9 +1184,16 @@ struct DuckDbTable {
     dataset: String,
 }
 
+/// Double-quote-escapes one identifier (`"` doubled) for a DuckDB
+/// statement, the ADR-0030 escaping rule shared by every identifier a
+/// session spells — dataset names, stage names, and column names alike.
+fn quote_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 impl DuckDbTable {
     fn quoted_dataset(&self) -> String {
-        format!("\"{}\"", self.dataset.replace('"', "\"\""))
+        quote_identifier(&self.dataset)
     }
 
     fn open_arrow_connection(&self) -> Result<Connection, LoadFailure> {
@@ -1132,6 +1222,32 @@ impl DuckDbTable {
         Ok(connection)
     }
 
+    /// Probes the destination table's Arrow schema with a `LIMIT 0` select —
+    /// the shared session-start step of the modes that write into an
+    /// existing table (append and merge): the table must exist, and the
+    /// probed schema is what every chunk aligns against. `operation` names
+    /// the mode in the failure message ("before append" / "before merge").
+    fn inspect_schema(
+        &self,
+        connection: &Connection,
+        operation: &'static str,
+    ) -> Result<SchemaRef, LoadFailure> {
+        let statement = format!("SELECT * FROM {} LIMIT 0", self.quoted_dataset());
+        let inspect_failure = |error: duckdb::Error| LoadFailure {
+            code: "destination_write_failed",
+            message: format!(
+                "failed to inspect DuckDB table {} in {} before {operation}: {error}",
+                self.dataset,
+                self.path.display()
+            ),
+        };
+        let mut statement = connection.prepare(&statement).map_err(inspect_failure)?;
+        Ok(statement
+            .query_arrow([])
+            .map_err(inspect_failure)?
+            .get_schema())
+    }
+
     fn close_failure(&self, error: duckdb::Error) -> LoadFailure {
         LoadFailure {
             code: "destination_write_failed",
@@ -1144,8 +1260,12 @@ impl DuckDbTable {
 }
 
 impl Destination for DuckDbDestination {
+    fn connector_name(&self) -> &'static str {
+        "duckdb"
+    }
+
     fn supported_load_modes(&self) -> &'static [LoadMode] {
-        FULL_REFRESH_AND_APPEND_LOAD_MODES
+        ALL_LOAD_MODES
     }
 
     fn begin(&self, mode: LoadMode) -> Result<Box<dyn DestinationWriter>, DestinationWriteFailure> {
@@ -1154,6 +1274,10 @@ impl Destination for DuckDbDestination {
                 self.table.clone(),
             )?)),
             LoadMode::Append => Ok(Box::new(DuckDbAppendWriter::begin(self.table.clone())?)),
+            LoadMode::Merge => Ok(Box::new(DuckDbMergeWriter::begin(
+                self.table.clone(),
+                self.merge_keys.clone(),
+            )?)),
         }
     }
 }
@@ -1340,22 +1464,7 @@ impl DuckDbAppendSession {
 impl DuckDbAppendWriter {
     fn begin(table: DuckDbTable) -> Result<Self, DestinationWriteFailure> {
         let connection = table.open_arrow_connection()?;
-        let statement = format!("SELECT * FROM {} LIMIT 0", table.quoted_dataset());
-        let inspect_failure = |error: duckdb::Error| LoadFailure {
-            code: "destination_write_failed",
-            message: format!(
-                "failed to inspect DuckDB table {} in {} before append: {error}",
-                table.dataset,
-                table.path.display()
-            ),
-        };
-        let destination_schema = {
-            let mut statement = connection.prepare(&statement).map_err(inspect_failure)?;
-            statement
-                .query_arrow([])
-                .map_err(inspect_failure)?
-                .get_schema()
-        };
+        let destination_schema = table.inspect_schema(&connection, "append")?;
         Ok(DuckDbAppendWriter {
             table,
             destination_schema,
@@ -1371,9 +1480,13 @@ impl DuckDbAppendWriter {
 impl DestinationWriter for DuckDbAppendWriter {
     fn write_chunk(&self, batch: &RecordBatch) -> Result<(), DestinationWriteFailure> {
         let mut session = self.session.lock().expect("writer session lock");
-        let append_batch =
-            align_batch_to_duckdb_schema(&self.table, batch, self.destination_schema.clone())
-                .map_err(|failure| session.chunk_failure(failure))?;
+        let append_batch = align_batch_to_duckdb_schema(
+            &self.table,
+            batch,
+            self.destination_schema.clone(),
+            "append",
+        )
+        .map_err(|failure| session.chunk_failure(failure))?;
 
         let statement = format!(
             "INSERT INTO {} BY NAME SELECT * FROM arrow(?, ?)",
@@ -1437,27 +1550,340 @@ impl DestinationWriter for DuckDbAppendWriter {
     }
 }
 
+/// The DuckDB merge session (ADR-0059): the destination table must already
+/// exist — its schema is probed at session start exactly like append, so
+/// bootstrap stays "first load `full_refresh`, then switch to `merge`" —
+/// then one explicit transaction holds a session-unique temporary staging
+/// table, every chunk aligns against the destination schema and lands in
+/// the stage, and `commit` runs the duplicate-key gate (ADR-0058), the
+/// matched-record count, and one `MERGE INTO` before the single terminal
+/// `COMMIT` (the full-refresh commit family of ADR-0047). Nothing is
+/// destination-visible before that commit; any earlier failure drops the
+/// connection, which rolls the open transaction back and discards the
+/// temporary stage.
+struct DuckDbMergeWriter {
+    table: DuckDbTable,
+    merge_keys: Vec<String>,
+    destination_schema: SchemaRef,
+    /// The session-unique temporary stage name. References qualify it as
+    /// `temp.main.<stage>` so no persistent table can capture them, and the
+    /// UUID suffix keeps the unqualified `MERGE INTO` target from ever
+    /// resolving to the stage by name.
+    stage: String,
+    // Interior lock because `write_chunk` takes `&self` (the session
+    // contract is `Sync`); at this connector's declared parallelism limit
+    // of 1 the lock is never contended.
+    session: Mutex<DuckDbMergeSession>,
+}
+
+struct DuckDbMergeSession {
+    connection: Option<Connection>,
+    // Chunks staged inside the still-open transaction: nothing is committed
+    // before COMMIT, which is why abandon reports zero regardless.
+    staged_chunks: u64,
+    staged_records: u64,
+}
+
+impl DuckDbMergeWriter {
+    fn begin(table: DuckDbTable, merge_keys: Vec<String>) -> Result<Self, DestinationWriteFailure> {
+        // The definition boundary rejects a merge load without keys, so a
+        // merge session always has at least one.
+        assert!(!merge_keys.is_empty(), "merge session without merge keys");
+        let connection = table.open_arrow_connection()?;
+        let destination_schema = table.inspect_schema(&connection, "merge")?;
+        connection
+            .execute_batch("BEGIN")
+            .map_err(|error| LoadFailure {
+                code: "destination_write_failed",
+                message: format!(
+                    "failed to begin the DuckDB merge transaction in {}: {error}",
+                    table.path.display()
+                ),
+            })?;
+        let stage = format!("data_spark_merge_stage_{}", Uuid::new_v4().simple());
+        connection
+            .execute_batch(&format!(
+                "CREATE TEMPORARY TABLE {} AS SELECT * FROM {} LIMIT 0",
+                quote_identifier(&stage),
+                table.quoted_dataset()
+            ))
+            .map_err(|error| LoadFailure {
+                code: "destination_write_failed",
+                message: format!(
+                    "failed to create the DuckDB merge stage for table {} in {}: {error}",
+                    table.dataset,
+                    table.path.display()
+                ),
+            })?;
+        Ok(DuckDbMergeWriter {
+            table,
+            merge_keys,
+            destination_schema,
+            stage,
+            session: Mutex::new(DuckDbMergeSession {
+                connection: Some(connection),
+                staged_chunks: 0,
+                staged_records: 0,
+            }),
+        })
+    }
+
+    /// A failure inside the still-open merge transaction: atomic facts,
+    /// nothing written — dropping the connection rolls everything back.
+    fn transactional_failure(
+        &self,
+        code: &'static str,
+        message: String,
+    ) -> DestinationWriteFailure {
+        DestinationWriteFailure::atomic(LoadFailure { code, message }, "transactional_merge", 0)
+    }
+
+    fn write_failure(&self, action: &str, error: duckdb::Error) -> DestinationWriteFailure {
+        self.transactional_failure(
+            "destination_write_failed",
+            format!(
+                "failed to {action} DuckDB table {} in {}: {error}",
+                self.table.dataset,
+                self.table.path.display()
+            ),
+        )
+    }
+
+    /// The qualified stage reference every statement uses: the `temp`
+    /// catalog is per connection, so the reference can never capture a
+    /// persistent table.
+    fn stage_reference(&self) -> String {
+        format!("temp.main.{}", quote_identifier(&self.stage))
+    }
+
+    /// The `ON` equality over the merge keys: null keys were rejected before
+    /// the write phase, so SQL equality is total over the staged records.
+    fn key_equality(&self) -> String {
+        self.merge_keys
+            .iter()
+            .map(|key| {
+                format!(
+                    "merge_target.{key} = merge_source.{key}",
+                    key = quote_identifier(key)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    }
+
+    /// Counts the staged records that share their merge key tuple with
+    /// another staged record — the ADR-0058 gate, run destination-side
+    /// because a distinct-key set is not bounded pass-1 state (ADR-0045).
+    /// Zero or at least two, never one, so the failure message can speak of
+    /// records in the plural.
+    fn colliding_records_sql(&self) -> String {
+        let partition = self
+            .merge_keys
+            .iter()
+            .map(|key| quote_identifier(key))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT count(*) FROM (SELECT count(*) OVER (PARTITION BY {partition}) \
+             AS key_tuple_records FROM {stage}) AS keyed WHERE key_tuple_records > 1",
+            stage = self.stage_reference()
+        )
+    }
+
+    /// Counts the staged records whose key tuple matches an existing
+    /// destination record — the report's `updated`; the remainder of the
+    /// stage is `inserted`, so `updated + inserted` is the staged record
+    /// count by construction (ADR-0059).
+    fn matched_records_sql(&self) -> String {
+        format!(
+            "SELECT count(*) FROM {stage} AS merge_source WHERE EXISTS \
+             (SELECT 1 FROM {target} AS merge_target WHERE {equality})",
+            stage = self.stage_reference(),
+            target = self.table.quoted_dataset(),
+            equality = self.key_equality()
+        )
+    }
+
+    /// The single `MERGE INTO` of the session: matched destination records
+    /// are replaced whole — every non-key column takes the staged value —
+    /// and unmatched staged records insert. With every column a key there is
+    /// nothing to update, so the matched clause is omitted and matched
+    /// records are left as their own replacement.
+    fn merge_sql(&self) -> String {
+        let columns = self
+            .destination_schema
+            .fields()
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+        let non_key_updates = columns
+            .iter()
+            .filter(|column| !self.merge_keys.iter().any(|key| key == *column))
+            .map(|column| {
+                format!(
+                    "{column} = merge_source.{column}",
+                    column = quote_identifier(column)
+                )
+            })
+            .collect::<Vec<_>>();
+        let matched_clause = if non_key_updates.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " WHEN MATCHED THEN UPDATE SET {}",
+                non_key_updates.join(", ")
+            )
+        };
+        let insert_columns = columns
+            .iter()
+            .map(|column| quote_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let insert_values = columns
+            .iter()
+            .map(|column| format!("merge_source.{}", quote_identifier(column)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "MERGE INTO {target} AS merge_target USING {stage} AS merge_source \
+             ON {equality}{matched_clause} \
+             WHEN NOT MATCHED THEN INSERT ({insert_columns}) VALUES ({insert_values})",
+            target = self.table.quoted_dataset(),
+            stage = self.stage_reference(),
+            equality = self.key_equality()
+        )
+    }
+}
+
+impl DestinationWriter for DuckDbMergeWriter {
+    fn write_chunk(&self, batch: &RecordBatch) -> Result<(), DestinationWriteFailure> {
+        let mut session = self.session.lock().expect("writer session lock");
+        // Chunk alignment inherits the append rule verbatim (ADR-0059): 1:1
+        // name match, exact types, non-nullable destination columns admit
+        // no nulls — additive drift against an unmigrated table fails here
+        // exactly like append.
+        let merge_batch = align_batch_to_duckdb_schema(
+            &self.table,
+            batch,
+            self.destination_schema.clone(),
+            "merge",
+        )
+        .map_err(|failure| DestinationWriteFailure::atomic(failure, "transactional_merge", 0))?;
+
+        let statement = format!(
+            "INSERT INTO {} BY NAME SELECT * FROM arrow(?, ?)",
+            self.stage_reference()
+        );
+        session
+            .connection
+            .as_ref()
+            .expect("session connection open")
+            .execute(
+                &statement,
+                arrow_recordbatch_to_query_params(merge_batch.clone()),
+            )
+            .map_err(|error| self.write_failure("stage merge records for", error))?;
+        session.staged_chunks += 1;
+        session.staged_records += merge_batch.num_rows() as u64;
+        Ok(())
+    }
+
+    fn commit(self: Box<Self>) -> Result<DestinationWrite, DestinationWriteFailure> {
+        let (connection, staged_chunks, staged_records) = {
+            let mut session = self.session.lock().expect("writer session lock");
+            (
+                session.connection.take().expect("session connection open"),
+                session.staged_chunks,
+                session.staged_records,
+            )
+        };
+
+        // The duplicate-key gate (ADR-0058): surviving records must map to
+        // distinct key tuples, or the merge's meaning would depend on an
+        // arbitrary winner. Failing here returns before COMMIT, so dropping
+        // the connection rolls the whole transaction back.
+        let colliding: i64 = connection
+            .query_row(&self.colliding_records_sql(), [], |row| row.get(0))
+            .map_err(|error| self.write_failure("check merge key uniqueness for", error))?;
+        if colliding > 0 {
+            return Err(self.transactional_failure(
+                "duplicate_merge_keys",
+                format!(
+                    "{colliding} surviving records share a merge key tuple with another \
+                     surviving record for DuckDB table {} in {}",
+                    self.table.dataset,
+                    self.table.path.display()
+                ),
+            ));
+        }
+
+        // Counted inside the same transaction snapshot the MERGE runs under,
+        // so matched-then-replaced and unmatched-then-inserted partition the
+        // stage exactly.
+        let matched: i64 = connection
+            .query_row(&self.matched_records_sql(), [], |row| row.get(0))
+            .map_err(|error| self.write_failure("count matched merge records for", error))?;
+        let updated = u64::try_from(matched).expect("non-negative matched count");
+        let inserted = staged_records - updated;
+
+        connection
+            .execute_batch(&self.merge_sql())
+            .map_err(|error| self.write_failure("merge into", error))?;
+        connection
+            .execute_batch("COMMIT")
+            .map_err(|error| self.write_failure("commit the merge of", error))?;
+        connection.close().map_err(|(_, error)| {
+            // The merge had already committed when the close failed, so the
+            // failure reports the written records and chunks honestly.
+            DestinationWriteFailure {
+                failure: self.table.close_failure(error),
+                facts: DestinationWriteFacts::atomic("transactional_merge"),
+                written_records: staged_records,
+                committed_chunks: staged_chunks,
+                transience: Transience::Terminal,
+            }
+        })?;
+
+        Ok(DestinationWrite {
+            bytes_written: None,
+            facts: DestinationWriteFacts::atomic("transactional_merge")
+                .with_merge_counts(updated, inserted),
+        })
+    }
+
+    fn abandon(self: Box<Self>) -> AbandonedWrite {
+        // Dropping the connection rolls the open transaction back: nothing
+        // was committed, and the temporary stage vanishes with it.
+        AbandonedWrite {
+            committed_chunks: 0,
+            written_records: 0,
+            facts: DestinationWriteFacts::not_applicable(),
+        }
+    }
+}
+
 fn align_batch_to_duckdb_schema(
     table: &DuckDbTable,
     batch: &RecordBatch,
     destination_schema: SchemaRef,
+    operation: &'static str,
 ) -> Result<RecordBatch, LoadFailure> {
     let source_schema = batch.schema();
     if source_schema.fields().len() != destination_schema.fields().len() {
-        return Err(duckdb_schema_mismatch(table));
+        return Err(duckdb_schema_mismatch(table, operation));
     }
 
     let mut columns = Vec::with_capacity(destination_schema.fields().len());
     for destination_field in destination_schema.fields() {
         let source_index = source_schema
             .index_of(destination_field.name())
-            .map_err(|_| duckdb_schema_mismatch(table))?;
+            .map_err(|_| duckdb_schema_mismatch(table, operation))?;
         let source_field = source_schema.field(source_index);
         let column = batch.column(source_index);
         if source_field.data_type() != destination_field.data_type()
             || (!destination_field.is_nullable() && column.null_count() > 0)
         {
-            return Err(duckdb_schema_mismatch(table));
+            return Err(duckdb_schema_mismatch(table, operation));
         }
         columns.push(column.clone());
     }
@@ -1465,18 +1891,18 @@ fn align_batch_to_duckdb_schema(
     RecordBatch::try_new(destination_schema, columns).map_err(|error| LoadFailure {
         code: "destination_write_failed",
         message: format!(
-            "failed to align append records with DuckDB destination {} in {}: {error}",
+            "failed to align {operation} records with DuckDB destination {} in {}: {error}",
             table.dataset,
             table.path.display()
         ),
     })
 }
 
-fn duckdb_schema_mismatch(table: &DuckDbTable) -> LoadFailure {
+fn duckdb_schema_mismatch(table: &DuckDbTable, operation: &'static str) -> LoadFailure {
     LoadFailure {
         code: "destination_write_failed",
         message: format!(
-            "append schema does not match DuckDB destination {} in {}",
+            "{operation} schema does not match DuckDB destination {} in {}",
             table.dataset,
             table.path.display()
         ),
@@ -2095,10 +2521,18 @@ mod tests {
     }
 
     fn read_whole(source: &LocalFileSource, directive: &SchemaDirective) -> WholeRead {
+        read_whole_with_merge_keys(source, &schema::MergeKeys::none(), directive)
+    }
+
+    fn read_whole_with_merge_keys(
+        source: &LocalFileSource,
+        merge_keys: &schema::MergeKeys,
+        directive: &SchemaDirective,
+    ) -> WholeRead {
         let work = TempDir::new().expect("artifact tempdir");
         let mut sink = RejectionSink::new(work.path());
         let read = source
-            .read(directive, usize::MAX, &mut sink)
+            .read(directive, merge_keys, usize::MAX, &mut sink)
             .expect("read source");
         let batches = read
             .chunks
@@ -2120,10 +2554,18 @@ mod tests {
         source: &LocalFileSource,
         directive: &SchemaDirective,
     ) -> (ExecutionFailure, Vec<Value>) {
+        read_whole_failure_with_merge_keys(source, &schema::MergeKeys::none(), directive)
+    }
+
+    fn read_whole_failure_with_merge_keys(
+        source: &LocalFileSource,
+        merge_keys: &schema::MergeKeys,
+        directive: &SchemaDirective,
+    ) -> (ExecutionFailure, Vec<Value>) {
         let work = TempDir::new().expect("artifact tempdir");
         let mut sink = RejectionSink::new(work.path());
         let failure = source
-            .read(directive, usize::MAX, &mut sink)
+            .read(directive, merge_keys, usize::MAX, &mut sink)
             .err()
             .expect("read fails");
         assert!(sink.take_io_error().is_none());
@@ -2169,9 +2611,11 @@ mod tests {
 
     #[test]
     fn destination_connector_accepts_parquet_and_rejects_unknown() {
-        assert!(destination_connector(&destination_definition("parquet", "out"), None).is_ok());
+        assert!(
+            destination_connector(&destination_definition("parquet", "out"), None, &[]).is_ok()
+        );
 
-        let error = destination_connector(&destination_definition("bigquery", "out"), None)
+        let error = destination_connector(&destination_definition("bigquery", "out"), None, &[])
             .err()
             .expect("unknown destination connector rejected");
         assert_eq!(error.code, "unsupported_destination_connector");
@@ -2182,14 +2626,18 @@ mod tests {
     fn destination_connector_requires_a_dataset_for_duckdb() {
         assert!(destination_connector(
             &destination_definition("duckdb", "customers.duckdb"),
-            Some("customers")
+            Some("customers"),
+            &[]
         )
         .is_ok());
 
-        let error =
-            destination_connector(&destination_definition("duckdb", "customers.duckdb"), None)
-                .err()
-                .expect("duckdb destination without a dataset rejected");
+        let error = destination_connector(
+            &destination_definition("duckdb", "customers.duckdb"),
+            None,
+            &[],
+        )
+        .err()
+        .expect("duckdb destination without a dataset rejected");
         assert_eq!(error.code, "missing_dataset");
         assert_eq!(
             error.message,
@@ -2199,6 +2647,7 @@ mod tests {
         let error = destination_connector(
             &destination_definition("duckdb", "customers.duckdb"),
             Some(""),
+            &[],
         )
         .err()
         .expect("duckdb destination with an empty dataset rejected");
@@ -2219,18 +2668,19 @@ mod tests {
     }
 
     #[test]
-    fn load_mode_parse_accepts_full_refresh_and_append_and_rejects_unknown() {
+    fn load_mode_parse_accepts_the_v1_mode_set_and_rejects_unknown() {
         assert!(matches!(
             LoadMode::parse("full_refresh"),
             Ok(LoadMode::FullRefresh)
         ));
         assert!(matches!(LoadMode::parse("append"), Ok(LoadMode::Append)));
+        assert!(matches!(LoadMode::parse("merge"), Ok(LoadMode::Merge)));
 
-        let error = LoadMode::parse("merge")
+        let error = LoadMode::parse("upsert")
             .err()
             .expect("unknown load mode rejected");
         assert_eq!(error.code, "unsupported_load_mode");
-        assert_eq!(error.message, "unsupported load mode: merge");
+        assert_eq!(error.message, "unsupported load mode: upsert");
     }
 
     // ---- Round-trips (temp dir): source read and destination write ----
@@ -2554,6 +3004,7 @@ mod tests {
                 path: database_path.clone(),
                 dataset: "customers".to_string(),
             },
+            merge_keys: Vec::new(),
         };
         let written = write_single(&destination, &batch, LoadMode::FullRefresh);
 
@@ -2581,6 +3032,7 @@ mod tests {
                 path: database_path.clone(),
                 dataset: "customers".to_string(),
             },
+            merge_keys: Vec::new(),
         };
 
         let first_path = work.path().join("first.csv");
@@ -2629,7 +3081,7 @@ mod tests {
     ) -> SourceRead {
         let mut sink = RejectionSink::new(sink_dir);
         let read = source
-            .read(directive, chunk_rows, &mut sink)
+            .read(directive, &schema::MergeKeys::none(), chunk_rows, &mut sink)
             .expect("read source");
         assert!(sink.take_io_error().is_none());
         read
@@ -2939,6 +3391,7 @@ mod tests {
                 path: database_path.clone(),
                 dataset: "customers".to_string(),
             },
+            merge_keys: Vec::new(),
         };
         let seed = two_row_batch(&work, "seed.csv");
         write_single(&destination, &seed, LoadMode::FullRefresh);
@@ -2981,6 +3434,7 @@ mod tests {
                 path: database_path.clone(),
                 dataset: "customers".to_string(),
             },
+            merge_keys: Vec::new(),
         };
         let seed = two_row_batch(&work, "seed.csv");
         write_single(&destination, &seed, LoadMode::FullRefresh);
@@ -3000,6 +3454,244 @@ mod tests {
         );
         let read_back = read_single_duckdb_batch(&database_path, "customers");
         assert_eq!(read_back.num_rows(), 3);
+    }
+
+    // ---- Merge sessions (ADR-0057, ADR-0058, ADR-0059) ----
+
+    /// Seeds a DuckDB table for the merge tests, which never auto-create.
+    fn seed_duckdb_table(database_path: &Path, statements: &str) {
+        let connection = Connection::open(database_path).expect("open DuckDB destination");
+        connection
+            .execute_batch(statements)
+            .expect("seed DuckDB destination");
+    }
+
+    fn csv_batch(work: &TempDir, name: &str, content: &str) -> RecordBatch {
+        let source_path = work.path().join(name);
+        fs::write(&source_path, content).expect("write csv");
+        read_whole(
+            &LocalFileSource {
+                path: source_path,
+                format: Some("csv".to_string()),
+            },
+            &SchemaDirective::inferred(),
+        )
+        .batch
+    }
+
+    fn merge_destination(database_path: &Path, keys: &[&str]) -> DuckDbDestination {
+        DuckDbDestination {
+            table: DuckDbTable {
+                path: database_path.to_path_buf(),
+                dataset: "customers".to_string(),
+            },
+            merge_keys: keys.iter().map(|key| key.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn parquet_destination_declines_merge_before_any_session() {
+        let destination = ParquetDestination {
+            path: PathBuf::from("customers_dataset"),
+        };
+
+        let error = destination
+            .validate_mode(LoadMode::Merge)
+            .expect_err("parquet declines merge");
+        assert_eq!(error.code, "unsupported_load_mode_for_destination");
+        assert_eq!(
+            error.message,
+            "parquet destination does not support load mode: merge \
+             (supported load modes: full_refresh, append)"
+        );
+    }
+
+    #[test]
+    fn duckdb_destination_supports_every_v1_load_mode() {
+        let destination = merge_destination(Path::new("customers.duckdb"), &["id"]);
+        for mode in [LoadMode::FullRefresh, LoadMode::Append, LoadMode::Merge] {
+            assert!(destination.validate_mode(mode).is_ok());
+        }
+    }
+
+    #[test]
+    fn duckdb_merge_session_updates_matching_keys_and_inserts_new_ones() {
+        let work = TempDir::new().expect("tempdir");
+        let database_path = work.path().join("customers.duckdb");
+        seed_duckdb_table(
+            &database_path,
+            "CREATE TABLE customers (id BIGINT, name VARCHAR); \
+             INSERT INTO customers VALUES (1, 'Ada'), (2, 'Grace')",
+        );
+        let batch = csv_batch(&work, "day-2.csv", "id,name\n2,Grace Hopper\n3,Katherine\n");
+
+        let destination = merge_destination(&database_path, &["id"]);
+        let written = write_single(&destination, &batch, LoadMode::Merge);
+
+        assert_eq!(written.bytes_written, None);
+        assert_eq!(
+            written.facts.report_value(),
+            serde_json::json!({
+                "atomicity": "atomic",
+                "strategy": "transactional_merge",
+                "merge": { "updated": 1, "inserted": 1 }
+            })
+        );
+        let read_back = read_single_duckdb_batch(&database_path, "customers");
+        assert_eq!(read_back.num_rows(), 3);
+        assert_eq!(ints(&read_back, 0).values(), &[1, 2, 3]);
+        assert_eq!(strings(&read_back, 1).value(0), "Ada");
+        assert_eq!(strings(&read_back, 1).value(1), "Grace Hopper");
+        assert_eq!(strings(&read_back, 1).value(2), "Katherine");
+    }
+
+    #[test]
+    fn duckdb_merge_with_every_column_a_key_still_counts_matches() {
+        // With no non-key column there is nothing to update, so the merge
+        // runs without a matched clause; matched records still count as
+        // updated, because their replacement equals themselves.
+        let work = TempDir::new().expect("tempdir");
+        let database_path = work.path().join("customers.duckdb");
+        seed_duckdb_table(
+            &database_path,
+            "CREATE TABLE customers (id BIGINT, name VARCHAR); \
+             INSERT INTO customers VALUES (1, 'Ada')",
+        );
+        let batch = csv_batch(&work, "pairs.csv", "id,name\n1,Ada\n2,Grace\n");
+
+        let destination = merge_destination(&database_path, &["id", "name"]);
+        let written = write_single(&destination, &batch, LoadMode::Merge);
+
+        assert_eq!(
+            written.facts.report_value()["merge"],
+            serde_json::json!({ "updated": 1, "inserted": 1 })
+        );
+        let read_back = read_single_duckdb_batch(&database_path, "customers");
+        assert_eq!(read_back.num_rows(), 2);
+    }
+
+    #[test]
+    fn duckdb_merge_session_fails_on_duplicate_merge_keys_and_commits_nothing() {
+        let work = TempDir::new().expect("tempdir");
+        let database_path = work.path().join("customers.duckdb");
+        seed_duckdb_table(
+            &database_path,
+            "CREATE TABLE customers (id BIGINT, name VARCHAR); \
+             INSERT INTO customers VALUES (1, 'Ada')",
+        );
+        let batch = csv_batch(&work, "dupes.csv", "id,name\n5,First\n5,Second\n");
+
+        let destination = merge_destination(&database_path, &["id"]);
+        let writer = destination.begin(LoadMode::Merge).expect("begin session");
+        writer.write_chunk(&batch).expect("stage chunk");
+        let failure = writer.commit().err().expect("duplicate keys fail");
+
+        assert_eq!(failure.failure.code, "duplicate_merge_keys");
+        assert_eq!(
+            failure.failure.message,
+            format!(
+                "2 surviving records share a merge key tuple with another surviving \
+                 record for DuckDB table customers in {}",
+                database_path.display()
+            )
+        );
+        assert_eq!(failure.written_records, 0);
+        assert_eq!(failure.committed_chunks, 0);
+        assert_eq!(
+            failure.facts.report_value(),
+            serde_json::json!({
+                "atomicity": "atomic",
+                "strategy": "transactional_merge"
+            })
+        );
+        // The rollback left the destination exactly as seeded.
+        let read_back = read_single_duckdb_batch(&database_path, "customers");
+        assert_eq!(read_back.num_rows(), 1);
+        assert_eq!(strings(&read_back, 1).value(0), "Ada");
+    }
+
+    #[test]
+    fn duckdb_merge_session_requires_an_existing_table() {
+        let work = TempDir::new().expect("tempdir");
+        let database_path = work.path().join("customers.duckdb");
+
+        let destination = merge_destination(&database_path, &["id"]);
+        let failure = destination
+            .begin(LoadMode::Merge)
+            .err()
+            .expect("merge into a missing table fails at begin");
+
+        assert_eq!(failure.failure.code, "destination_write_failed");
+        assert!(
+            failure.failure.message.contains("before merge"),
+            "message names the merge probe: {}",
+            failure.failure.message
+        );
+        assert_eq!(
+            failure.facts.report_value(),
+            serde_json::json!({ "atomicity": "not_applicable" })
+        );
+    }
+
+    #[test]
+    fn duckdb_merge_abandon_commits_nothing() {
+        let work = TempDir::new().expect("tempdir");
+        let database_path = work.path().join("customers.duckdb");
+        seed_duckdb_table(
+            &database_path,
+            "CREATE TABLE customers (id BIGINT, name VARCHAR); \
+             INSERT INTO customers VALUES (1, 'Ada')",
+        );
+        let batch = csv_batch(&work, "abandoned.csv", "id,name\n2,Grace\n");
+
+        let destination = merge_destination(&database_path, &["id"]);
+        let writer = destination.begin(LoadMode::Merge).expect("begin session");
+        writer.write_chunk(&batch).expect("stage chunk");
+        let abandoned = writer.abandon();
+
+        assert_eq!(abandoned.committed_chunks, 0);
+        assert_eq!(abandoned.written_records, 0);
+        let read_back = read_single_duckdb_batch(&database_path, "customers");
+        assert_eq!(read_back.num_rows(), 1);
+    }
+
+    #[test]
+    fn csv_merge_key_nulls_reject_records_and_unknown_keys_fail_the_read() {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.csv");
+        fs::write(&source_path, "id,name\n1,Ada\n,Grace\n").expect("write csv");
+        let source = LocalFileSource {
+            path: source_path,
+            format: Some("csv".to_string()),
+        };
+
+        // The empty cell in the key field is the pipeline's existing null:
+        // the record rejects as `null_merge_key` and the survivor still
+        // shapes the batch.
+        let read = read_whole_with_merge_keys(
+            &source,
+            &schema::MergeKeys::from_names(vec!["id".to_string()]),
+            &SchemaDirective::inferred(),
+        );
+        assert_eq!(read.source_rows, 2);
+        assert_eq!(read.rejected_count, 1);
+        assert_eq!(read.batch.num_rows(), 1);
+        assert_eq!(read.rejected[0]["code"], "null_merge_key");
+        assert_eq!(read.rejected[0]["field"], "id");
+        assert_eq!(read.rejected[0]["message"], "merge key \"id\" is null");
+
+        // A key naming no dataset field fails the read side-effect-free.
+        let (failure, rejected) = read_whole_failure_with_merge_keys(
+            &source,
+            &schema::MergeKeys::from_names(vec!["customer_id".to_string()]),
+            &SchemaDirective::inferred(),
+        );
+        assert_eq!(failure.failure.code, "unknown_merge_key_field");
+        assert_eq!(
+            failure.failure.message,
+            "merge keys name fields absent from the resolved dataset schema: customer_id"
+        );
+        assert!(rejected.is_empty());
     }
 
     // ---- Test helpers ----

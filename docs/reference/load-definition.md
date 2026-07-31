@@ -44,14 +44,16 @@ The failure codes named throughout this reference appear in the report's
 | `destination` | yes | — | Where records are written to. |
 | `dataset` | for `duckdb` | — | The dataset name; addresses the DuckDB table. |
 | `load_mode` | no | `full_refresh` | How the load changes the destination dataset. |
+| `merge` | for `merge` | — | The merge keys a merge load matches records on. |
 | `transform` | no | none | The structural transform: flatten mapping, field selection, rename mapping. |
 | `schema` | no | inference | Schema pinning, drift policy, and per-field overrides. |
 | `execution` | no | all defaults | Chunk bound, load parallelism, retry policy. |
 | `reject_threshold` | no | `0` | Rejected records tolerated before the load fails. |
 | `artifacts` | no | `.data-spark/runs` | The root under which the artifact directory is created. |
 
-A complete definition using every top-level key (the sections below refer
-back to it):
+A complete definition using every top-level key a `full_refresh` load may
+declare — the `merge` block exists only under `load_mode: merge` and is
+shown in its own section (the sections below refer back to this example):
 
 ```yaml
 version: 1
@@ -98,10 +100,11 @@ An invalid definition fails before any source is read or destination touched
 ([ADR-0019](../adr/0019-validate-schema-and-load-rules-before-writing.md)).
 Checks run in a fixed order, and the first failure wins: YAML parsing
 (including unknown keys) → `version` → `source` and `destination` presence →
-load mode → source connector → destination connector → destination support
-for the mode → `transform` → `schema` configuration → the pinned schema file
-→ the source read (which validates the resolved source format first) → the
-destination write.
+load mode → `merge` cross-validation → source connector → destination
+connector → destination support for the mode → `transform` → `schema`
+configuration → the pinned schema file → the source read (which validates
+the resolved source format first, and resolves the merge keys against the
+dataset schema) → the destination write.
 
 ## `version`
 
@@ -251,11 +254,15 @@ destination table; omitting it (or declaring it empty) fails the load with
 
 Governing ADRs:
 [ADR-0047](../adr/0047-commit-full-refresh-terminally-and-append-per-chunk.md),
-[ADR-0021](../adr/0021-report-destination-write-atomicity.md).
+[ADR-0021](../adr/0021-report-destination-write-atomicity.md),
+[ADR-0057](../adr/0057-land-merge-loads-on-duckdb-only-and-decline-elsewhere.md).
 
 How the load changes the destination dataset. Optional; the default is
-`full_refresh`. Any other value fails the load with `unsupported_load_mode`.
-Both shipped destination connectors support both modes.
+`full_refresh`. A value outside the mode vocabulary below fails the load
+with `unsupported_load_mode`; a known mode the destination does not support
+fails with `unsupported_load_mode_for_destination`, naming the destination
+and the modes it does support. Both shipped destination connectors support
+`full_refresh` and `append`; `merge` is supported by `duckdb` only.
 
 ```yaml
 # Fragment — not a complete load definition.
@@ -270,6 +277,59 @@ load_mode: append
   changing existing records, committing once per chunk: a failure after `k`
   committed chunks leaves exactly that prefix visible, traceable through the
   load report.
+- **`merge`** updates the destination records whose merge key tuple matches
+  a source record — replaced whole, every non-key field taking the source
+  value — and inserts the unmatched source records. Records absent from the
+  source stay in the destination: merge never deletes. The commit boundary
+  is terminal like `full_refresh`. A merge load must declare its keys in
+  the [`merge`](#merge) block, and the destination table must already exist
+  — bootstrap with a `full_refresh` load first.
+
+## `merge`
+
+Governing ADRs:
+[ADR-0009](../adr/0009-require-resolved-merge-keys.md),
+[ADR-0057](../adr/0057-land-merge-loads-on-duckdb-only-and-decline-elsewhere.md),
+[ADR-0058](../adr/0058-fail-merge-loads-on-duplicate-merge-keys.md),
+[ADR-0059](../adr/0059-execute-duckdb-merge-as-a-staged-terminal-transaction.md).
+
+The merge keys of a `load_mode: merge` load: the dataset fields whose value
+tuple decides whether a source record updates an existing destination
+record or inserts a new one. Required exactly when the load mode is
+`merge`.
+
+```yaml
+# Fragment — not a complete load definition.
+load_mode: merge
+merge:
+  keys: [customer_id, region]
+```
+
+- `keys` names **dataset fields** — the fields the load materializes after
+  `transform.flatten`, `transform.select`, and `transform.rename`. Rename
+  targets and flatten outputs qualify; a renamed-away source name does not.
+  A key naming no dataset field fails the load with
+  `unknown_merge_key_field` before anything is written.
+- Cross-validation is strict, and fails before any source or destination
+  I/O: `load_mode: merge` without a `merge` block fails with
+  `missing_merge_keys`; a `merge` block under any other load mode, an empty
+  `keys` list, or a duplicated key name fails with `invalid_merge_config`.
+  A `merge` block without `keys` fails YAML parsing
+  ([ADR-0037](../adr/0037-reject-unknown-fields-in-versioned-yaml-contracts.md)).
+- Merge keys are implicitly non-null: a record holding null in any key field
+  — a CSV empty cell, a JSONL `null`, or a JSONL absent field — is a
+  rejected record with rejection code `null_merge_key`, counted against
+  [`reject_threshold`](#reject_threshold). At the default threshold of `0`,
+  one null-key record fails the load.
+- Two or more surviving records sharing one key tuple fail the load with
+  `duplicate_merge_keys` — never first-or-last-wins
+  ([ADR-0058](../adr/0058-fail-merge-loads-on-duplicate-merge-keys.md)).
+  The check runs inside the destination transaction, so the failure leaves
+  the destination untouched.
+- The report echoes the block as a top-level `merge` object and, on
+  success, states how the records partitioned in
+  `destination_write.merge.updated` / `.inserted` — see the
+  [load report reference](load-report.md).
 
 ## `transform`
 
@@ -710,8 +770,9 @@ reject_threshold: 10
 A rejected record is a source record that cannot be written without
 violating the chosen schema or load rules: a malformed CSV or JSONL record
 (`malformed_csv_record`, `malformed_jsonl_record`), a value misfit against a
-pinned or overridden field (`type_coercion_failed`), or a null in a required
-field (`missing_required_field`).
+pinned or overridden field (`type_coercion_failed`), a null in a required
+field (`missing_required_field`), or a null in a [merge key](#merge) field
+(`null_merge_key`).
 
 The threshold interacts with the rejected-records artifact
 ([ADR-0036](../adr/0036-write-rejected-records-jsonl-under-a-flat-reject-threshold.md)):
@@ -771,6 +832,7 @@ chunk, so an empty dataset materializes its schema
 | --- | --- |
 | `full_refresh` | The dataset is replaced by an empty one — a populated dataset loses every record it held. |
 | `append` | No records are added, so the dataset keeps every record it already held — when the schema this load resolved still matches the destination, which a zero-survivor load cannot take for granted (see below). |
+| `merge` | Nothing is staged, so the no-op merge commits and the dataset keeps every record it already held — under the same schema-match caveat as `append`, because a merge aligns its chunks against the destination the same way, and the report counts `{"updated": 0, "inserted": 0}`. |
 
 A load that completes this way is an ordinary write, reporting the posture
 its [destination](#destination) and mode always report — `atomic` /

@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -64,6 +65,10 @@ struct LoadReport {
     destination_summary: Value,
     dataset: Option<String>,
     load_mode: String,
+    /// The definition's merge block echoed back — `{"keys": [...]}` — and
+    /// JSON null for every load that declares none, the `dataset`
+    /// null-when-absent precedent (ADR-0030).
+    merge: Value,
     schema_decision: Value,
     row_counts: RowCounts,
     byte_counts: ByteCounts,
@@ -94,6 +99,7 @@ impl LoadReport {
             destination_summary: details.destination_summary,
             dataset: details.dataset,
             load_mode: details.load_mode,
+            merge: details.merge,
             schema_decision: details.schema_decision,
             row_counts: details.row_counts,
             byte_counts: details.byte_counts,
@@ -153,6 +159,7 @@ impl LoadReport {
             destination_summary: failure.destination_summary,
             dataset: failure.dataset,
             load_mode: failure.load_mode,
+            merge: failure.merge,
             schema_decision: failure.schema_decision,
             row_counts: RowCounts {
                 source: failure.source_rows,
@@ -235,6 +242,11 @@ struct LoadDefinition {
     destination: Option<DestinationDefinition>,
     dataset: Option<String>,
     load_mode: Option<String>,
+    /// The merge block a `load_mode: merge` definition must declare and no
+    /// other load mode may (ADR-0057): the merge keys the upsert matches on
+    /// (ADR-0009). Cross-validation lives at the execution boundary so the
+    /// failure reports echo the definition context.
+    merge: Option<MergeConfig>,
     /// The structural transform applied before schema pinning, validation,
     /// and destination writing: flatten mapping, field selection, then
     /// rename mapping (ADR-0039, ADR-0040, ADR-0041).
@@ -288,6 +300,19 @@ struct RetryConfig {
     max_delay_ms: Option<u64>,
 }
 
+/// The `merge` block of a load definition (ADR-0057): the dataset fields —
+/// after flatten, selection, and rename — whose tuple decides whether a
+/// source record updates an existing destination record or inserts a new
+/// one. `keys` is required by the YAML contract itself, so `merge: {}`
+/// fails parsing (ADR-0037); an empty or duplicated list fails
+/// cross-validation as `invalid_merge_config`. Unknown keys are rejected
+/// recursively (ADR-0037).
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct MergeConfig {
+    keys: Vec<String>,
+}
+
 /// The `artifacts` block of a load definition: the root under which this load's
 /// unique artifact directory is created (ADR-0015).
 #[derive(Debug, Deserialize, Serialize)]
@@ -333,6 +358,7 @@ struct ExecutionDetails {
     destination_summary: Value,
     dataset: Option<String>,
     load_mode: String,
+    merge: Value,
     schema_decision: Value,
     row_counts: RowCounts,
     byte_counts: ByteCounts,
@@ -353,6 +379,7 @@ struct ReportableFailure {
     destination_summary: Value,
     dataset: Option<String>,
     load_mode: String,
+    merge: Value,
     schema_decision: Value,
     source_rows: u64,
     written_records: u64,
@@ -376,6 +403,7 @@ impl ReportableFailure {
             destination_summary: json!({}),
             dataset: None,
             load_mode: "full_refresh".to_string(),
+            merge: Value::Null,
             schema_decision: not_evaluated_schema_decision(),
             source_rows: 0,
             written_records: 0,
@@ -611,6 +639,13 @@ fn execute_load_definition(
         .load_mode
         .clone()
         .unwrap_or_else(|| "full_refresh".to_string());
+    // The merge block is echoed back like the load mode: whatever the
+    // definition declared, even when cross-validation then rejects it.
+    let merge = definition
+        .merge
+        .as_ref()
+        .map(to_json)
+        .unwrap_or(Value::Null);
 
     match definition.version {
         Some(SUPPORTED_LOAD_DEFINITION_VERSION) => {}
@@ -620,6 +655,7 @@ fn execute_load_definition(
                 destination_summary,
                 dataset,
                 load_mode,
+                merge,
                 schema_decision: not_evaluated_schema_decision(),
                 source_rows: 0,
                 written_records: 0,
@@ -637,6 +673,7 @@ fn execute_load_definition(
                 destination_summary,
                 dataset,
                 load_mode,
+                merge,
                 schema_decision: not_evaluated_schema_decision(),
                 source_rows: 0,
                 written_records: 0,
@@ -655,6 +692,7 @@ fn execute_load_definition(
         destination_summary,
         dataset,
         load_mode,
+        merge,
         schema_decision: execution_failure
             .schema_decision
             .map(|decision| *decision)
@@ -670,6 +708,53 @@ fn execute_load_definition(
         code: execution_failure.failure.code,
         message: execution_failure.failure.message,
     })
+}
+
+/// Cross-validates the load mode against the definition's merge block
+/// (ADR-0057) and returns the validated merge key names — empty for every
+/// non-merge load. All failures are pure config failures raised before any
+/// source or destination I/O: a merge load must declare its keys
+/// (`missing_merge_keys`, fail-fast key discovery per ADR-0009), a merge
+/// block outside a merge load is a broken definition, and an empty or
+/// duplicated key list never names a usable key tuple
+/// (`invalid_merge_config`).
+fn validate_merge_config(
+    mode: LoadMode,
+    merge: Option<&MergeConfig>,
+) -> Result<Vec<String>, LoadFailure> {
+    let invalid_merge_config = |message: String| LoadFailure {
+        code: "invalid_merge_config",
+        message,
+    };
+    let Some(merge) = merge else {
+        if mode == LoadMode::Merge {
+            return Err(LoadFailure {
+                code: "missing_merge_keys",
+                message: "load definition merge.keys is required when load_mode is merge"
+                    .to_string(),
+            });
+        }
+        return Ok(Vec::new());
+    };
+    if mode != LoadMode::Merge {
+        return Err(invalid_merge_config(
+            "a merge block requires load_mode: merge".to_string(),
+        ));
+    }
+    if merge.keys.is_empty() {
+        return Err(invalid_merge_config(
+            "merge.keys must name at least one dataset field".to_string(),
+        ));
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for key in &merge.keys {
+        if !seen.insert(key.as_str()) {
+            return Err(invalid_merge_config(format!(
+                "merge.keys names field {key:?} more than once"
+            )));
+        }
+    }
+    Ok(merge.keys.clone())
 }
 
 fn reject_threshold_failure(
@@ -703,17 +788,20 @@ fn execute_supported_load(
         .clone()
         .unwrap_or_else(|| "full_refresh".to_string());
 
-    // Validate the load mode, both connectors, the schema directive, and the
-    // execution config before any source or destination I/O so an unsupported
-    // definition fails without reading the source or touching the destination
-    // (ADR-0019), preserving the error precedence: load mode -> source
-    // connector -> destination connector -> schema directive (config, then
-    // pinned schema file) -> execution config -> read -> write. The source
-    // format is validated inside read() so its precedence stays after the
-    // destination-connector check for a doubly-invalid definition.
+    // Validate the load mode, its merge block, both connectors, the schema
+    // directive, and the execution config before any source or destination
+    // I/O so an unsupported definition fails without reading the source or
+    // touching the destination (ADR-0019), preserving the error precedence:
+    // load mode -> merge cross-validation -> source connector -> destination
+    // connector (existence, then mode support) -> schema directive (config,
+    // then pinned schema file) -> execution config -> read -> write. The
+    // source format is validated inside read() so its precedence stays after
+    // the destination-connector check for a doubly-invalid definition.
     let mode = LoadMode::parse(&load_mode)?;
+    let merge_key_names = validate_merge_config(mode, definition.merge.as_ref())?;
     let source_port = source_connector(source)?;
-    let destination_port = destination_connector(destination, definition.dataset.as_deref())?;
+    let destination_port =
+        destination_connector(destination, definition.dataset.as_deref(), &merge_key_names)?;
     destination_port.validate_mode(mode)?;
     let directive = resolve_schema_directive(
         definition.schema.as_ref(),
@@ -727,6 +815,7 @@ fn execute_supported_load(
         resolve_parallelism(definition.execution.as_ref(), connector_parallelism_limit);
 
     let reject_threshold = definition.reject_threshold.unwrap_or(0);
+    let merge_keys = schema::MergeKeys::from_names(merge_key_names);
     let SourceRead {
         schema_decision,
         pinned_schema_write,
@@ -735,7 +824,7 @@ fn execute_supported_load(
         rejected_count,
         chunks,
     } = source_port
-        .read(&directive, chunk_rows as usize, sink)
+        .read(&directive, &merge_keys, chunk_rows as usize, sink)
         .map_err(|failure| failure.apply_pending_reject_threshold(reject_threshold))?;
     let row_count = source_rows - rejected_count;
 
@@ -827,6 +916,11 @@ fn execute_supported_load(
         destination_summary: to_json(destination),
         dataset: definition.dataset.clone(),
         load_mode,
+        merge: definition
+            .merge
+            .as_ref()
+            .map(to_json)
+            .unwrap_or(Value::Null),
         schema_decision,
         row_counts: RowCounts {
             source: source_rows,
@@ -1123,6 +1217,7 @@ mod tests {
             destination_summary: json!({ "connector": "parquet" }),
             dataset: Some("customers".to_string()),
             load_mode: "full_refresh".to_string(),
+            merge: Value::Null,
             schema_decision: json!({ "mode": "inferred" }),
             row_counts: RowCounts {
                 source: 3,
@@ -1191,6 +1286,7 @@ mod tests {
             destination_summary: json!({}),
             dataset: None,
             load_mode: "full_refresh".to_string(),
+            merge: Value::Null,
             schema_decision: json!({ "mode": "inferred" }),
             row_counts: RowCounts {
                 source: 2,
@@ -1224,6 +1320,7 @@ mod tests {
             destination_summary: json!({ "connector": "parquet" }),
             dataset: Some("customers".to_string()),
             load_mode: "full_refresh".to_string(),
+            merge: Value::Null,
             schema_decision: not_evaluated_schema_decision(),
             source_rows: 0,
             written_records: 0,
@@ -1291,6 +1388,7 @@ mod tests {
             destination_summary: json!({ "connector": "parquet" }),
             dataset: Some("customers".to_string()),
             load_mode: "full_refresh".to_string(),
+            merge: Value::Null,
             schema_decision: json!({ "mode": "inferred" }),
             source_rows: 3,
             written_records: 0,
@@ -1342,6 +1440,7 @@ mod tests {
             }),
             dataset: Some("customers".to_string()),
             load_mode: None,
+            merge: None,
             transform: None,
             schema: None,
             artifacts: None,
@@ -1445,6 +1544,7 @@ mod tests {
             destination_summary: json!({ "connector": "parquet" }),
             dataset: Some("customers".to_string()),
             load_mode: "append".to_string(),
+            merge: Value::Null,
             schema_decision: json!({ "mode": "inferred" }),
             source_rows: 5,
             written_records: 2,
@@ -1508,6 +1608,7 @@ mod tests {
             destination_summary: json!({}),
             dataset: None,
             load_mode: "append".to_string(),
+            merge: Value::Null,
             schema_decision: json!({ "mode": "inferred" }),
             source_rows: 1,
             written_records: 0,
@@ -1554,7 +1655,12 @@ mod tests {
         .expect("source connector");
         let mut sink = rejection::RejectionSink::new(work.path());
         let read = source_port
-            .read(&schema::SchemaDirective::inferred(), chunk_rows, &mut sink)
+            .read(
+                &schema::SchemaDirective::inferred(),
+                &schema::MergeKeys::none(),
+                chunk_rows,
+                &mut sink,
+            )
             .expect("read source");
         assert!(sink.take_io_error().is_none());
         read
@@ -1567,6 +1673,7 @@ mod tests {
                 path: work.path().join("customers_dataset"),
             },
             None,
+            &[],
         )
         .expect("parquet connector")
     }
@@ -1578,6 +1685,7 @@ mod tests {
                 path: work.path().join("customers.duckdb"),
             },
             Some("customers"),
+            &[],
         )
         .expect("duckdb connector")
     }

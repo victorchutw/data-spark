@@ -1,0 +1,11 @@
+---
+status: accepted
+---
+
+# Fail Merge Loads on Duplicate Merge Keys
+
+Two or more surviving records sharing one merge key tuple fail the load with `duplicate_merge_keys` — never first-wins or last-wins. A duplicate key tuple makes "update the matching record" ambiguous: whichever record silently won would depend on source order, and the loser's values would vanish without any trace in the report or the rejected-records artifact. The posture aligns with BigQuery's MERGE, which errors when more than one source row matches a target row, so the mode's meaning stays destination-independent as the connector matrix grows toward ADR-0003's warehouse destinations; loosening to an explicit last-wins policy later would be an additive opt-in key, not a behavior change. The check covers surviving records only — rejected records were never write candidates, so a rejected duplicate is just a rejection.
+
+The check runs destination-side, inside the merge transaction, after the last chunk staged and before the real table is touched: ADR-0045 caps pass-1 state as bounded (type lattices, counters, rejected line numbers), and a distinct-key set over the whole source is not bounded, so the client-side pass cannot host it. The staging table already holds every surviving record when the session commits, so one aggregate over the stage answers the question in the engine, where the data already is. On a hit the transaction rolls back, leaving the destination byte-identical; the pinned schema file, persisted before the write phase, stays — matching every write-phase failure today (a retry against fixed data converges on the same pin). The failure carries the `atomic` / `transactional_merge` facts with zero written records, like any pre-commit failure of a terminal-commit mode (ADR-0047).
+
+Alternatives rejected: last-wins deduplication (order-dependent silent data loss, and a semantics fork from the warehouse destinations this tool is aimed at); first-wins (the same, mirrored); detecting duplicates in pass 1 with an in-memory key set (unbounded state, violating the ADR-0045 bounded-memory posture that the chunked execution work proved); rejecting duplicate-keyed records per record instead of failing the load (which of the duplicates is "the" record is exactly the question the load cannot answer).

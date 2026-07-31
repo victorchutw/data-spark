@@ -31,6 +31,38 @@ this repository's use of pull requests, and link their commit instead.
 
 ## [Unreleased]
 
+### Added
+
+- Merge loads: `load_mode: merge` performs a keyed upsert into a DuckDB
+  table — destination records whose merge key tuple matches a surviving
+  source record are replaced whole, unmatched source records insert, and
+  records absent from the source stay; merge never deletes
+  ([ADR-0057](docs/adr/0057-land-merge-loads-on-duckdb-only-and-decline-elsewhere.md)).
+  **[contract]** The load definition gains an optional top-level `merge`
+  block (`keys: [field, ...]`, required exactly when the mode is `merge`),
+  and the load report gains a top-level `merge` echo (`null` on non-merge
+  loads) plus, on success, `destination_write.merge` with the
+  `updated`/`inserted` partition, whose sum always equals
+  `row_counts.written`; both contract versions stay `1`. The merge executes
+  as a staged terminal transaction — `atomicity: "atomic"`,
+  `strategy: "transactional_merge"`, nothing visible before the single
+  commit — and requires the destination table to exist: bootstrap with a
+  `full_refresh` load first
+  ([ADR-0059](docs/adr/0059-execute-duckdb-merge-as-a-staged-terminal-transaction.md)).
+  Keys name dataset fields (rename targets and flatten outputs qualify); a
+  key naming no dataset field fails as `unknown_merge_key_field`, a record
+  holding null in any key field is rejected as `null_merge_key` under the
+  ordinary `reject_threshold`, and surviving records sharing one key tuple
+  fail the load as `duplicate_merge_keys` — never first-or-last-wins
+  ([ADR-0058](docs/adr/0058-fail-merge-loads-on-duplicate-merge-keys.md)).
+  Cross-validation adds `missing_merge_keys` and `invalid_merge_config`;
+  the `parquet` destination declines the mode as
+  `unsupported_load_mode_for_destination`, and `unsupported_load_mode` now
+  means exactly "the mode string is unknown". Documented in a new
+  [merge loads guide](docs/guides/merge-loads.md), a runnable
+  [csv-to-duckdb-merge](examples/csv-to-duckdb-merge/) example, and both
+  reference pages. ([#100])
+
 ### Fixed
 
 - Two pages promised that keeping `reject_threshold` at `0` protects "any
@@ -329,3 +361,4 @@ one carried is listed under the stable release that followed — `0.1.0` and
 [#94]: https://github.com/victorchutw/data-spark/pull/94
 [#95]: https://github.com/victorchutw/data-spark/pull/95
 [#98]: https://github.com/victorchutw/data-spark/pull/98
+[#100]: https://github.com/victorchutw/data-spark/pull/100
