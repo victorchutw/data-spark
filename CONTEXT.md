@@ -195,7 +195,7 @@ A load mode that adds new records to the destination dataset without changing ex
 _Avoid_: Insert-only, incremental append
 
 **Merge Load**:
-A load mode that replaces destination records whose merge key matches a surviving source record, inserts unmatched source records, and never deletes; prose may gloss the behavior as a keyed upsert, never as the mode's name.
+A load mode that replaces a destination record whole with the surviving source record its merge key matches, inserts unmatched source records, and never deletes; prose may gloss the behavior as a keyed upsert, never as the mode's name.
 _Avoid_: Upsert, incremental merge
 
 **Merge Key**:
