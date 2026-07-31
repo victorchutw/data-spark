@@ -397,6 +397,10 @@ mod tests {
     }
 
     impl Destination for ScriptedDestination {
+        fn connector_name(&self) -> &'static str {
+            "scripted"
+        }
+
         fn supported_load_modes(&self) -> &'static [LoadMode] {
             &[LoadMode::Append]
         }
@@ -580,6 +584,10 @@ mod tests {
     }
 
     impl Destination for RendezvousDestination {
+        fn connector_name(&self) -> &'static str {
+            "scripted"
+        }
+
         fn supported_load_modes(&self) -> &'static [LoadMode] {
             &[LoadMode::Append]
         }
@@ -801,6 +809,10 @@ mod tests {
     }
 
     impl Destination for GatedDestination {
+        fn connector_name(&self) -> &'static str {
+            "scripted"
+        }
+
         fn supported_load_modes(&self) -> &'static [LoadMode] {
             &[LoadMode::Append]
         }

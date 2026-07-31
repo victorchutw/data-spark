@@ -187,6 +187,35 @@ pub(crate) enum DriftPolicy {
     AllowAdditiveNullable,
 }
 
+/// The Resolved Merge Keys of a merge load (ADR-0009): the dataset field
+/// names the user declared under `merge.keys`, in declaration order — empty
+/// for every non-merge load, so the read path carries one without an
+/// optional wrapper. Emptiness and duplicate names were already rejected at
+/// the definition boundary (`invalid_merge_config`), so a non-empty carrier
+/// is always a merge load's validated key list. Each key must name a
+/// resolved dataset field — after flatten, selection, and rename — which
+/// resolution verifies (`unknown_merge_key_field`); a record holding null
+/// in any key field is rejected per record (`null_merge_key`), because a
+/// null never equals anything under key equality.
+pub(crate) struct MergeKeys {
+    keys: Vec<String>,
+}
+
+impl MergeKeys {
+    /// The empty carrier of every non-merge load. Production code builds the
+    /// carrier from the definition's validated keys — empty for non-merge
+    /// loads — so the named empty form serves the test harnesses.
+    #[cfg(test)]
+    pub(crate) fn none() -> Self {
+        MergeKeys { keys: Vec::new() }
+    }
+
+    /// Wraps the definition's validated key names.
+    pub(crate) fn from_names(keys: Vec<String>) -> Self {
+        MergeKeys { keys }
+    }
+}
+
 /// One `schema.overrides` entry as written in a load definition (ADR-0038):
 /// the field it names and the inferred properties it replaces. Part of the
 /// versioned load-definition contract, so unknown keys inside an entry are
@@ -1014,6 +1043,7 @@ impl Resolution {
 /// failure with the whole-input observations its message needs.
 pub(crate) struct TextObserver<'a> {
     directive: &'a SchemaDirective,
+    merge_keys: &'a MergeKeys,
     field_names: &'a [String],
     checks: Option<Vec<FieldCheck>>,
     all_types: Vec<InferredType>,
@@ -1021,17 +1051,28 @@ pub(crate) struct TextObserver<'a> {
 }
 
 impl<'a> TextObserver<'a> {
-    pub(crate) fn new(directive: &'a SchemaDirective, field_names: &'a [String]) -> Self {
+    pub(crate) fn new(
+        directive: &'a SchemaDirective,
+        merge_keys: &'a MergeKeys,
+        field_names: &'a [String],
+    ) -> Self {
         // Probe the verdict with placeholder observations: only the checks
         // matter here, and they do not depend on observed types. A failing
         // probe leaves the observer in observation-only mode, and finish()
         // re-derives the same failure with the real observations.
         let placeholder = vec![InferredType::Null; field_names.len()];
-        let checks = resolve_plan(directive, field_names, &placeholder, &placeholder)
-            .ok()
-            .map(|resolution| resolution.checks);
+        let checks = resolve_plan(
+            directive,
+            merge_keys,
+            field_names,
+            &placeholder,
+            &placeholder,
+        )
+        .ok()
+        .map(|resolution| resolution.checks);
         TextObserver {
             directive,
+            merge_keys,
             field_names,
             checks,
             all_types: vec![InferredType::Null; field_names.len()],
@@ -1062,6 +1103,7 @@ impl<'a> TextObserver<'a> {
     pub(crate) fn finish(self) -> Result<Resolution, ExecutionFailure> {
         resolve_plan(
             self.directive,
+            self.merge_keys,
             self.field_names,
             &self.all_types,
             &self.survivor_types,
@@ -1088,6 +1130,7 @@ fn merge_text_observations(types: &mut [InferredType], record: &TextRecord) {
 /// dataset column order cannot change them.
 pub(crate) struct JsonObserver<'a> {
     directive: &'a SchemaDirective,
+    merge_keys: &'a MergeKeys,
     checks: Vec<FieldCheck>,
     all_types: HashMap<String, InferredType>,
     survivor_types: HashMap<String, InferredType>,
@@ -1105,11 +1148,12 @@ pub(crate) enum JsonOutcome {
 }
 
 impl<'a> JsonObserver<'a> {
-    pub(crate) fn new(directive: &'a SchemaDirective) -> Self {
+    pub(crate) fn new(directive: &'a SchemaDirective, merge_keys: &'a MergeKeys) -> Self {
         let flatten_count = directive.transform().flatten.len();
         JsonObserver {
             directive,
-            checks: directive_checks(directive),
+            merge_keys,
+            checks: directive_checks(directive, merge_keys),
             all_types: HashMap::new(),
             survivor_types: HashMap::new(),
             flatten_all: vec![InferredType::Null; flatten_count],
@@ -1163,7 +1207,13 @@ impl<'a> JsonObserver<'a> {
         for (position, observed) in self.flatten_survivors.iter().enumerate() {
             survivor_types[field_names.len() + position] = *observed;
         }
-        resolve_plan(self.directive, field_names, &all_types, &survivor_types)
+        resolve_plan(
+            self.directive,
+            self.merge_keys,
+            field_names,
+            &all_types,
+            &survivor_types,
+        )
     }
 }
 
@@ -1187,17 +1237,28 @@ fn merge_json_observations(
 }
 
 /// The per-record checks derivable from the directive alone, before the JSONL
-/// key union is known: every pinned field (a pin field missing from the union
-/// is missing-field drift, so on any load that validates records the pin is
-/// fully matched) plus every override outside the pin (an override naming no
-/// dataset field is `unknown_override_field`, another verdict that precedes
-/// validation). Whenever the end-of-input verdict passes, this set equals the
-/// resolved checks, so pass-1 outcomes agree with the resolved plan; when the
-/// verdict fails, the outcomes are discarded with the spill.
-fn directive_checks(directive: &SchemaDirective) -> Vec<FieldCheck> {
+/// key union is known: every merge key (a key naming no dataset field is
+/// `unknown_merge_key_field`, a verdict that precedes validation), then
+/// every pinned field (a pin field missing from the union is missing-field
+/// drift, so on any load that validates records the pin is fully matched)
+/// plus every override outside the pin (an override naming no dataset field
+/// is `unknown_override_field`, another verdict that precedes validation).
+/// Whenever the end-of-input verdict passes, this set equals the resolved
+/// checks, so pass-1 outcomes agree with the resolved plan; when the verdict
+/// fails, the outcomes are discarded with the spill.
+fn directive_checks(directive: &SchemaDirective, merge_keys: &MergeKeys) -> Vec<FieldCheck> {
     let transform = directive.transform();
     let overrides = directive.overrides();
     let mut checks = Vec::new();
+    for key in &merge_keys.keys {
+        checks.push(FieldCheck {
+            name: key.clone(),
+            source: json_source_address(transform, key),
+            observed_index: 0,
+            expected_type: None,
+            required: Some(NonNullRequirement::MergeKey),
+        });
+    }
     let mut pin_named: HashSet<&str> = HashSet::new();
     if let SchemaDirective::Pinned { pin, .. } = directive {
         for pin_field in &pin.fields {
@@ -1207,7 +1268,7 @@ fn directive_checks(directive: &SchemaDirective) -> Vec<FieldCheck> {
                 source: json_source_address(transform, &pin_field.name),
                 observed_index: 0,
                 expected_type: Some((pin_field.field_type, TypeOrigin::Pinned)),
-                required: !pin_field.nullable,
+                required: (!pin_field.nullable).then_some(NonNullRequirement::Schema),
             });
         }
     }
@@ -1222,7 +1283,7 @@ fn directive_checks(directive: &SchemaDirective) -> Vec<FieldCheck> {
             expected_type: override_
                 .field_type
                 .map(|field_type| (field_type, TypeOrigin::Overridden)),
-            required: override_.nullable == Some(false),
+            required: (override_.nullable == Some(false)).then_some(NonNullRequirement::Schema),
         });
     }
     checks
@@ -1261,7 +1322,7 @@ pub(crate) fn json_record_violates(record: &JsonRecord, checks: &[FieldCheck]) -
     checks
         .iter()
         .any(|check| match check.source.json_value(&record.object) {
-            None | Some(Value::Null) => check.required,
+            None | Some(Value::Null) => check.required.is_some(),
             Some(value) => check
                 .expected_type
                 .is_some_and(|(expected_type, _)| !json_value_fits(value, expected_type)),
@@ -1278,6 +1339,7 @@ pub(crate) fn json_record_violates(record: &JsonRecord, checks: &[FieldCheck]) -
 /// record's values never shape the destination.
 fn resolve_plan(
     directive: &SchemaDirective,
+    merge_keys: &MergeKeys,
     field_names: &[String],
     all_types: &[InferredType],
     survivor_types: &[InferredType],
@@ -1285,7 +1347,8 @@ fn resolve_plan(
     stamped_resolution(directive, || {
         let columns = resolve_transform(directive, field_names)?;
         check_override_names(directive, &columns)?;
-        match directive {
+        let merge_checks = merge_key_checks(directive, merge_keys, &columns)?;
+        let resolved: Result<Resolution, ExecutionFailure> = match directive {
             SchemaDirective::Inferred { overrides, .. } => Ok(inferred_resolution(
                 &columns,
                 survivor_types,
@@ -1329,8 +1392,65 @@ fn resolve_plan(
                     pinned_schema_write: plan.pinned_schema_write,
                 })
             }
+        };
+        let mut resolution = resolved?;
+        // Merge-key checks precede the schema checks, so a null in a key
+        // field is always named by the merge-key rule; being order-free,
+        // pass-1 outcomes are unchanged by the position.
+        if !merge_checks.is_empty() {
+            let mut checks = merge_checks;
+            checks.append(&mut resolution.checks);
+            resolution.checks = checks;
         }
+        Ok(resolution)
     })
+}
+
+/// Verifies every merge key names a resolved dataset column — after flatten,
+/// selection, and rename, exactly the fields the load materializes — and
+/// builds the per-record non-null checks the keys impose, in key order. A
+/// key naming no dataset field fails the load with `unknown_merge_key_field`
+/// before any record is validated or written, so for JSONL a batch-wide
+/// absent key field is an unknown field, never a batch of null-key
+/// rejections.
+fn merge_key_checks(
+    directive: &SchemaDirective,
+    merge_keys: &MergeKeys,
+    columns: &[DatasetColumn],
+) -> Result<Vec<FieldCheck>, ExecutionFailure> {
+    let mut checks = Vec::with_capacity(merge_keys.keys.len());
+    let mut unknown: Vec<String> = Vec::new();
+    for key in &merge_keys.keys {
+        match columns
+            .iter()
+            .find(|column| column.dataset_name.as_str() == key.as_str())
+        {
+            Some(column) => checks.push(FieldCheck {
+                name: column.dataset_name.clone(),
+                source: column.source.clone(),
+                observed_index: column.observed_index,
+                expected_type: None,
+                required: Some(NonNullRequirement::MergeKey),
+            }),
+            None => unknown.push(key.clone()),
+        }
+    }
+    if unknown.is_empty() {
+        return Ok(checks);
+    }
+
+    // The load failed before any schema decision could be completed, so the
+    // decision echoes the configured posture, like an unknown override name.
+    Err(pre_materialization_failure(
+        LoadFailure {
+            code: "unknown_merge_key_field",
+            message: format!(
+                "merge keys name fields absent from the resolved dataset schema: {}",
+                unknown.join(", ")
+            ),
+        },
+        configured_posture_decision(directive),
+    ))
 }
 
 /// Assembles the resolution of an inference-driven or pin-bootstrapping load:
@@ -1924,7 +2044,20 @@ pub(crate) struct FieldCheck {
     source: SourceAddress,
     observed_index: usize,
     expected_type: Option<(FieldType, TypeOrigin)>,
-    required: bool,
+    required: Option<NonNullRequirement>,
+}
+
+/// Why a check requires its field to be non-null, which decides the
+/// rejection a null value raises: a `nullable: false` schema property —
+/// pinned or overridden — rejects as `missing_required_field` (ADR-0035,
+/// ADR-0038), while a merge key rejects as `null_merge_key`, because a null
+/// never equals anything under key equality. Merge-key checks precede the
+/// schema checks, so a null in a key field that is also schema-required
+/// names the merge-key rule.
+#[derive(Clone, Copy)]
+enum NonNullRequirement {
+    Schema,
+    MergeKey,
 }
 
 impl FieldCheck {
@@ -1969,7 +2102,7 @@ fn pinned_checks(matched: &[PlannedField]) -> Vec<FieldCheck> {
             source: planned.source.clone(),
             observed_index: planned.observed_index,
             expected_type: Some((planned.materialized_type, TypeOrigin::Pinned)),
-            required: !planned.nullable,
+            required: (!planned.nullable).then_some(NonNullRequirement::Schema),
         })
         .collect()
 }
@@ -1993,7 +2126,8 @@ fn override_checks<'a>(
                     expected_type: override_
                         .field_type
                         .map(|field_type| (field_type, TypeOrigin::Overridden)),
-                    required: override_.nullable == Some(false),
+                    required: (override_.nullable == Some(false))
+                        .then_some(NonNullRequirement::Schema),
                 })
         })
         .collect()
@@ -2012,10 +2146,11 @@ pub(crate) fn validate_text_record(
     for check in checks {
         match record.cells[check.observed_index].as_deref() {
             None => {
-                if check.required {
-                    return Some(required_field_rejection(
+                if let Some(requirement) = check.required {
+                    return Some(null_value_rejection(
                         record.line,
                         check,
+                        requirement,
                         text_record_json(field_names, &record.cells),
                     ));
                 }
@@ -2048,10 +2183,11 @@ fn validate_json_record(record: &JsonRecord, checks: &[FieldCheck]) -> Option<Re
     for check in checks {
         match check.source.json_value(&record.object) {
             None | Some(Value::Null) => {
-                if check.required {
-                    return Some(required_field_rejection(
+                if let Some(requirement) = check.required {
+                    return Some(null_value_rejection(
                         record.line,
                         check,
+                        requirement,
                         Value::Object(record.object.clone()),
                     ));
                 }
@@ -2287,13 +2423,31 @@ fn json_kind(value: &Value) -> &'static str {
     }
 }
 
-fn required_field_rejection(line: u64, check: &FieldCheck, record: Value) -> RejectedRecord {
+/// The rejection a null value in a non-null field earns, named by why the
+/// field is non-null: a schema-required field (ADR-0035), or a merge key,
+/// which key equality can never match on null.
+fn null_value_rejection(
+    line: u64,
+    check: &FieldCheck,
+    requirement: NonNullRequirement,
+    record: Value,
+) -> RejectedRecord {
+    let (code, message) = match requirement {
+        NonNullRequirement::Schema => (
+            rejection::MISSING_REQUIRED_FIELD,
+            format!("required field {:?} is null", check.name),
+        ),
+        NonNullRequirement::MergeKey => (
+            rejection::NULL_MERGE_KEY,
+            format!("merge key {:?} is null", check.name),
+        ),
+    };
     RejectedRecord {
         line,
-        code: rejection::MISSING_REQUIRED_FIELD,
+        code,
         field: Some(check.name.clone()),
         source_field: check.source_field(),
-        message: format!("required field {:?} is null", check.name),
+        message,
         record,
     }
 }
@@ -3194,7 +3348,8 @@ pub(crate) fn from_text_columns(
     field_names: Vec<String>,
     records: Vec<TextRecord>,
 ) -> Result<Materialized, ExecutionFailure> {
-    let mut observer = TextObserver::new(directive, &field_names);
+    let merge_keys = MergeKeys::none();
+    let mut observer = TextObserver::new(directive, &merge_keys, &field_names);
     let mut survivors = Vec::new();
     let mut rejected = Vec::new();
     for record in records {
@@ -3222,7 +3377,8 @@ pub(crate) fn from_json_columns(
     field_names: Vec<String>,
     records: Vec<JsonRecord>,
 ) -> Result<Materialized, ExecutionFailure> {
-    let mut observer = JsonObserver::new(directive);
+    let merge_keys = MergeKeys::none();
+    let mut observer = JsonObserver::new(directive, &merge_keys);
     let mut survivors = Vec::new();
     let mut spilled = Vec::new();
     for record in records {

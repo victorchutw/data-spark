@@ -1,0 +1,12 @@
+version: 1
+source:
+  connector: local_file
+  path: customers-day-2.csv
+  format: csv
+destination:
+  connector: duckdb
+  path: crm.duckdb
+dataset: customers
+load_mode: merge
+merge:
+  keys: [customer_id]

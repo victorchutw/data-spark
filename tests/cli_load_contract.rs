@@ -8401,6 +8401,971 @@ fn invalid_parallelism_values_fail_before_source_or_destination_work() {
     }
 }
 
+// ---- Merge loads (ADR-0057, ADR-0058, ADR-0059) ----
+
+/// Writes a merge-shaped load definition: the standard blocks plus a raw
+/// trailing block for `merge:`, `transform:`, or `reject_threshold:` lines.
+fn write_merge_definition(
+    definition_path: &Path,
+    source_path: &Path,
+    source_format: &str,
+    destination_connector: &str,
+    destination_path: &Path,
+    load_mode: &str,
+    extra_blocks: &str,
+) {
+    fs::write(
+        definition_path,
+        format!(
+            "version: 1\n\
+             source:\n\
+             \x20 connector: local_file\n\
+             \x20 path: {}\n\
+             \x20 format: {source_format}\n\
+             destination:\n\
+             \x20 connector: {destination_connector}\n\
+             \x20 path: {}\n\
+             dataset: customers\n\
+             load_mode: {load_mode}\n\
+             {extra_blocks}",
+            source_path.display(),
+            destination_path.display(),
+        ),
+    )
+    .expect("write load definition");
+}
+
+#[test]
+fn local_csv_merge_updates_matching_records_and_inserts_new_ones_into_duckdb() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    // Day 1 bootstraps the destination table: merge never auto-creates.
+    fs::write(
+        &source_path,
+        "customer_id,name,tier\n1,Ada,gold\n2,Grace,silver\n",
+    )
+    .expect("write bootstrap csv");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "full_refresh",
+        "",
+    );
+    let bootstrap = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-1"),
+        &definition_path,
+        true,
+    );
+    assert!(
+        bootstrap.report["merge"].is_null(),
+        "a non-merge load echoes a null merge block"
+    );
+
+    // Day 2 merges one matching key (replaced whole: every non-key column
+    // takes the source value) and one new key.
+    fs::write(
+        &source_path,
+        "customer_id,name,tier\n2,Grace Hopper,gold\n3,Katherine,bronze\n",
+    )
+    .expect("write merge csv");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "merge",
+        "merge:\n  keys: [customer_id]\n",
+    );
+    let merge = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-2"),
+        &definition_path,
+        true,
+    );
+    let report = &merge.report;
+
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["process_exit_code"], 0);
+    assert_eq!(report["load_mode"], "merge");
+    assert_eq!(
+        report["merge"],
+        serde_json::json!({ "keys": ["customer_id"] })
+    );
+    assert_eq!(report["row_counts"]["source"], 2);
+    assert_eq!(report["row_counts"]["written"], 2);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert_eq!(
+        report["destination_write"],
+        serde_json::json!({
+            "atomicity": "atomic",
+            "strategy": "transactional_merge",
+            "merge": { "updated": 1, "inserted": 1 }
+        })
+    );
+    let updated = report["destination_write"]["merge"]["updated"]
+        .as_u64()
+        .expect("updated count");
+    let inserted = report["destination_write"]["merge"]["inserted"]
+        .as_u64()
+        .expect("inserted count");
+    assert_eq!(
+        updated + inserted,
+        report["row_counts"]["written"].as_u64().expect("written"),
+        "updated + inserted == row_counts.written"
+    );
+    assert!(report["byte_counts"]["destination"].is_null());
+    assert!(merge.stdout.contains("Load mode: merge"));
+
+    // The matched record was replaced whole, the new key inserted, and the
+    // untouched record kept every value.
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 3);
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_id is int64");
+    let names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name is string");
+    let tiers = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("tier is string");
+    assert_eq!(ids.values(), &[1, 2, 3]);
+    assert_eq!(names.value(0), "Ada");
+    assert_eq!(tiers.value(0), "gold");
+    assert_eq!(names.value(1), "Grace Hopper");
+    assert_eq!(tiers.value(1), "gold");
+    assert_eq!(names.value(2), "Katherine");
+    assert_eq!(tiers.value(2), "bronze");
+}
+
+#[test]
+fn local_jsonl_merge_matches_on_renamed_and_flattened_multi_field_keys() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+    let transform_block = "transform:\n\
+         \x20 flatten:\n\
+         \x20   region.code: region_code\n\
+         \x20 select: [id, region_code, name]\n\
+         \x20 rename:\n\
+         \x20   id: customer_id\n";
+
+    fs::write(
+        &source_path,
+        concat!(
+            "{\"id\": 1, \"region\": {\"code\": \"eu\"}, \"name\": \"Ada\"}\n",
+            "{\"id\": 2, \"region\": {\"code\": \"us\"}, \"name\": \"Grace\"}\n",
+        ),
+    )
+    .expect("write bootstrap jsonl");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "jsonl",
+        "duckdb",
+        &database_path,
+        "full_refresh",
+        transform_block,
+    );
+    run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-1"),
+        &definition_path,
+        true,
+    );
+
+    // The key tuple is a rename target plus a flatten output: (2, us)
+    // matches an existing record while (2, eu) is a new tuple, so the same
+    // customer_id both updates and inserts under the two-field key.
+    fs::write(
+        &source_path,
+        concat!(
+            "{\"id\": 2, \"region\": {\"code\": \"us\"}, \"name\": \"Grace Hopper\"}\n",
+            "{\"id\": 2, \"region\": {\"code\": \"eu\"}, \"name\": \"Grace Brewster\"}\n",
+        ),
+    )
+    .expect("write merge jsonl");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "jsonl",
+        "duckdb",
+        &database_path,
+        "merge",
+        &format!("{transform_block}merge:\n  keys: [customer_id, region_code]\n"),
+    );
+    let merge = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-2"),
+        &definition_path,
+        true,
+    );
+    let report = &merge.report;
+
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(
+        report["merge"],
+        serde_json::json!({ "keys": ["customer_id", "region_code"] })
+    );
+    assert_eq!(
+        report["destination_write"]["merge"],
+        serde_json::json!({ "updated": 1, "inserted": 1 })
+    );
+    assert_eq!(report["row_counts"]["written"], 2);
+
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 3);
+    let mut records = Vec::new();
+    for index in 0..batch.num_rows() {
+        records.push((
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("customer_id is int64")
+                .value(index),
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("region_code is string")
+                .value(index)
+                .to_string(),
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("name is string")
+                .value(index)
+                .to_string(),
+        ));
+    }
+    records.sort();
+    assert_eq!(
+        records,
+        vec![
+            (1, "eu".to_string(), "Ada".to_string()),
+            (2, "eu".to_string(), "Grace Brewster".to_string()),
+            (2, "us".to_string(), "Grace Hopper".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn merge_key_nulls_reject_records_against_the_reject_threshold() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    fs::write(&source_path, "customer_id,name\n1,Ada\n").expect("write bootstrap csv");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "full_refresh",
+        "",
+    );
+    run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-1"),
+        &definition_path,
+        true,
+    );
+
+    // A CSV empty cell is the pipeline's existing null: under the default
+    // threshold of 0 the single null-key record fails the whole load before
+    // any destination write.
+    fs::write(&source_path, "customer_id,name\n2,Grace\n,Katherine\n").expect("write null-key csv");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "merge",
+        "merge:\n  keys: [customer_id]\n",
+    );
+    let failed = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-default"),
+        &definition_path,
+        false,
+    );
+    let report = &failed.report;
+    assert_eq!(report["error_summary"]["code"], "reject_threshold_exceeded");
+    assert_eq!(report["row_counts"]["rejected"], 1);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+    let rejections = read_rejected_records(&PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("rejected artifact path"),
+    ));
+    assert_eq!(rejections.len(), 1);
+    assert_eq!(rejections[0]["code"], "null_merge_key");
+    assert_eq!(rejections[0]["field"], "customer_id");
+    assert_eq!(
+        rejections[0]["message"],
+        "merge key \"customer_id\" is null"
+    );
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 1, "the failed load wrote nothing");
+
+    // An explicit threshold admits the rejection: the survivors merge and
+    // the counts exclude the rejected record.
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "merge",
+        "merge:\n  keys: [customer_id]\nreject_threshold: 1\n",
+    );
+    let merged = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-threshold"),
+        &definition_path,
+        true,
+    );
+    assert_eq!(merged.report["row_counts"]["rejected"], 1);
+    assert_eq!(merged.report["row_counts"]["written"], 1);
+    assert_eq!(
+        merged.report["destination_write"]["merge"],
+        serde_json::json!({ "updated": 0, "inserted": 1 })
+    );
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 2);
+}
+
+#[test]
+fn jsonl_absent_key_fields_reject_as_null_merge_keys() {
+    // A JSONL record with the key field absent — or explicitly null — is
+    // the existing null definition, so it rejects as `null_merge_key`
+    // exactly like a null value.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.jsonl");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    fs::write(&source_path, "{\"customer_id\": 1, \"name\": \"Ada\"}\n")
+        .expect("write bootstrap jsonl");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "jsonl",
+        "duckdb",
+        &database_path,
+        "full_refresh",
+        "",
+    );
+    run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-1"),
+        &definition_path,
+        true,
+    );
+
+    fs::write(
+        &source_path,
+        concat!(
+            "{\"customer_id\": 2, \"name\": \"Grace\"}\n",
+            "{\"name\": \"Absent\"}\n",
+            "{\"customer_id\": null, \"name\": \"Null\"}\n",
+        ),
+    )
+    .expect("write merge jsonl");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "jsonl",
+        "duckdb",
+        &database_path,
+        "merge",
+        "merge:\n  keys: [customer_id]\nreject_threshold: 2\n",
+    );
+    let merged = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-2"),
+        &definition_path,
+        true,
+    );
+
+    assert_eq!(merged.report["row_counts"]["rejected"], 2);
+    assert_eq!(merged.report["row_counts"]["written"], 1);
+    let rejections = read_rejected_records(&PathBuf::from(
+        merged.report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("rejected artifact path"),
+    ));
+    assert_eq!(rejections.len(), 2);
+    for rejection in &rejections {
+        assert_eq!(rejection["code"], "null_merge_key");
+    }
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 2);
+}
+
+#[test]
+fn merge_cross_validation_failures_keep_the_pure_pre_write_posture() {
+    for (load_mode, merge_block, expected_code, expected_message) in [
+        (
+            "merge",
+            "",
+            "missing_merge_keys",
+            "load definition merge.keys is required when load_mode is merge",
+        ),
+        (
+            "append",
+            "merge:\n  keys: [customer_id]\n",
+            "invalid_merge_config",
+            "a merge block requires load_mode: merge",
+        ),
+        (
+            "merge",
+            "merge:\n  keys: []\n",
+            "invalid_merge_config",
+            "merge.keys must name at least one dataset field",
+        ),
+        (
+            "merge",
+            "merge:\n  keys: [customer_id, customer_id]\n",
+            "invalid_merge_config",
+            "merge.keys names field \"customer_id\" more than once",
+        ),
+    ] {
+        let work = TempDir::new().expect("tempdir");
+        let source_path = work.path().join("customers.csv");
+        let database_path = work.path().join("customers.duckdb");
+        let definition_path = work.path().join("load.yml");
+        fs::write(&source_path, "customer_id,name\n1,Ada\n").expect("write source csv");
+        write_merge_definition(
+            &definition_path,
+            &source_path,
+            "csv",
+            "duckdb",
+            &database_path,
+            load_mode,
+            merge_block,
+        );
+
+        let load = run_cli_load(
+            work.path(),
+            &work.path().join("artifacts"),
+            &definition_path,
+            false,
+        );
+        let report = &load.report;
+
+        assert_eq!(
+            report["error_summary"]["code"], expected_code,
+            "{merge_block:?}"
+        );
+        assert_eq!(
+            report["error_summary"]["message"], expected_message,
+            "{merge_block:?}"
+        );
+        assert_eq!(report["exit_status"], "failed", "{merge_block:?}");
+        assert_eq!(report["process_exit_code"], 1, "{merge_block:?}");
+        assert_eq!(
+            report["schema_decision"],
+            serde_json::json!({ "mode": "not_evaluated" }),
+            "{merge_block:?}"
+        );
+        assert_eq!(
+            report["execution"],
+            serde_json::json!({
+                "record_format": "not_started",
+                "batch_count": 0
+            }),
+            "{merge_block:?}"
+        );
+        assert_eq!(report["row_counts"]["source"], 0, "{merge_block:?}");
+        assert_eq!(report["row_counts"]["written"], 0, "{merge_block:?}");
+        assert_eq!(report["row_counts"]["rejected"], 0, "{merge_block:?}");
+        assert_eq!(
+            report["destination_write"]["atomicity"], "not_applicable",
+            "{merge_block:?}"
+        );
+        assert!(
+            !database_path.exists(),
+            "a config failure must not touch the destination: {merge_block:?}"
+        );
+    }
+}
+
+#[test]
+fn merge_echoes_the_declared_block_even_when_cross_validation_rejects_it() {
+    // The report echoes the merge block like it echoes any load mode string:
+    // as declared, even when the declaration is the failure.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let definition_path = work.path().join("load.yml");
+    fs::write(&source_path, "customer_id\n1\n").expect("write source csv");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &work.path().join("customers.duckdb"),
+        "append",
+        "merge:\n  keys: [customer_id]\n",
+    );
+
+    let load = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts"),
+        &definition_path,
+        false,
+    );
+
+    assert_eq!(load.report["error_summary"]["code"], "invalid_merge_config");
+    assert_eq!(
+        load.report["merge"],
+        serde_json::json!({ "keys": ["customer_id"] })
+    );
+}
+
+#[test]
+fn parquet_declines_merge_and_unknown_modes_stay_unsupported_load_mode() {
+    // A parquet merge fails before any I/O: the missing source proves no
+    // source read happened, and the failure names the destination and its
+    // supported modes (`unsupported_load_mode_for_destination`).
+    let work = TempDir::new().expect("tempdir");
+    let definition_path = work.path().join("load.yml");
+    let destination_path = work.path().join("customers_dataset");
+    write_merge_definition(
+        &definition_path,
+        &work.path().join("missing.csv"),
+        "csv",
+        "parquet",
+        &destination_path,
+        "merge",
+        "merge:\n  keys: [customer_id]\n",
+    );
+    let declined = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-parquet"),
+        &definition_path,
+        false,
+    );
+    assert_eq!(
+        declined.report["error_summary"]["code"],
+        "unsupported_load_mode_for_destination"
+    );
+    assert_eq!(
+        declined.report["error_summary"]["message"],
+        "parquet destination does not support load mode: merge \
+         (supported load modes: full_refresh, append)"
+    );
+    assert_eq!(
+        declined.report["schema_decision"],
+        serde_json::json!({ "mode": "not_evaluated" })
+    );
+    assert!(!destination_path.exists());
+
+    // `unsupported_load_mode` now means exactly "the mode string is
+    // unknown".
+    write_merge_definition(
+        &definition_path,
+        &work.path().join("missing.csv"),
+        "csv",
+        "parquet",
+        &destination_path,
+        "sideload",
+        "",
+    );
+    let unknown = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-unknown"),
+        &definition_path,
+        false,
+    );
+    assert_eq!(
+        unknown.report["error_summary"]["code"],
+        "unsupported_load_mode"
+    );
+    assert_eq!(
+        unknown.report["error_summary"]["message"],
+        "unsupported load mode: sideload"
+    );
+}
+
+#[test]
+fn unknown_merge_key_fields_fail_before_any_destination_write() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    fs::write(&source_path, "customer_id,name\n1,Ada\n").expect("write bootstrap csv");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "full_refresh",
+        "",
+    );
+    run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-1"),
+        &definition_path,
+        true,
+    );
+
+    // A key naming a renamed-away source name is not a dataset field: keys
+    // speak dataset names, after the transform.
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "merge",
+        "transform:\n  rename:\n    customer_id: id\nmerge:\n  keys: [customer_id]\n",
+    );
+    let failed = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-unknown-key"),
+        &definition_path,
+        false,
+    );
+    let report = &failed.report;
+    assert_eq!(report["error_summary"]["code"], "unknown_merge_key_field");
+    assert_eq!(
+        report["error_summary"]["message"],
+        "merge keys name fields absent from the resolved dataset schema: customer_id"
+    );
+    assert_eq!(report["schema_decision"]["mode"], "inferred");
+    assert_eq!(report["row_counts"]["source"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+    assert_eq!(
+        report["execution"],
+        serde_json::json!({
+            "record_format": "not_started",
+            "batch_count": 0
+        })
+    );
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 1, "the destination stayed untouched");
+
+    // For JSONL the dataset shape is the union of the batch's record keys, so
+    // a batch-wide-absent key field is an unknown field — never a batch of
+    // null-key rejections.
+    let jsonl_path = work.path().join("customers.jsonl");
+    fs::write(&jsonl_path, "{\"name\": \"Ada\"}\n").expect("write jsonl");
+    write_merge_definition(
+        &definition_path,
+        &jsonl_path,
+        "jsonl",
+        "duckdb",
+        &database_path,
+        "merge",
+        "merge:\n  keys: [customer_id]\n",
+    );
+    let absent = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-absent-key"),
+        &definition_path,
+        false,
+    );
+    assert_eq!(
+        absent.report["error_summary"]["code"],
+        "unknown_merge_key_field"
+    );
+    assert_eq!(absent.report["row_counts"]["rejected"], 0);
+    assert!(absent.report["rejected_records"]["artifact"].is_null());
+}
+
+#[test]
+fn merge_into_a_missing_duckdb_table_keeps_the_not_started_posture() {
+    // Merge never auto-creates its destination table: a missing table fails
+    // opening the session, mirroring the append probe — same code, "before
+    // merge" wording, and the exact pre-write posture.
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+    fs::write(&source_path, "customer_id\n1\n").expect("write source csv");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "merge",
+        "merge:\n  keys: [customer_id]\n",
+    );
+
+    let load = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts"),
+        &definition_path,
+        false,
+    );
+    let report = &load.report;
+
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("before merge"));
+    assert_eq!(
+        report["execution"],
+        serde_json::json!({
+            "record_format": "not_started",
+            "batch_count": 0
+        })
+    );
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+}
+
+#[test]
+fn a_zero_survivor_merge_commits_a_no_op_and_exits_zero() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("readings.csv");
+    let database_path = work.path().join("readings.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    // Text-typed columns keep the header-only day aligned with the table.
+    fs::write(&source_path, "station,city\nS-1,Berlin\n").expect("write bootstrap csv");
+    fs::write(
+        &definition_path,
+        format!(
+            "version: 1\n\
+             source:\n\
+             \x20 connector: local_file\n\
+             \x20 path: {}\n\
+             \x20 format: csv\n\
+             destination:\n\
+             \x20 connector: duckdb\n\
+             \x20 path: {}\n\
+             dataset: readings\n\
+             load_mode: full_refresh\n",
+            source_path.display(),
+            database_path.display(),
+        ),
+    )
+    .expect("write bootstrap definition");
+    run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-1"),
+        &definition_path,
+        true,
+    );
+
+    // A header-only day has zero survivors: the stage stays empty, the merge
+    // is a no-op, and the terminal commit still completes the load.
+    fs::write(&source_path, "station,city\n").expect("write empty csv");
+    fs::write(
+        &definition_path,
+        format!(
+            "version: 1\n\
+             source:\n\
+             \x20 connector: local_file\n\
+             \x20 path: {}\n\
+             \x20 format: csv\n\
+             destination:\n\
+             \x20 connector: duckdb\n\
+             \x20 path: {}\n\
+             dataset: readings\n\
+             load_mode: merge\n\
+             merge:\n\
+             \x20 keys: [station]\n",
+            source_path.display(),
+            database_path.display(),
+        ),
+    )
+    .expect("write merge definition");
+    let merge = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-2"),
+        &definition_path,
+        true,
+    );
+
+    assert_eq!(merge.report["exit_status"], "succeeded");
+    assert_eq!(merge.report["row_counts"]["source"], 0);
+    assert_eq!(merge.report["row_counts"]["written"], 0);
+    assert_eq!(
+        merge.report["destination_write"],
+        serde_json::json!({
+            "atomicity": "atomic",
+            "strategy": "transactional_merge",
+            "merge": { "updated": 0, "inserted": 0 }
+        })
+    );
+    let batch = read_single_duckdb_batch(&database_path, "readings");
+    assert_eq!(batch.num_rows(), 1, "the destination is unchanged");
+}
+
+#[test]
+fn duplicate_merge_keys_fail_the_load_and_leave_the_destination_byte_identical() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    fs::write(&source_path, "customer_id,name\n1,Ada\n").expect("write bootstrap csv");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "full_refresh",
+        "",
+    );
+    run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-1"),
+        &definition_path,
+        true,
+    );
+    let destination_before = fs::read(&database_path).expect("read destination bytes");
+
+    // Two surviving records share one key tuple: never first/last-wins —
+    // the load fails and the transaction rolls back before the real table
+    // was touched.
+    fs::write(
+        &source_path,
+        "customer_id,name\n7,First\n7,Second\n8,Other\n",
+    )
+    .expect("write duplicate-key csv");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "merge",
+        "merge:\n  keys: [customer_id]\n",
+    );
+    let failed = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-2"),
+        &definition_path,
+        false,
+    );
+    let report = &failed.report;
+
+    assert_eq!(report["error_summary"]["code"], "duplicate_merge_keys");
+    assert_eq!(
+        report["error_summary"]["message"],
+        format!(
+            "2 surviving records share a merge key tuple with another surviving \
+             record for DuckDB table customers in {}",
+            database_path.display()
+        )
+    );
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["destination_write"]["atomicity"], "atomic");
+    assert_eq!(
+        report["destination_write"]["strategy"],
+        "transactional_merge"
+    );
+    assert!(
+        report["destination_write"]["merge"].is_null(),
+        "a failed merge reports no merge counts"
+    );
+    assert_eq!(report["execution"]["record_format"], "arrow_record_batch");
+    assert_eq!(report["execution"]["batch_count"], 0);
+
+    let destination_after = fs::read(&database_path).expect("read destination bytes");
+    assert_eq!(
+        destination_before, destination_after,
+        "the rolled-back merge left the destination byte-identical"
+    );
+}
+
+#[test]
+fn a_mid_load_merge_failure_leaves_the_destination_byte_identical() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    fs::write(&source_path, "customer_id,name\n1,Ada\n").expect("write bootstrap csv");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "full_refresh",
+        "",
+    );
+    run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-1"),
+        &definition_path,
+        true,
+    );
+    let destination_before = fs::read(&database_path).expect("read destination bytes");
+
+    // An added source column against the unmigrated table fails chunk
+    // alignment exactly like append — but under merge's terminal commit the
+    // failure commits nothing.
+    fs::write(&source_path, "customer_id,name,tier\n2,Grace,gold\n").expect("write drifted csv");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "merge",
+        "merge:\n  keys: [customer_id]\n",
+    );
+    let failed = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-2"),
+        &definition_path,
+        false,
+    );
+    let report = &failed.report;
+
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("merge schema does not match DuckDB destination"));
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["destination_write"]["atomicity"], "atomic");
+    assert_eq!(
+        report["destination_write"]["strategy"],
+        "transactional_merge"
+    );
+
+    let destination_after = fs::read(&database_path).expect("read destination bytes");
+    assert_eq!(
+        destination_before, destination_after,
+        "the failed merge left the destination byte-identical"
+    );
+}
+
 fn write_load_definition(
     definition_path: &Path,
     source_path: &Path,

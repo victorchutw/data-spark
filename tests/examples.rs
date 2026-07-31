@@ -35,10 +35,13 @@ struct RowCounts {
 }
 
 /// The report's `destination_write`: the write atomicity and the strategy that
-/// reached it, which a load that never got to its destination has neither of.
+/// reached it, which a load that never got to its destination has neither of —
+/// plus, for a committed merge, the `updated`/`inserted` partition its README
+/// states.
 struct DestinationWrite {
     atomicity: &'static str,
     strategy: Option<&'static str>,
+    merge: Option<(u64, u64)>,
 }
 
 impl DestinationWrite {
@@ -46,6 +49,15 @@ impl DestinationWrite {
         Self {
             atomicity: "atomic",
             strategy: Some(strategy),
+            merge: None,
+        }
+    }
+
+    fn merged(updated: u64, inserted: u64) -> Self {
+        Self {
+            atomicity: "atomic",
+            strategy: Some("transactional_merge"),
+            merge: Some((updated, inserted)),
         }
     }
 
@@ -53,6 +65,7 @@ impl DestinationWrite {
         Self {
             atomicity: "best_effort",
             strategy: Some(strategy),
+            merge: None,
         }
     }
 
@@ -60,6 +73,7 @@ impl DestinationWrite {
         Self {
             atomicity: "not_applicable",
             strategy: None,
+            merge: None,
         }
     }
 }
@@ -269,6 +283,35 @@ fn examples() -> Vec<Example> {
                     })
                     .write(DestinationWrite::best_effort("insert"))
                     .destination_records(5),
+            ],
+        },
+        Example {
+            name: "csv-to-duckdb-merge",
+            destination: Destination::DuckDb {
+                path: "crm.duckdb",
+                dataset: "customers",
+            },
+            loads: vec![
+                // A merge writes into a table that exists, so the first load
+                // is the full refresh that creates it.
+                Load::succeeds("load-day-1.yml")
+                    .row_counts(RowCounts {
+                        source: 3,
+                        written: 3,
+                        rejected: 0,
+                    })
+                    .write(DestinationWrite::atomic("transactional_replace"))
+                    .destination_records(3),
+                // Day 2 updates customer 2 whole and inserts customer 4;
+                // customers 1 and 3 stay — merge never deletes.
+                Load::succeeds("load-day-2.yml")
+                    .row_counts(RowCounts {
+                        source: 2,
+                        written: 2,
+                        rejected: 0,
+                    })
+                    .write(DestinationWrite::merged(1, 1))
+                    .destination_records(4),
             ],
         },
         Example {
@@ -673,6 +716,17 @@ fn assert_report(context: &str, stdout: &str, report: &Value, load: &Load) {
             None => assert!(
                 report["destination_write"]["strategy"].is_null(),
                 "{context}: a load that reached no destination write has no strategy"
+            ),
+        }
+        match write.merge {
+            Some((updated, inserted)) => assert_eq!(
+                report["destination_write"]["merge"],
+                serde_json::json!({ "updated": updated, "inserted": inserted }),
+                "{context}: the merge partition the README names"
+            ),
+            None => assert!(
+                report["destination_write"]["merge"].is_null(),
+                "{context}: only a committed merge reports merge counts"
             ),
         }
     }
