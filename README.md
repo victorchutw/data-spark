@@ -9,11 +9,14 @@ automation alike.
 
 ## Features
 
-As of v0.3.0:
+As of v0.4.0:
 
 - **Sources**: local CSV and JSONL files.
 - **Destinations**: DuckDB databases and Parquet datasets.
-- **Load modes**: full refresh and append.
+- **Load modes**: full refresh, append, and merge. Merge is a keyed upsert
+  into a DuckDB table — matched records are replaced whole, unmatched source
+  records insert, and merge never deletes; the Parquet destination declines
+  the mode.
 - **Schema inference** from source records, with schema pinning and a drift
   policy that keeps a BI-ready dataset stable across repeated loads.
 - **Schema overrides and declared types**: wall-clock timestamps, instant
@@ -165,7 +168,7 @@ timings):
 ## Documentation
 
 [examples/](examples/) holds small, self-contained, runnable examples — the four
-source and destination pairs, both load modes, schema pinning and drift
+source and destination pairs, all three load modes, schema pinning and drift
 policies, structural transforms, declared types, rejected records, and chunked
 execution — and the test suite loads every one of them, so none of them can
 rot.
@@ -174,8 +177,9 @@ rot.
 starting from one of those examples: [schema
 pinning](docs/guides/schema-pinning.md), [rejected
 records](docs/guides/rejected-records.md), [declared
-types](docs/guides/declared-types.md), and [execution
-tuning](docs/guides/execution-tuning.md). Both contracts are documented key by
+types](docs/guides/declared-types.md), [execution
+tuning](docs/guides/execution-tuning.md), and [merge
+loads](docs/guides/merge-loads.md). Both contracts are documented key by
 key in the [Load Definition Reference](docs/reference/load-definition.md) and
 the [Load Report Reference](docs/reference/load-report.md).
 
