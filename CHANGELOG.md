@@ -31,6 +31,25 @@ this repository's use of pull requests, and link their commit instead.
 
 ## [Unreleased]
 
+### Fixed
+
+- Two pages promised that keeping `reject_threshold` at `0` protects "any
+  dataset that must never go empty" — a guarantee the threshold does not
+  provide. It guards only the rejection route: an empty delivery, a
+  header-only CSV, rejects nothing, so it completes at any threshold and a
+  `full_refresh` mirrors it as an empty dataset. Both pages now scope the
+  promise to "emptied by rejection", document the empty-delivery route, and
+  carry the decision that no guard is added, because a full refresh mirrors
+  the source by definition and an abnormal empty delivery is guarded
+  upstream
+  ([ADR-0056](docs/adr/0056-mirror-the-source-on-zero-survivor-full-refreshes.md)).
+  The every-record-rejected table also claimed a JSONL source whose
+  rejections are all tolerated fails; verified against the shipped binary,
+  that holds only for an all-unparseable file — records that parse but
+  reject offer their field names, and the load completes empty like CSV.
+  `CONTEXT.md` gains the Surviving Record term the docs, the code, and the
+  decision records already used. ([#98])
+
 ## [0.3.0] - 2026-07-30
 
 The binary can now say which release it is: `--version` prints it, and every
@@ -309,3 +328,4 @@ one carried is listed under the stable release that followed — `0.1.0` and
 [#88]: https://github.com/victorchutw/data-spark/pull/88
 [#94]: https://github.com/victorchutw/data-spark/pull/94
 [#95]: https://github.com/victorchutw/data-spark/pull/95
+[#98]: https://github.com/victorchutw/data-spark/pull/98
