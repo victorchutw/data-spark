@@ -1429,6 +1429,106 @@ fn header_only_csv_completes_as_an_empty_load() {
 }
 
 #[test]
+fn all_rejected_parseable_jsonl_completes_as_an_empty_load() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("events.jsonl");
+    // Every record parses as a JSON object but rejects under the override,
+    // so the source still offers field names with no survivor to observe.
+    fs::write(
+        &source_path,
+        "{\"station\": null, \"reading\": 1.5}\n{\"station\": null, \"reading\": 2.5}\n",
+    )
+    .expect("write all-rejected source jsonl");
+
+    let destination_path = work.path().join("events_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: jsonl
+destination:
+  connector: parquet
+  path: {}
+load_mode: full_refresh
+schema:
+  overrides:
+    - name: station
+      nullable: false
+reject_threshold: 10
+"#,
+            source_path.display(),
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    let result = run_cli_load(work.path(), &artifacts_dir, &definition_path, true);
+    let report = &result.report;
+
+    // ADR-0056: only an all-unparseable JSONL source fails (`malformed_jsonl`);
+    // records that parse but reject resolve the schema from their own field
+    // names, and a tolerated all-rejected load completes as an empty one.
+    assert_eq!(report["report_version"], 1);
+    assert_eq!(report["exit_status"], "succeeded");
+    assert_eq!(report["process_exit_code"], 0);
+    assert_eq!(report["schema_decision"]["mode"], "inferred");
+    let fields: Vec<(&str, &str)> = report["schema_decision"]["fields"]
+        .as_array()
+        .expect("schema fields")
+        .iter()
+        .map(|field| {
+            (
+                field["name"].as_str().expect("field name"),
+                field["type"].as_str().expect("field type"),
+            )
+        })
+        .collect();
+    // No surviving record shaped the columns, so both infer as utf8.
+    assert_eq!(fields, [("station", "utf8"), ("reading", "utf8")]);
+    assert_eq!(report["row_counts"]["source"], 2);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 2);
+    assert_eq!(report["rejected_records"]["count"], 2);
+    assert_eq!(report["destination_write"]["atomicity"], "best_effort");
+    assert!(report["error_summary"].is_null());
+
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let rejected_lines = read_rejected_records(&artifact_path);
+    assert_eq!(rejected_lines.len(), 2);
+    assert_eq!(rejected_lines[0]["line"], 1);
+    assert_eq!(rejected_lines[0]["code"], "missing_required_field");
+    assert_eq!(rejected_lines[1]["line"], 2);
+    assert_eq!(rejected_lines[1]["code"], "missing_required_field");
+
+    let files = parquet_files(&destination_path);
+    assert_eq!(
+        files.len(),
+        1,
+        "the empty dataset still has one Parquet file"
+    );
+    let rows = read_parquet_batches(&destination_path)
+        .iter()
+        .map(|batch| batch.num_rows())
+        .sum::<usize>();
+    assert_eq!(rows, 0, "an external Parquet reader sees no records");
+
+    assert!(result.stdout.contains("Status: succeeded"));
+    assert!(result.stdout.contains("Records read: 2"));
+    assert!(result.stdout.contains("Records written: 0"));
+    assert!(result.stdout.contains("Records rejected: 2"));
+}
+
+#[test]
 fn malformed_csv_header_fails_with_a_report_and_summary_before_destination_writing() {
     let work = TempDir::new().expect("tempdir");
     let source_path = work.path().join("customers.csv");
