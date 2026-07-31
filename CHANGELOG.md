@@ -36,10 +36,11 @@ this repository's use of pull requests, and link their commit instead.
 - `CONTEXT.md`'s Merge Load definition lagged the decided merge semantics
   ([ADR-0057](docs/adr/0057-land-merge-loads-on-duckdb-only-and-decline-elsewhere.md)):
   it said matched records are updated, where a merge replaces them whole,
-  and it omitted never-deletes, the boundary that decision defines the mode
-  by. The entry now carries both and settles in place that prose may gloss
-  the behavior as a keyed upsert, never as the mode's name — the reading
-  every shipped merge artifact already uses. ([#104])
+  and it omitted that a merge never deletes, the boundary that decision
+  defines the mode by. The entry now carries both and settles in place
+  that prose may gloss the behavior as a keyed upsert, never as the mode's
+  name — the reading that every shipped merge artifact already uses.
+  ([#104])
 
 ## [0.4.0] - 2026-07-31
 
