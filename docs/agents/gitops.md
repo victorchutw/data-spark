@@ -71,7 +71,9 @@ When moving an external PR through triage, use the same labels with
 7. Keep the PR as draft while still changing behavior. Draft PRs keep referenced issues in `in-progress`, and Copilot auto-review stays quiet until the PR is marked ready.
 8. Mark the PR ready for review only when CI is green and behavior is no longer changing. The issue status sync workflow moves referenced issues to `in-review`, and Copilot reviews the ready-for-review snapshot.
 9. Settle the Copilot review as described in "Copilot code review" below.
-10. Merge only after CI passes and every review conversation is resolved.
+10. Merge only after the required `rust` and `copilot-reviewed` checks pass
+    and every review conversation is resolved; the `main` branch ruleset
+    enforces all three.
 11. Let GitHub close the issue through the `Closes #<issue-number>` reference.
 
 ## Copilot code review
@@ -101,8 +103,20 @@ will actually merge. After marking a PR ready:
 3. Re-request a Copilot review manually if the fixes change behavior
    substantially.
 
-Branch protection requires every conversation to be resolved before merging,
-so an unhandled Copilot thread blocks the merge even when CI is green.
+Two of the `main` ruleset's requirements make settling mechanical rather
+than customary:
+
+- Every review conversation must be resolved before merging, so an unhandled
+  Copilot thread blocks the merge even when CI is green.
+- The `copilot-reviewed` commit status, posted by
+  `.github/workflows/copilot-review-gate.yml`, must be `success`. The gate
+  reports `success` once any submitted Copilot review exists on the PR —
+  deliberately not per-SHA freshness, because Copilot does not re-review
+  pushes, so requiring a review of the current head would deadlock every PR
+  after its first post-review push. Fork PRs receive the status as `success`
+  with a waiver description instead, because the automatic Copilot review
+  fires from the maintainer's account settings and never for external
+  authors.
 
 ## External PR triage
 
@@ -215,17 +229,33 @@ over an hour, but still correct.
 - `.github/workflows/issue-default-label.yml` adds `needs-triage` to new issues when no state label is present. External PR labels are applied by triage, not by this workflow.
 - `.github/workflows/issue-status-sync.yml` moves referenced issues to `in-progress` for draft PRs and `in-review` for ready PRs.
 - `.github/workflows/ci.yml` gates pushes and PRs with Rust formatting, linting, tests, and release build checks.
+- `.github/workflows/copilot-review-gate.yml` posts the `copilot-reviewed` commit status on PR head SHAs: `pending` until a Copilot review is submitted on the PR, `success` after, and `success` with a waiver description for fork PRs. It is status-only and must never check out PR code, because its `pull_request_target` trigger carries the base-repo write token.
 - `.github/workflows/release.yml` creates the single-binary GitHub Release from `v`-prefixed SemVer tags. Its cache step is restore-only (`save-if: "false"`), consuming the Rust build caches that `ci.yml` saves on `main`; a missing cache degrades to a cold but correct build.
 
 ## Repository settings
 
-`main` should be protected after the workflows are present on GitHub:
+`main` is protected by a single branch ruleset named `main merge gate`, not
+by classic branch protection; never run both systems against `main` at once.
+The ruleset requires:
 
-- Require pull requests before merging.
-- Require status checks before merging.
-- Require the `rust` CI check.
-- Require branches to be up to date before merging.
-- Require conversation resolution before merging.
-- Block force pushes and branch deletion.
+- A pull request before merging, with zero required approving reviews — a
+  solo maintainer cannot approve their own PRs, so any nonzero count would
+  deadlock the repo — and every review conversation resolved.
+- The `rust` and `copilot-reviewed` status checks, with the branch up to
+  date with `main` before merging. Strict up-to-dateness costs an occasional
+  branch update on this serial solo flow and guarantees the merged result is
+  the one CI tested. A branch update re-triggers both checks, and the gate
+  re-posts `copilot-reviewed` from the already-submitted review, so updating
+  cannot deadlock a reviewed PR.
+- No force pushes and no branch deletion.
+
+The `copilot-reviewed` requirement sequences any recreation of this setup:
+the gate workflow must be on `main` before a ruleset requiring its context
+activates, or every open PR blocks on a status nothing posts.
+
+Repository admins can bypass the ruleset for pull requests only — the
+conscious escape hatch (`gh pr merge --admin`, or the bypass confirmation in
+the merge box) for Copilot outages and emergencies. Direct pushes to `main`
+stay blocked for everyone, admins included.
 
 Release publishing should stay limited to `.github/workflows/release.yml` with `contents: write`; routine CI and issue automation should use narrower permissions.

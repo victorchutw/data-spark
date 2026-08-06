@@ -1,0 +1,91 @@
+name: copilot-review-gate
+
+# Posts a commit status with context `copilot-reviewed` on the PR head SHA.
+# The `main` branch ruleset requires that context, which turns "settle the
+# Copilot review before merging" from a convention into a merge gate.
+#
+# The gate is satisfied by any submitted Copilot review on the PR, not a
+# review of the current head SHA: Copilot does not re-review pushes, so
+# per-SHA freshness would deadlock every PR after its first post-review
+# push (observed on PR #119).
+#
+# SECURITY: `pull_request_target` runs with the base-repo write token so
+# fork PRs can receive the status. This workflow must therefore never
+# check out or execute PR code — it is status-only. Keep it that way.
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - synchronize
+  pull_request_target:
+    types:
+      - opened
+      - reopened
+      - ready_for_review
+      - synchronize
+  pull_request_review:
+    types:
+      - submitted
+
+permissions:
+  statuses: write
+  pull-requests: read
+
+jobs:
+  gate:
+    name: post the copilot-reviewed commit status
+    # Exactly one trigger family handles each PR. Same-repo PRs use
+    # `pull_request` and `pull_request_review`, which run the workflow
+    # version from the PR merge ref with a write token. Fork PRs use
+    # `pull_request_target`, which runs the version on `main` with the
+    # base-repo token, because their `pull_request` token cannot write
+    # statuses.
+    if: >-
+      (github.event_name != 'pull_request_target' &&
+       github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.head.repo.full_name != github.repository)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post status for the PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [ "$IS_FORK" = "true" ]; then
+            # The automatic Copilot review is triggered from the
+            # maintainer's account settings and never fires for external
+            # authors; requiring it of fork PRs would deadlock them.
+            state="success"
+            description="gate waived (external PR)"
+          else
+            copilot_reviews=$(
+              gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
+                --jq '.[] | select(.user.login == "copilot-pull-request-reviewer[bot]" and .state != "PENDING") | .id'
+            )
+            if [ -n "$copilot_reviews" ]; then
+              state="success"
+              description="Copilot review submitted"
+            else
+              state="pending"
+              description="waiting for Copilot review"
+            fi
+          fi
+
+          gh api "repos/${GH_REPO}/statuses/${HEAD_SHA}" \
+            -f state="$state" \
+            -f context="copilot-reviewed" \
+            -f description="$description" \
+            -f target_url="$RUN_URL" \
+            >/dev/null
+
+          echo "posted copilot-reviewed=${state} (${description}) on ${HEAD_SHA}"
