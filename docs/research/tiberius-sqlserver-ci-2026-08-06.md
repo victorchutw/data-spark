@@ -21,14 +21,17 @@ experiment can settle are collected at the end as prototype candidates.
   runtime dependencies to install — not a fully static musl binary. A SQL
   Server connector keeps the promise as long as it adds no *system* library
   requirement (see TLS below).
-- CI/runner budget observed on this repo (private): after the disk-free step,
+- CI/runner budget observed on this repo while it was still private (it went
+  public on 2026-08-06, the day this note landed): after the disk-free step,
   run 30605688262 reports `/dev/root 72G, 37G used, 36G avail` — ~36 GiB free
-  for everything the job does.
+  for everything the job does. Public-repo runners (§6) double the advertised
+  CPU/RAM but advertise the same 14 GB SSD, so treat the disk budget as
+  unverified until the spike re-baselines it.
 
 ## 1. Bulk insert
 
 **API.** `Client::bulk_insert(table)` opens a TDS bulk load: "Execute a `BULK
-INSERT` statement, efficiantly storing a large number of rows to a specified
+INSERT` statement, efficiantly [sic] storing a large number of rows to a specified
 table. Note: make sure the input row follows the same schema as the table,
 otherwise calling `send()` will return an error"
 ([`Client::bulk_insert`](https://docs.rs/tiberius/latest/tiberius/struct.Client.html#method.bulk_insert)).
@@ -75,8 +78,9 @@ so a 10-column table yields at most ⌊2,100 / 10⌋ = **210 rows per statement*
 workarounds are multiple INSERTs, a derived-table `SELECT … FROM (VALUES …)`
 (no row cap, still parameter-capped), or bulk import
 ([Table Value Constructor](https://learn.microsoft.com/en-us/sql/t-sql/queries/table-value-constructor-transact-sql)).
-At data-spark's current 10k-row chunk size that is ~50 statements per chunk —
-workable as a fallback, but bulk load is the primary path.
+At data-spark's default 65,536-row chunk size (`execution.chunk_rows`,
+ADR-0046) that is ~312 statements per chunk — workable as a fallback, but bulk
+load is the primary path.
 
 ## 2. Async containment
 
@@ -215,11 +219,15 @@ table-level DDL carries no such restriction:
 
 ## 6. CI: a real SQL Server on GitHub Actions
 
-- **Runner (this repo is private):** standard `ubuntu-latest` for private
-  repositories is 2 vCPU / 8 GB RAM / 14 GB SSD advertised
-  ([GitHub-hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners#standard-github-hosted-runners-for-private-repositories));
-  observed actual root filesystem on this repo's runs is 72 GiB with **36 GiB
-  free** after the existing disk-free step (run 30605688262).
+- **Runner:** the repo went public on 2026-08-06, so jobs now run on the
+  public-repo standard `ubuntu-latest` — 4 vCPU / 16 GB RAM / 14 GB SSD
+  advertised ("Standard GitHub-hosted runners for public repositories",
+  [GitHub-hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners))
+  — and standard-runner minutes are free. CPU and RAM double the private-era
+  spec (2 vCPU / 8 GB); the advertised SSD stays 14 GB, so the disk budget
+  does not automatically improve. The private-era observation — root
+  filesystem 72 GiB with **36 GiB free** after the existing disk-free step
+  (run 30605688262) — stands until the spike re-measures on a public runner.
 - **Image:** `mcr.microsoft.com/mssql/server:2022-latest` is ~1.6 GB
   compressed (2017: ~1.33 GB) per Microsoft's container repo discussion
   ([microsoft/mssql-docker #809](https://github.com/microsoft/mssql-docker/issues/809)
@@ -228,7 +236,7 @@ table-level DDL carries no such restriction:
 - **Container requirements:** "At least 2 GB of disk space. At least 2 GB of
   RAM."
   ([Docker quickstart](https://learn.microsoft.com/en-us/sql/linux/install-upgrade/quickstart-install-docker))
-  — comfortable inside 8 GB alongside cargo.
+  — comfortable beside cargo on a 16 GB public runner.
 - **Licensing:** `ACCEPT_EULA` is a "Required setting for the SQL Server
   image"; `MSSQL_PID` defaults the container to **Developer edition**, "the
   freely licensed Developer Edition of SQL Server for non-production use"
@@ -265,7 +273,7 @@ table-level DDL carries no such restriction:
 | 3. Static linking | **Viable with `rustls`** — pure-Rust TLS keeps the single-file promise; default `native-tls` would add a system OpenSSL dependency. Released rustls stack is old (RUSTSEC flags, #417). |
 | 4. Transactions/DDL | **Viable** — raw T-SQL transactions over one connection; staging + `sp_rename` swap and `MERGE WITH (HOLDLOCK)` are all legal in explicit transactions; `ALTER SCHEMA TRANSFER` drops permissions on transfer (prefer same-schema rename swap). |
 | 5. Server compatibility | **Viable** — 2017/2019/2022 CI-tested, SQL auth ungated; no TDS 8.0 strict mode; crate release staleness is the real risk (crates.io vs pinned git rev decision). |
-| 6. CI | **Viable** — ~1.6 GB image vs 36 GiB observed free disk; 2 GB RAM vs 8 GB runner; Developer edition + `ACCEPT_EULA` is license-clean for CI; health-gating via service-container options or an explicit sqlcmd wait loop. |
+| 6. CI | **Viable** — ~1.6 GB image vs 36 GiB observed free disk; 2 GB RAM vs a 16 GB public runner (repo public since 2026-08-06, standard-runner minutes free); Developer edition + `ACCEPT_EULA` is license-clean for CI; health-gating via service-container options or an explicit sqlcmd wait loop. |
 
 ## Facts that need a prototype to pin down
 
@@ -279,8 +287,8 @@ table-level DDL carries no such restriction:
    panic containment).
 4. Error surface probing for retry classification: which failures return `Err`
    vs panic (#424), and what a mid-bulk-load connection drop looks like.
-5. Image pull + extract + startup-to-ready seconds on the actual private-repo
-   runner (secondary sources say ~1.6 GB compressed; no primary source states
-   startup time).
+5. Image pull + extract + startup-to-ready seconds on the actual runner
+   (public `ubuntu-latest` since 2026-08-06; secondary sources say ~1.6 GB
+   compressed; no primary source states startup time).
 6. Whether crates.io 0.12.3 suffices or the cycle should pin a git revision
    for post-2024 fixes.
