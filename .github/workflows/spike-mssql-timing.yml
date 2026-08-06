@@ -1,0 +1,54 @@
+# Throwaway workflow for spike #115 — lives only on the spike branch, never
+# merged. Times mssql image pull + startup-to-ready on the public ubuntu-latest
+# runner, and re-baselines free disk (the research note flags both as
+# unverified on public runners). Informs ticket #111 (CI wiring).
+name: spike-mssql-timing
+
+on:
+  push:
+    branches:
+      - spike/115-tiberius-sqlserver
+
+permissions: {}
+
+jobs:
+  timing:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Disk baseline (no cleanup)
+        run: df -h /
+
+      - name: Free runner disk space (mirror of ci.yml step)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Pull image (timed)
+        run: |
+          S=$(date +%s)
+          docker pull mcr.microsoft.com/mssql/server:2022-latest
+          E=$(date +%s)
+          echo "PULL_SECONDS=$((E-S))"
+          docker images mcr.microsoft.com/mssql/server:2022-latest
+
+      - name: Start container and wait for ready (timed)
+        run: |
+          S=$(date +%s)
+          docker run -d --name spike-mssql -e ACCEPT_EULA=Y \
+            -e MSSQL_SA_PASSWORD='Sp1ke!Passw0rd' -p 1433:1433 \
+            mcr.microsoft.com/mssql/server:2022-latest
+          n=0
+          until docker exec spike-mssql /opt/mssql-tools18/bin/sqlcmd -C \
+            -S localhost -U sa -P 'Sp1ke!Passw0rd' -Q "SELECT 1" >/dev/null 2>&1; do
+            sleep 1
+            n=$((n+1))
+            if [ "$n" -gt 300 ]; then echo "TIMEOUT waiting for readiness"; exit 1; fi
+          done
+          E=$(date +%s)
+          echo "STARTUP_TO_READY_SECONDS=$((E-S))"
+          docker exec spike-mssql /opt/mssql-tools18/bin/sqlcmd -C -S localhost \
+            -U sa -P 'Sp1ke!Passw0rd' -Q "SELECT @@VERSION" -h -1 | head -2
+
+      - name: Disk after image + container
+        run: df -h /

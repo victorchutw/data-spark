@@ -15,6 +15,7 @@ mod dispatch;
 mod rejection;
 mod retry;
 mod schema;
+pub mod spike_mssql;
 
 use connector::{
     destination_connector, resolved_source_format, source_connector, DestinationWriteFacts,
