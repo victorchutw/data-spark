@@ -58,6 +58,9 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # The reviewer's login in the reviews API; rendered as "Copilot"
+          # in the UI. Verified against PR #104's reviews.
+          COPILOT_REVIEWER: "copilot-pull-request-reviewer[bot]"
         run: |
           set -euo pipefail
 
@@ -70,7 +73,8 @@ jobs:
           else
             copilot_reviews=$(
               gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
-                --jq '.[] | select(.user.login == "copilot-pull-request-reviewer[bot]" and .state != "PENDING") | .id'
+                | jq -r --arg login "$COPILOT_REVIEWER" \
+                    '.[] | select(.user.login == $login and .state != "PENDING") | .id'
             )
             if [ -n "$copilot_reviews" ]; then
               state="success"
