@@ -116,7 +116,12 @@ than customary:
   after its first post-review push. Fork PRs receive the status as `success`
   with a waiver description instead, because the automatic Copilot review
   fires from the maintainer's account settings and never for external
-  authors.
+  authors. The status normally flips inside the gate run that fires when the
+  PR becomes ready for review: that run waits for the review, because the
+  run a Copilot review submission itself triggers comes from a
+  non-collaborator bot actor and can sit behind manual workflow approval.
+  If the wait window is missed, any push, any maintainer reply that submits
+  a review, or a re-run of the gate re-posts the status.
 
 ## External PR triage
 
@@ -235,8 +240,9 @@ over an hour, but still correct.
 ## Repository settings
 
 `main` is protected by a single branch ruleset named `main merge gate`, not
-by classic branch protection; never run both systems against `main` at once.
-The ruleset requires:
+by classic branch protection. Run exactly one protection system in steady
+state; when swapping systems, briefly overlap them rather than leaving a gap
+with neither active. The ruleset requires:
 
 - A pull request before merging, with zero required approving reviews — a
   solo maintainer cannot approve their own PRs, so any nonzero count would

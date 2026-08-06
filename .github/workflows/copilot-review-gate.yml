@@ -9,6 +9,13 @@ name: copilot-review-gate
 # per-SHA freshness would deadlock every PR after its first post-review
 # push (observed on PR #119).
 #
+# A Copilot review submission fires pull_request_review from a
+# non-collaborator bot actor, and such runs can sit behind manual
+# workflow approval (observed on PR #120), so the run handling a
+# non-draft PR waits for the review itself instead of counting on that
+# event. A late review still flips the status through any push, a
+# maintainer reply that submits a review, or a re-run of this workflow.
+#
 # SECURITY: `pull_request_target` runs with the base-repo write token so
 # fork PRs can receive the status. This workflow must therefore never
 # check out or execute PR code — it is status-only. Keep it that way.
@@ -49,6 +56,7 @@ jobs:
       (github.event_name == 'pull_request_target' &&
        github.event.pull_request.head.repo.full_name != github.repository)
     runs-on: ubuntu-latest
+    timeout-minutes: 12
     steps:
       - name: Post status for the PR head
         env:
@@ -57,6 +65,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+          PR_DRAFT: ${{ github.event.pull_request.draft }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           # The reviewer's login in the reviews API; rendered as "Copilot"
           # in the UI. Verified against PR #104's reviews.
@@ -64,32 +73,48 @@ jobs:
         run: |
           set -euo pipefail
 
+          post_status() {
+            gh api "repos/${GH_REPO}/statuses/${HEAD_SHA}" \
+              -f state="$1" \
+              -f context="copilot-reviewed" \
+              -f description="$2" \
+              -f target_url="$RUN_URL" \
+              >/dev/null
+            echo "posted copilot-reviewed=$1 ($2) on ${HEAD_SHA}"
+          }
+
+          find_copilot_review() {
+            gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
+              | jq -r --arg login "$COPILOT_REVIEWER" \
+                  '.[] | select(.user.login == $login and .state != "PENDING") | .id' \
+              | head -n 1
+          }
+
           if [ "$IS_FORK" = "true" ]; then
             # The automatic Copilot review is triggered from the
             # maintainer's account settings and never fires for external
             # authors; requiring it of fork PRs would deadlock them.
-            state="success"
-            description="gate waived (external PR)"
-          else
-            copilot_reviews=$(
-              gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
-                | jq -r --arg login "$COPILOT_REVIEWER" \
-                    '.[] | select(.user.login == $login and .state != "PENDING") | .id'
-            )
-            if [ -n "$copilot_reviews" ]; then
-              state="success"
-              description="Copilot review submitted"
-            else
-              state="pending"
-              description="waiting for Copilot review"
-            fi
+            post_status success "gate waived (external PR)"
+            exit 0
           fi
 
-          gh api "repos/${GH_REPO}/statuses/${HEAD_SHA}" \
-            -f state="$state" \
-            -f context="copilot-reviewed" \
-            -f description="$description" \
-            -f target_url="$RUN_URL" \
-            >/dev/null
+          if [ -n "$(find_copilot_review || true)" ]; then
+            post_status success "Copilot review submitted"
+            exit 0
+          fi
 
-          echo "posted copilot-reviewed=${state} (${description}) on ${HEAD_SHA}"
+          post_status pending "waiting for Copilot review"
+
+          # A review lands 2-3 minutes after the PR becomes ready, and the
+          # pull_request_review run its submission triggers may need manual
+          # approval, so wait for it here. Drafts are never reviewed, so
+          # their status stays pending until the ready-for-review run.
+          if [ "$PR_DRAFT" = "false" ]; then
+            for _ in $(seq 1 24); do
+              sleep 20
+              if [ -n "$(find_copilot_review || true)" ]; then
+                post_status success "Copilot review submitted"
+                break
+              fi
+            done
+          fi
