@@ -24,8 +24,9 @@ experiment can settle are collected at the end as prototype candidates.
 - CI/runner budget observed on this repo while it was still private (it went
   public on 2026-08-06, the day this note landed): after the disk-free step,
   run 30605688262 reports `/dev/root 72G, 37G used, 36G avail` — ~36 GiB free
-  for everything the job does. Public-repo runners (§6) can only be roomier;
-  the spike should re-baseline.
+  for everything the job does. Public-repo runners (§6) double the advertised
+  CPU/RAM but advertise the same 14 GB SSD, so treat the disk budget as
+  unverified until the spike re-baselines it.
 
 ## 1. Bulk insert
 
@@ -222,10 +223,11 @@ table-level DDL carries no such restriction:
   public-repo standard `ubuntu-latest` — 4 vCPU / 16 GB RAM / 14 GB SSD
   advertised ("Standard GitHub-hosted runners for public repositories",
   [GitHub-hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners))
-  — and standard-runner minutes are free. The disk measurement below is from
-  the private era (2 vCPU / 8 GB) and can only improve: observed root
-  filesystem was 72 GiB with **36 GiB free** after the existing disk-free step
-  (run 30605688262); the spike should re-measure on a public runner.
+  — and standard-runner minutes are free. CPU and RAM double the private-era
+  spec (2 vCPU / 8 GB); the advertised SSD stays 14 GB, so the disk budget
+  does not automatically improve. The private-era observation — root
+  filesystem 72 GiB with **36 GiB free** after the existing disk-free step
+  (run 30605688262) — stands until the spike re-measures on a public runner.
 - **Image:** `mcr.microsoft.com/mssql/server:2022-latest` is ~1.6 GB
   compressed (2017: ~1.33 GB) per Microsoft's container repo discussion
   ([microsoft/mssql-docker #809](https://github.com/microsoft/mssql-docker/issues/809)
