@@ -232,7 +232,7 @@ over an hour, but still correct.
 ## GitHub automation
 
 - `.github/workflows/issue-default-label.yml` adds `needs-triage` to new issues when no state label is present. External PR labels are applied by triage, not by this workflow.
-- `.github/workflows/issue-status-sync.yml` moves referenced issues to `in-progress` for draft PRs and `in-review` for ready PRs.
+- `.github/workflows/issue-status-sync.yml` moves referenced issues to `in-progress` for draft PRs and `in-review` for ready PRs. Fork PRs skip the job: their read-only token cannot edit labels, and external PRs should not drive this repo's issue state.
 - `.github/workflows/ci.yml` gates pushes and PRs with Rust formatting, linting, tests, and release build checks.
 - `.github/workflows/copilot-review-gate.yml` posts the `copilot-reviewed` commit status on PR head SHAs: `pending` until a Copilot review is submitted on the PR, `success` after, and `success` with a waiver description for fork PRs. It is status-only and must never check out PR code, because its `pull_request_target` trigger carries the base-repo write token.
 - `.github/workflows/release.yml` creates the single-binary GitHub Release from `v`-prefixed SemVer tags. Its cache step is restore-only (`save-if: "false"`), consuming the Rust build caches that `ci.yml` saves on `main`; a missing cache degrades to a cold but correct build.
