@@ -17,6 +17,10 @@ permissions:
 jobs:
   sync:
     name: sync referenced issue state
+    # Fork PRs skip this job: their GITHUB_TOKEN is read-only, so the
+    # label edits would fail — and an external PR should not be driving
+    # this repo's issue state labels in the first place.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     steps:
       - name: Move referenced issues
