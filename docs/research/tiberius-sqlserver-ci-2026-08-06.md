@@ -192,7 +192,7 @@ table-level DDL carries no such restriction:
   statement before deploying to production"
   ([MERGE, "Concurrency considerations"](https://learn.microsoft.com/en-us/sql/t-sql/statements/merge-transact-sql)).
   `MERGE <target> WITH (HOLDLOCK)` inside the terminal transaction matches the
-  staged terminal upsert of ADR-0057.
+  staged terminal upsert of ADR-0059.
 
 ## 5. Server compatibility and crate health
 
