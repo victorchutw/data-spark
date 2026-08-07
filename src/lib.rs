@@ -343,11 +343,78 @@ struct SourceDefinition {
     format: Option<String>,
 }
 
+/// The `destination` block of a load definition. Its key set is
+/// connector-dependent (ADR-0060): file destinations address a local `path`,
+/// while `sqlserver` addresses a server through inline discrete fields, so
+/// deserialization dispatches on `connector` and each shape stays strict on
+/// exactly its own keys (ADR-0037) — `path` under `sqlserver`, or a server
+/// key under `parquet`, fails as an unknown key. Serialization is untagged
+/// because `connector` already lives inside each shape, keeping the
+/// `destination_summary` echo of the block as written.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum DestinationDefinition {
+    File(FileDestinationDefinition),
+    SqlServer(SqlServerDestinationDefinition),
+}
+
+impl<'de> Deserialize<'de> for DestinationDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // Buffer the block once, pick the shape by its `connector`, and
+        // deserialize the strict shape from the buffer. Every connector this
+        // build does not know keeps the file shape, so an unknown name still
+        // fails in the Definition phase as `unsupported_destination_connector`
+        // with the definition context echoed, exactly as it did before
+        // `sqlserver` split the key set.
+        let block = serde_yaml::Value::deserialize(deserializer)?;
+        if block.get("connector").and_then(serde_yaml::Value::as_str) == Some("sqlserver") {
+            serde_yaml::from_value(block)
+                .map(DestinationDefinition::SqlServer)
+                .map_err(serde::de::Error::custom)
+        } else {
+            serde_yaml::from_value(block)
+                .map(DestinationDefinition::File)
+                .map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+/// A destination addressed by a local `path`: `parquet` and `duckdb` today,
+/// and the shape every unknown connector name is parsed against.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct DestinationDefinition {
+struct FileDestinationDefinition {
     connector: String,
     path: PathBuf,
+}
+
+/// The `sqlserver` destination block (ADR-0060): inline discrete fields with
+/// an environment credential reference, never a connection string. The keys
+/// the contract requires (`host`, `database`, `user`, `password_env`) parse
+/// as optional so an absent or empty one fails in the Definition phase as
+/// `invalid_destination_config` with the definition context echoed, not as a
+/// YAML parse failure; `encryption` likewise parses as free text and is
+/// validated there. `port` rides the `execution.chunk_rows` precedent: zero,
+/// negative, out-of-range, and non-integer values fail YAML parsing
+/// (`NonZeroU16`). The block carries no secret by shape (ADR-0061) —
+/// `password_env` names an environment variable — so the
+/// `destination_summary` echo stays safe by construction.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SqlServerDestinationDefinition {
+    connector: String,
+    host: Option<String>,
+    port: Option<std::num::NonZeroU16>,
+    database: Option<String>,
+    schema: Option<String>,
+    user: Option<String>,
+    password_env: Option<String>,
+    encryption: Option<String>,
+    trust_server_certificate: Option<bool>,
+    accept_datetime_rounding: Option<bool>,
 }
 
 /// The execution facts of a load that succeeded. Failures travel as
@@ -793,7 +860,9 @@ fn execute_supported_load(
     // I/O so an unsupported definition fails without reading the source or
     // touching the destination (ADR-0019), preserving the error precedence:
     // load mode -> merge cross-validation -> source connector -> destination
-    // connector (existence, then mode support) -> schema directive (config,
+    // connector (existence and offline per-connector validation — for
+    // sqlserver the block, the dataset name, and the credential reference,
+    // ADR-0060 — then mode support) -> schema directive (config,
     // then pinned schema file) -> execution config -> read -> write. The
     // source format is validated inside read() so its precedence stays after
     // the destination-connector check for a doubly-invalid definition.
@@ -1434,10 +1503,10 @@ mod tests {
                 path: source_path,
                 format: Some("csv".to_string()),
             }),
-            destination: Some(DestinationDefinition {
+            destination: Some(DestinationDefinition::File(FileDestinationDefinition {
                 connector: "parquet".to_string(),
                 path: work.path().join("customers_dataset"),
-            }),
+            })),
             dataset: Some("customers".to_string()),
             load_mode: None,
             merge: None,
@@ -1668,10 +1737,10 @@ mod tests {
 
     fn parquet_destination(work: &tempfile::TempDir) -> Box<dyn connector::Destination> {
         destination_connector(
-            &DestinationDefinition {
+            &DestinationDefinition::File(FileDestinationDefinition {
                 connector: "parquet".to_string(),
                 path: work.path().join("customers_dataset"),
-            },
+            }),
             None,
             &[],
         )
@@ -1680,10 +1749,10 @@ mod tests {
 
     fn duckdb_destination(work: &tempfile::TempDir) -> Box<dyn connector::Destination> {
         destination_connector(
-            &DestinationDefinition {
+            &DestinationDefinition::File(FileDestinationDefinition {
                 connector: "duckdb".to_string(),
                 path: work.path().join("customers.duckdb"),
-            },
+            }),
             Some("customers"),
             &[],
         )
