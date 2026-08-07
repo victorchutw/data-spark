@@ -20,6 +20,10 @@ parquet = "58.3.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_yaml = "0.9"
+# SQL Server TDS client for the sqlserver connector. Crates.io release with
+# the spike-proven feature set; its stale rustls 0.21 stack is accepted with
+# a weekly cargo-audit sensor carrying the ignore list (ADR-0069).
+tiberius = { version = "0.12.3", default-features = false, features = ["tds73", "rustls", "chrono"] }
 uuid = { version = "1.10", features = ["v4"] }
 
 [dev-dependencies]
