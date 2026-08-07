@@ -16,12 +16,17 @@
 //! write facts ([`DestinationWrite`]) so the orchestrator never branches on
 //! connector identity. The load mode is parsed once into [`LoadMode`] at the
 //! session boundary. `local_file`, `parquet`, and `duckdb` are the first
-//! connectors; everything else here is private.
+//! connectors, and `sqlserver` enters as Definition-phase surface — offline
+//! block validation with every load mode still declined (ADR-0060);
+//! everything else here is private.
 
 use crate::rejection::{RejectedRecord, RejectionSink};
 use crate::rejection::{MALFORMED_CSV_RECORD, MALFORMED_JSONL_RECORD};
 use crate::schema::{self, SchemaDirective};
-use crate::{DestinationDefinition, ExecutionFailure, LoadFailure, SourceDefinition};
+use crate::{
+    DestinationDefinition, ExecutionFailure, LoadFailure, SourceDefinition,
+    SqlServerDestinationDefinition,
+};
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use duckdb::vtab::arrow::{arrow_recordbatch_to_query_params, ArrowVTab};
@@ -314,23 +319,29 @@ pub(crate) trait Destination {
     /// declaration (ADR-0057).
     fn validate_mode(&self, mode: LoadMode) -> Result<(), LoadFailure> {
         if self.supported_load_modes().contains(&mode) {
-            Ok(())
-        } else {
-            let supported = self
-                .supported_load_modes()
-                .iter()
-                .map(|supported| supported.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(LoadFailure {
-                code: "unsupported_load_mode_for_destination",
-                message: format!(
-                    "{} destination does not support load mode: {} (supported load modes: {supported})",
-                    self.connector_name(),
-                    mode.as_str()
-                ),
-            })
+            return Ok(());
         }
+        let supported = self
+            .supported_load_modes()
+            .iter()
+            .map(|supported| supported.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        // A destination whose whole mode list is still empty deserves a
+        // readable spelling, not an empty parenthetical.
+        let supported_clause = if supported.is_empty() {
+            "no load modes are supported for this destination yet".to_string()
+        } else {
+            format!("supported load modes: {supported}")
+        };
+        Err(LoadFailure {
+            code: "unsupported_load_mode_for_destination",
+            message: format!(
+                "{} destination does not support load mode: {} ({supported_clause})",
+                self.connector_name(),
+                mode.as_str()
+            ),
+        })
     }
 
     /// Opens the write session for one load in the given mode. The session
@@ -393,46 +404,64 @@ pub(crate) fn source_connector(
     }
 }
 
-/// Resolves a destination definition to its connector. Pure: validates the
-/// connector name plus the addressing the connector needs — for `duckdb`, a
-/// present `dataset` naming the destination table (ADR-0030) — doing no I/O,
-/// so an unsupported or incomplete definition fails before any destination
-/// write (ADR-0019). `merge_keys` are the definition's already-validated
-/// merge keys — empty for every non-merge load — which a merge session
-/// upserts on (ADR-0059); destinations that decline merge ignore them.
+/// Resolves a destination definition to its connector. Validates the
+/// connector name plus everything the connector can check offline — for
+/// `duckdb`, a present `dataset` naming the destination table (ADR-0030);
+/// for `sqlserver`, the whole block, the dot-free `dataset`, and the
+/// credential reference resolving in the process environment (ADR-0060) —
+/// doing no source or destination I/O, so an unsupported or incomplete
+/// definition fails before any destination write (ADR-0019). `merge_keys`
+/// are the definition's already-validated merge keys — empty for every
+/// non-merge load — which a merge session upserts on (ADR-0059);
+/// destinations that decline merge ignore them.
 pub(crate) fn destination_connector(
     definition: &DestinationDefinition,
     dataset: Option<&str>,
     merge_keys: &[String],
 ) -> Result<Box<dyn Destination>, LoadFailure> {
-    match definition.connector.as_str() {
-        "parquet" => Ok(Box::new(ParquetDestination {
-            path: definition.path.clone(),
-        })),
-        "duckdb" => {
-            // An empty dataset is no address at all, so it fails here as
-            // missing rather than at write time; identifier content beyond
-            // presence is deliberately left to DuckDB (no allowlist, ADR-0030).
-            let dataset = dataset
-                .filter(|dataset| !dataset.is_empty())
-                .ok_or_else(|| LoadFailure {
-                    code: "missing_dataset",
-                    message: "load definition dataset is required for a duckdb destination"
-                        .to_string(),
-                })?;
-            Ok(Box::new(DuckDbDestination {
-                table: DuckDbTable {
-                    path: definition.path.clone(),
-                    dataset: dataset.to_string(),
-                },
-                merge_keys: merge_keys.to_vec(),
-            }))
+    match definition {
+        DestinationDefinition::File(definition) => match definition.connector.as_str() {
+            "parquet" => Ok(Box::new(ParquetDestination {
+                path: definition.path.clone(),
+            })),
+            "duckdb" => {
+                // Identifier content beyond presence is deliberately left to
+                // DuckDB (no allowlist, ADR-0030).
+                let dataset = require_dataset(dataset, "duckdb")?;
+                Ok(Box::new(DuckDbDestination {
+                    table: DuckDbTable {
+                        path: definition.path.clone(),
+                        dataset: dataset.to_string(),
+                    },
+                    merge_keys: merge_keys.to_vec(),
+                }))
+            }
+            other => Err(LoadFailure {
+                code: "unsupported_destination_connector",
+                message: format!("unsupported destination connector: {other}"),
+            }),
+        },
+        DestinationDefinition::SqlServer(definition) => {
+            let config = SqlServerConfig::from_definition(definition, dataset)?;
+            resolve_credential_reference(&config.password_env)?;
+            Ok(Box::new(SqlServerDestination { config }))
         }
-        other => Err(LoadFailure {
-            code: "unsupported_destination_connector",
-            message: format!("unsupported destination connector: {other}"),
-        }),
     }
+}
+
+/// The shared dataset-presence rule of the table-addressed destinations
+/// (ADR-0030, ADR-0060): an empty dataset is no address at all, so it fails
+/// here as missing rather than at write time.
+fn require_dataset<'definition>(
+    dataset: Option<&'definition str>,
+    connector: &'static str,
+) -> Result<&'definition str, LoadFailure> {
+    dataset
+        .filter(|dataset| !dataset.is_empty())
+        .ok_or_else(|| LoadFailure {
+            code: "missing_dataset",
+            message: format!("load definition dataset is required for a {connector} destination"),
+        })
 }
 
 /// Reads local CSV and JSONL files. The `format` is resolved from the definition
@@ -1909,6 +1938,189 @@ fn duckdb_schema_mismatch(table: &DuckDbTable, operation: &'static str) -> LoadF
     }
 }
 
+/// The resolved `sqlserver` destination address (ADR-0060): every key of the
+/// block validated and defaulted, plus the dataset naming the destination
+/// table (`accept_datetime_rounding` resolves here too, though its semantics
+/// are ADR-0065's and land with the write slices). Resolution is offline —
+/// the Definition phase never opens a connection — so connectivity,
+/// authentication, and TLS failures stay write-phase facts for the slices
+/// that write.
+// The write slices (ADR-0064) consume the resolved address; until the first
+// sqlserver session exists, only `password_env` is read outside tests, and
+// the remaining fields would trip dead_code in non-test builds. Drop the
+// attribute with the first sqlserver write session.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct SqlServerConfig {
+    host: String,
+    port: u16,
+    database: String,
+    schema: String,
+    user: String,
+    password_env: String,
+    encryption: SqlServerEncryption,
+    trust_server_certificate: bool,
+    accept_datetime_rounding: bool,
+    dataset: String,
+}
+
+/// The two encryption postures of ADR-0060: `required` — the secure default —
+/// and `optional`, reproducing the proven SSMS `Encrypt=Optional` posture for
+/// servers that decline required encryption. No fully-unencrypted state
+/// exists: it would send login credentials effectively in the clear.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SqlServerEncryption {
+    Required,
+    Optional,
+}
+
+impl SqlServerConfig {
+    /// Validates and resolves the `sqlserver` destination block plus the
+    /// load's `dataset` (ADR-0060), entirely offline. Each required key must
+    /// be present and non-empty, `encryption` must be `required` (the
+    /// default) or `optional`, and `schema` — when written — must be one
+    /// non-empty dot-free identifier (`invalid_destination_config`); absent
+    /// optional keys take their defaults — port 1433, schema `dbo`,
+    /// encryption required, both boolean knobs false. The dataset must be
+    /// present and non-empty (`missing_dataset`) and dot-free: qualification
+    /// is physical addressing and lives in `schema`, so a dotted name fails
+    /// `invalid_dataset_name` pointing there.
+    fn from_definition(
+        definition: &SqlServerDestinationDefinition,
+        dataset: Option<&str>,
+    ) -> Result<SqlServerConfig, LoadFailure> {
+        debug_assert_eq!(
+            definition.connector, "sqlserver",
+            "deserialization dispatches the sqlserver shape on its connector name"
+        );
+        let invalid_destination_config = |message: String| LoadFailure {
+            code: "invalid_destination_config",
+            message,
+        };
+        let required = |key: &'static str, value: &Option<String>| {
+            value
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    invalid_destination_config(format!(
+                        "destination.{key} is required for a sqlserver destination \
+                         and must not be empty"
+                    ))
+                })
+        };
+        let host = required("host", &definition.host)?;
+        let database = required("database", &definition.database)?;
+        let user = required("user", &definition.user)?;
+        let password_env = required("password_env", &definition.password_env)?;
+        let encryption = match definition.encryption.as_deref() {
+            None | Some("required") => SqlServerEncryption::Required,
+            Some("optional") => SqlServerEncryption::Optional,
+            Some(other) => {
+                return Err(invalid_destination_config(format!(
+                    "destination.encryption must be \"required\" or \"optional\", got: {other}"
+                )))
+            }
+        };
+        let schema = match definition.schema.as_deref() {
+            None => "dbo".to_string(),
+            Some("") => {
+                return Err(invalid_destination_config(
+                    "destination.schema must not be empty for a sqlserver destination".to_string(),
+                ))
+            }
+            Some(schema) if schema.contains('.') => {
+                return Err(invalid_destination_config(format!(
+                    "destination.schema must be a single identifier without a dot, \
+                     got: {schema}"
+                )))
+            }
+            Some(schema) => schema.to_string(),
+        };
+        let dataset = require_dataset(dataset, "sqlserver")?;
+        if dataset.contains('.') {
+            return Err(LoadFailure {
+                code: "invalid_dataset_name",
+                message: format!(
+                    "load definition dataset {dataset:?} must not contain a dot for a \
+                     sqlserver destination: schema qualification lives in destination.schema"
+                ),
+            });
+        }
+        Ok(SqlServerConfig {
+            host,
+            port: definition
+                .port
+                .map(std::num::NonZeroU16::get)
+                .unwrap_or(1433),
+            database,
+            schema,
+            user,
+            password_env,
+            encryption,
+            trust_server_certificate: definition.trust_server_certificate.unwrap_or(false),
+            accept_datetime_rounding: definition.accept_datetime_rounding.unwrap_or(false),
+            dataset: dataset.to_string(),
+        })
+    }
+}
+
+/// Resolves the credential reference in the Definition phase (ADR-0060): the
+/// environment variable `password_env` names must be set and non-empty at
+/// load time. Only resolvability is checked — the value stays in the
+/// environment, never in any struct — and it can never reach a report,
+/// because no contract key can carry it (ADR-0061).
+fn resolve_credential_reference(password_env: &str) -> Result<(), LoadFailure> {
+    match std::env::var_os(password_env) {
+        None => Err(LoadFailure {
+            code: "unresolved_credential_reference",
+            message: format!(
+                "environment variable {password_env} named by destination.password_env \
+                 is not set"
+            ),
+        }),
+        Some(value) if value.is_empty() => Err(LoadFailure {
+            code: "unresolved_credential_reference",
+            message: format!(
+                "environment variable {password_env} named by destination.password_env \
+                 is empty"
+            ),
+        }),
+        Some(_) => Ok(()),
+    }
+}
+
+/// The SQL Server destination (ADR-0060): in this slice, pure
+/// Definition-phase surface — the block is validated offline and echoed, and
+/// no load mode is supported yet. The write strategies land mode by mode
+/// (ADR-0064), widening [`Destination::supported_load_modes`] as they do, so
+/// until then every load declines through [`Destination::validate_mode`]
+/// before any connection could exist.
+struct SqlServerDestination {
+    // Held for the write slices (ADR-0064); no shipped path reads it yet.
+    #[allow(dead_code)]
+    config: SqlServerConfig,
+}
+
+const NO_LOAD_MODES: &[LoadMode] = &[];
+
+impl Destination for SqlServerDestination {
+    fn connector_name(&self) -> &'static str {
+        "sqlserver"
+    }
+
+    fn supported_load_modes(&self) -> &'static [LoadMode] {
+        NO_LOAD_MODES
+    }
+
+    fn begin(&self, mode: LoadMode) -> Result<Box<dyn DestinationWriter>, DestinationWriteFailure> {
+        // Every mode is declined until the first write slice widens the
+        // list: the orchestrator's validate_mode call fails the load before
+        // begin, and a directly-driven session reports the same declination.
+        self.validate_mode(mode)?;
+        unreachable!("sqlserver validate_mode declines every load mode");
+    }
+}
+
 /// Opens a source file and measures its bytes, the shared head of both
 /// passes.
 fn open_source_file(source_path: &Path, format_label: &str) -> Result<(File, u64), LoadFailure> {
@@ -2652,6 +2864,198 @@ mod tests {
         .err()
         .expect("duckdb destination with an empty dataset rejected");
         assert_eq!(error.code, "missing_dataset");
+    }
+
+    // ---- SQL Server Definition-phase validation (ADR-0060, ADR-0061) ----
+
+    #[test]
+    fn sql_server_config_defaults_absent_optional_keys() {
+        let config = SqlServerConfig::from_definition(&sqlserver_definition(), Some("customers"))
+            .expect("minimal sqlserver block resolves");
+
+        assert_eq!(config.host, "db.example.internal");
+        assert_eq!(config.port, 1433);
+        assert_eq!(config.database, "analytics");
+        assert_eq!(config.schema, "dbo");
+        assert_eq!(config.user, "loader");
+        assert_eq!(config.password_env, "MSSQL_PASSWORD");
+        assert_eq!(config.encryption, SqlServerEncryption::Required);
+        assert!(!config.trust_server_certificate);
+        assert!(!config.accept_datetime_rounding);
+        assert_eq!(config.dataset, "customers");
+    }
+
+    #[test]
+    fn sql_server_config_keeps_explicit_values() {
+        let mut definition = sqlserver_definition();
+        definition.port = Some(std::num::NonZeroU16::new(14330).expect("nonzero port"));
+        definition.schema = Some("sales".to_string());
+        definition.encryption = Some("optional".to_string());
+        definition.trust_server_certificate = Some(true);
+        definition.accept_datetime_rounding = Some(true);
+
+        let config = SqlServerConfig::from_definition(&definition, Some("customers"))
+            .expect("explicit sqlserver block resolves");
+
+        assert_eq!(config.port, 14330);
+        assert_eq!(config.schema, "sales");
+        assert_eq!(config.encryption, SqlServerEncryption::Optional);
+        assert!(config.trust_server_certificate);
+        assert!(config.accept_datetime_rounding);
+    }
+
+    /// Overwrites one required key of a sqlserver block under test.
+    type RequiredKeySetter = fn(&mut SqlServerDestinationDefinition, Option<String>);
+
+    #[test]
+    fn sql_server_config_requires_each_required_key_present_and_non_empty() {
+        let setters: [(&str, RequiredKeySetter); 4] = [
+            ("host", |definition, value| definition.host = value),
+            ("database", |definition, value| definition.database = value),
+            ("user", |definition, value| definition.user = value),
+            ("password_env", |definition, value| {
+                definition.password_env = value
+            }),
+        ];
+        for (key, set) in setters {
+            for value in [None, Some(String::new())] {
+                let case = if value.is_none() { "missing" } else { "empty" };
+                let mut definition = sqlserver_definition();
+                set(&mut definition, value);
+                let error = SqlServerConfig::from_definition(&definition, Some("customers"))
+                    .err()
+                    .unwrap_or_else(|| panic!("{case} {key} rejected"));
+                assert_eq!(error.code, "invalid_destination_config", "code for {key}");
+                assert!(
+                    error.message.contains(&format!("destination.{key}")),
+                    "message names destination.{key}: {}",
+                    error.message
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sql_server_config_accepts_exactly_the_two_encryption_postures() {
+        for (value, expected) in [
+            ("required", SqlServerEncryption::Required),
+            ("optional", SqlServerEncryption::Optional),
+        ] {
+            let mut definition = sqlserver_definition();
+            definition.encryption = Some(value.to_string());
+            let config = SqlServerConfig::from_definition(&definition, Some("customers"))
+                .expect("valid encryption resolves");
+            assert_eq!(config.encryption, expected, "encryption {value}");
+        }
+
+        let mut definition = sqlserver_definition();
+        definition.encryption = Some("off".to_string());
+        let error = SqlServerConfig::from_definition(&definition, Some("customers"))
+            .err()
+            .expect("unknown encryption value rejected");
+        assert_eq!(error.code, "invalid_destination_config");
+        assert!(
+            error.message.contains("destination.encryption"),
+            "message names destination.encryption: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn sql_server_config_rejects_an_empty_or_dotted_schema() {
+        for schema in ["", "dbo.sales"] {
+            let mut definition = sqlserver_definition();
+            definition.schema = Some(schema.to_string());
+            let error = SqlServerConfig::from_definition(&definition, Some("customers"))
+                .err()
+                .expect("broken schema rejected");
+            assert_eq!(
+                error.code, "invalid_destination_config",
+                "schema {schema:?}"
+            );
+            assert!(
+                error.message.contains("destination.schema"),
+                "message names destination.schema: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn sql_server_config_requires_a_dataset_like_duckdb() {
+        for dataset in [None, Some("")] {
+            let error = SqlServerConfig::from_definition(&sqlserver_definition(), dataset)
+                .err()
+                .expect("absent dataset rejected");
+            assert_eq!(error.code, "missing_dataset");
+            assert_eq!(
+                error.message,
+                "load definition dataset is required for a sqlserver destination"
+            );
+        }
+    }
+
+    #[test]
+    fn sql_server_config_rejects_a_dotted_dataset_pointing_at_schema() {
+        // Qualification is physical addressing and lives in destination.schema
+        // (ADR-0060), so the failure must send the author there.
+        let error =
+            SqlServerConfig::from_definition(&sqlserver_definition(), Some("dbo.customers"))
+                .err()
+                .expect("dotted dataset rejected");
+        assert_eq!(error.code, "invalid_dataset_name");
+        assert!(
+            error.message.contains("destination.schema"),
+            "message points at destination.schema: {}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn sql_server_destination_declines_every_load_mode_with_a_readable_message() {
+        let config = SqlServerConfig::from_definition(&sqlserver_definition(), Some("customers"))
+            .expect("valid sqlserver block resolves");
+        let destination = SqlServerDestination { config };
+
+        assert!(destination.supported_load_modes().is_empty());
+        for mode in [LoadMode::FullRefresh, LoadMode::Append, LoadMode::Merge] {
+            let error = destination
+                .validate_mode(mode)
+                .expect_err("every mode declined");
+            assert_eq!(error.code, "unsupported_load_mode_for_destination");
+            assert_eq!(
+                error.message,
+                format!(
+                    "sqlserver destination does not support load mode: {} \
+                     (no load modes are supported for this destination yet)",
+                    mode.as_str()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn destination_connector_fails_when_the_sqlserver_credential_reference_is_unset() {
+        // A name no environment defines, so the test never mutates the
+        // process environment; the set and empty postures live in the CLI
+        // contract tests, which control a child process's environment.
+        let mut definition = sqlserver_definition();
+        definition.password_env = Some("DATA_SPARK_TEST_UNSET_CREDENTIAL_132".to_string());
+        let error = destination_connector(
+            &DestinationDefinition::SqlServer(definition),
+            Some("customers"),
+            &[],
+        )
+        .err()
+        .expect("unset credential reference rejected");
+        assert_eq!(error.code, "unresolved_credential_reference");
+        assert!(
+            error
+                .message
+                .contains("DATA_SPARK_TEST_UNSET_CREDENTIAL_132"),
+            "message names the unresolved variable: {}",
+            error.message
+        );
     }
 
     #[test]
@@ -3705,9 +4109,26 @@ mod tests {
     }
 
     fn destination_definition(connector: &str, path: &str) -> DestinationDefinition {
-        DestinationDefinition {
+        DestinationDefinition::File(crate::FileDestinationDefinition {
             connector: connector.to_string(),
             path: PathBuf::from(path),
+        })
+    }
+
+    /// A complete minimal sqlserver block: every required key present, every
+    /// optional key absent, so tests mutate exactly the key they exercise.
+    fn sqlserver_definition() -> SqlServerDestinationDefinition {
+        SqlServerDestinationDefinition {
+            connector: "sqlserver".to_string(),
+            host: Some("db.example.internal".to_string()),
+            port: None,
+            database: Some("analytics".to_string()),
+            schema: None,
+            user: Some("loader".to_string()),
+            password_env: Some("MSSQL_PASSWORD".to_string()),
+            encryption: None,
+            trust_server_certificate: None,
+            accept_datetime_rounding: None,
         }
     }
 

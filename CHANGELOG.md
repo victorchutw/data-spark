@@ -31,6 +31,33 @@ this repository's use of pull requests, and link their commit instead.
 
 ## [Unreleased]
 
+### Added
+
+- The `sqlserver` destination block: the first network destination enters
+  the load definition as pure Definition-phase surface — parsing, offline
+  validation, and the environment credential reference. No connection is
+  opened, and no load mode is supported yet, so every sqlserver load still
+  fails pre-write with `unsupported_load_mode_for_destination`; the write
+  slices land mode by mode
+  ([ADR-0060](docs/adr/0060-express-the-sql-server-destination-as-inline-fields-with-an-env-credential-reference.md),
+  [ADR-0061](docs/adr/0061-guarantee-secret-free-load-reports-by-contract-shape.md)).
+  **[contract]** The load definition's `destination` key set is now
+  connector-dependent: under `connector: sqlserver` it gains `host`,
+  `port`, `database`, `schema`, `user`, `password_env`, `encryption`,
+  `trust_server_certificate`, and `accept_datetime_rounding` — the last
+  parsed and echoed ahead of its
+  [ADR-0065](docs/adr/0065-validate-existing-sql-server-tables-against-a-loud-or-lossless-accept-family.md)
+  semantics — while `path` is not a `sqlserver` key and fails as an
+  unknown key. `password_env`
+  names an environment variable — a credential reference, never a value —
+  so no contract key can carry a secret and the `destination_summary`
+  echo stays safe by shape. Three failure codes join the vocabulary:
+  `invalid_destination_config` for an incomplete or contradictory block,
+  `unresolved_credential_reference` when the named environment variable
+  is unset or empty at load time, and `invalid_dataset_name` for a
+  dotted `dataset` — schema qualification lives in `destination.schema`.
+  ([#147])
+
 ### Fixed
 
 - `CONTEXT.md`'s Merge Load definition lagged the decided merge semantics
@@ -383,3 +410,4 @@ one carried is listed under the stable release that followed — `0.1.0` and
 [#98]: https://github.com/victorchutw/data-spark/pull/98
 [#100]: https://github.com/victorchutw/data-spark/pull/100
 [#104]: https://github.com/victorchutw/data-spark/pull/104
+[#147]: https://github.com/victorchutw/data-spark/pull/147

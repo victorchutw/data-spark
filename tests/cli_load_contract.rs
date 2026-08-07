@@ -9435,6 +9435,355 @@ fn a_mid_load_merge_failure_leaves_the_destination_byte_identical() {
     );
 }
 
+// ---- SQL Server destination block: Definition-phase surface (ADR-0060, ADR-0061) ----
+
+/// The environment variable every sqlserver test names in `password_env`,
+/// chosen to collide with nothing the CI job exports.
+const SQLSERVER_PASSWORD_ENV: &str = "DATA_SPARK_TEST_MSSQL_PASSWORD";
+
+/// The password value of the positive-path tests. ADR-0061's shape guarantee
+/// is asserted as text: no report or stdout may ever contain it.
+const SQLSERVER_PASSWORD_SENTINEL: &str = "S3cr3t-Sentinel-Never-Echo-132!";
+
+/// The minimal valid sqlserver destination block — every required key
+/// present, every optional key absent — which the failure tests use as
+/// written, decorate with the key under test, or pair with a broken
+/// dataset.
+fn minimal_sqlserver_destination_block() -> String {
+    format!(
+        "destination:\n\
+         \x20 connector: sqlserver\n\
+         \x20 host: db.example.internal\n\
+         \x20 database: analytics\n\
+         \x20 user: loader\n\
+         \x20 password_env: {SQLSERVER_PASSWORD_ENV}\n"
+    )
+}
+
+/// Runs a load around the given sqlserver `destination` block with the
+/// credential environment variable set to `password` (removed when `None`)
+/// on the child process, and returns the stdout, the raw report text, and
+/// the parsed report. `definition_tail` is the definition after the block —
+/// the `dataset` and `load_mode` lines. Every sqlserver load in this slice
+/// fails — no load mode is supported yet — so the helper asserts failure.
+/// The source file is real, proving the failures fire before it is ever
+/// read.
+fn run_sqlserver_load_failure(
+    destination_block: &str,
+    definition_tail: &str,
+    password: Option<&str>,
+) -> (String, String, Value) {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    fs::write(&source_path, "customer_id,name\n1,Ada\n").expect("write source csv");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            "version: 1\nsource:\n  connector: local_file\n  path: {}\n  format: csv\n\
+             {destination_block}{definition_tail}",
+            source_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    let mut command = Command::cargo_bin("data-spark").expect("binary");
+    command
+        .current_dir(work.path())
+        .env_remove(SQLSERVER_PASSWORD_ENV);
+    if let Some(password) = password {
+        command.env(SQLSERVER_PASSWORD_ENV, password);
+    }
+    let assert = command
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let (report_path, report) = read_single_report(
+        &artifacts_dir,
+        "failed sqlserver load still has one artifact directory",
+    );
+    let report_text = fs::read_to_string(report_path).expect("report text");
+    (stdout, report_text, report)
+}
+
+/// The pre-write posture of every failure in this slice (ADR-0019): no
+/// schema decision, zero counts, an untouched destination, and a write
+/// phase that never started.
+fn assert_sqlserver_pre_write_posture(report: &Value) {
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(report["schema_decision"]["mode"], "not_evaluated");
+    assert_eq!(report["row_counts"]["source"], 0);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+    assert_eq!(report["execution"]["record_format"], "not_started");
+    assert_eq!(report["execution"]["batch_count"], 0);
+}
+
+#[test]
+fn sqlserver_full_block_echoes_verbatim_and_declines_the_load_before_any_work() {
+    // AC1 + AC4: a complete valid block parses and is echoed verbatim, and
+    // the load then fails pre-write through mode validation — the sqlserver
+    // destination supports no load mode yet — with a readable spelling of
+    // the empty mode list.
+    let destination_block = format!(
+        "destination:\n\
+         \x20 connector: sqlserver\n\
+         \x20 host: db.example.internal\n\
+         \x20 port: 14330\n\
+         \x20 database: analytics\n\
+         \x20 schema: sales\n\
+         \x20 user: loader\n\
+         \x20 password_env: {SQLSERVER_PASSWORD_ENV}\n\
+         \x20 encryption: optional\n\
+         \x20 trust_server_certificate: true\n\
+         \x20 accept_datetime_rounding: true\n"
+    );
+    let (stdout, report_text, report) = run_sqlserver_load_failure(
+        &destination_block,
+        "dataset: customers\nload_mode: full_refresh\n",
+        Some(SQLSERVER_PASSWORD_SENTINEL),
+    );
+
+    assert_eq!(
+        report["error_summary"]["code"],
+        "unsupported_load_mode_for_destination"
+    );
+    let message = report["error_summary"]["message"]
+        .as_str()
+        .expect("error message");
+    assert_eq!(
+        message,
+        "sqlserver destination does not support load mode: full_refresh \
+         (no load modes are supported for this destination yet)"
+    );
+    assert!(stdout.contains("no load modes are supported for this destination yet"));
+
+    // The block is echoed exactly as written, key for key.
+    assert_eq!(
+        report["destination_summary"],
+        serde_json::json!({
+            "connector": "sqlserver",
+            "host": "db.example.internal",
+            "port": 14330,
+            "database": "analytics",
+            "schema": "sales",
+            "user": "loader",
+            "password_env": SQLSERVER_PASSWORD_ENV,
+            "encryption": "optional",
+            "trust_server_certificate": true,
+            "accept_datetime_rounding": true
+        })
+    );
+    assert_eq!(report["dataset"], "customers");
+    assert_eq!(report["load_mode"], "full_refresh");
+    assert_sqlserver_pre_write_posture(&report);
+
+    // ADR-0061: the password exists only in the environment; no surface of
+    // the run may carry it.
+    assert!(
+        !report_text.contains(SQLSERVER_PASSWORD_SENTINEL),
+        "the report text must never contain the password"
+    );
+    assert!(
+        !stdout.contains(SQLSERVER_PASSWORD_SENTINEL),
+        "stdout must never contain the password"
+    );
+}
+
+#[test]
+fn sqlserver_minimal_block_echoes_absent_keys_as_null_and_declines_append() {
+    // AC1: defaulted-absent keys follow the existing destination_summary
+    // convention — echoed as null, like source.format — while the resolved
+    // defaults themselves are pinned by the unit tests.
+    let (stdout, report_text, report) = run_sqlserver_load_failure(
+        &minimal_sqlserver_destination_block(),
+        "dataset: customers\nload_mode: append\n",
+        Some(SQLSERVER_PASSWORD_SENTINEL),
+    );
+
+    assert_eq!(
+        report["error_summary"]["code"],
+        "unsupported_load_mode_for_destination"
+    );
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("does not support load mode: append"));
+    assert_eq!(
+        report["destination_summary"],
+        serde_json::json!({
+            "connector": "sqlserver",
+            "host": "db.example.internal",
+            "port": null,
+            "database": "analytics",
+            "schema": null,
+            "user": "loader",
+            "password_env": SQLSERVER_PASSWORD_ENV,
+            "encryption": null,
+            "trust_server_certificate": null,
+            "accept_datetime_rounding": null
+        })
+    );
+    assert_sqlserver_pre_write_posture(&report);
+    assert!(!report_text.contains(SQLSERVER_PASSWORD_SENTINEL));
+    assert!(!stdout.contains(SQLSERVER_PASSWORD_SENTINEL));
+}
+
+#[test]
+fn sqlserver_missing_or_empty_required_keys_fail_offline_as_invalid_destination_config() {
+    // AC2, with the credential variable deliberately unset: the config
+    // failure must fire first, proving block validation precedes credential
+    // resolution.
+    let required: [(&str, &str); 4] = [
+        ("host", "db.example.internal"),
+        ("database", "analytics"),
+        ("user", "loader"),
+        ("password_env", SQLSERVER_PASSWORD_ENV),
+    ];
+    for (broken, _) in required {
+        for empty in [false, true] {
+            let case = if empty { "empty" } else { "missing" };
+            let mut destination_block = String::from("destination:\n  connector: sqlserver\n");
+            for (key, value) in required {
+                if key != broken {
+                    destination_block.push_str(&format!("  {key}: {value}\n"));
+                } else if empty {
+                    destination_block.push_str(&format!("  {key}: \"\"\n"));
+                }
+            }
+            let (_, _, report) = run_sqlserver_load_failure(
+                &destination_block,
+                "dataset: customers\nload_mode: full_refresh\n",
+                None,
+            );
+            assert_eq!(
+                report["error_summary"]["code"], "invalid_destination_config",
+                "code for {case} {broken}"
+            );
+            let message = report["error_summary"]["message"]
+                .as_str()
+                .expect("error message");
+            assert!(
+                message.contains(&format!("destination.{broken}")),
+                "message names destination.{broken}: {message}"
+            );
+            assert_sqlserver_pre_write_posture(&report);
+        }
+    }
+}
+
+#[test]
+fn sqlserver_invalid_encryption_value_fails_offline_as_invalid_destination_config() {
+    let destination_block = format!(
+        "{}  encryption: none\n",
+        minimal_sqlserver_destination_block()
+    );
+    let (_, _, report) = run_sqlserver_load_failure(
+        &destination_block,
+        "dataset: customers\nload_mode: full_refresh\n",
+        None,
+    );
+
+    assert_eq!(
+        report["error_summary"]["code"],
+        "invalid_destination_config"
+    );
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .expect("error message")
+        .contains("destination.encryption"));
+    assert_sqlserver_pre_write_posture(&report);
+}
+
+#[test]
+fn sqlserver_dotted_dataset_fails_as_invalid_dataset_name_pointing_at_schema() {
+    // AC2: qualification is physical addressing and lives in
+    // destination.schema, so the failure sends the author there.
+    let (_, _, report) = run_sqlserver_load_failure(
+        &minimal_sqlserver_destination_block(),
+        "dataset: dbo.customers\nload_mode: full_refresh\n",
+        None,
+    );
+
+    assert_eq!(report["error_summary"]["code"], "invalid_dataset_name");
+    let message = report["error_summary"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(
+        message.contains("destination.schema"),
+        "message points at destination.schema: {message}"
+    );
+    assert_eq!(report["dataset"], "dbo.customers");
+    assert_sqlserver_pre_write_posture(&report);
+}
+
+#[test]
+fn sqlserver_path_key_fails_as_an_unknown_key() {
+    // AC2: `path` is not a sqlserver key (ADR-0060), so writing one fails
+    // under the strict contract exactly like any unknown key (ADR-0037).
+    let destination_block = format!(
+        "{}  path: customers.duckdb\n",
+        minimal_sqlserver_destination_block()
+    );
+    let (stdout, report_text, report) = run_sqlserver_load_failure(
+        &destination_block,
+        "dataset: customers\nload_mode: full_refresh\n",
+        Some(SQLSERVER_PASSWORD_SENTINEL),
+    );
+
+    assert_eq!(
+        report["error_summary"]["code"],
+        "invalid_load_definition_yaml"
+    );
+    let message = report["error_summary"]["message"]
+        .as_str()
+        .expect("error message");
+    assert!(message.contains("failed to parse load definition"));
+    assert!(
+        message.contains("unknown field `path`"),
+        "error text must identify the rejected key: {message}"
+    );
+    assert_sqlserver_pre_write_posture(&report);
+    // Even a parse failure's surfaces stay password-free (ADR-0061).
+    assert!(!report_text.contains(SQLSERVER_PASSWORD_SENTINEL));
+    assert!(!stdout.contains(SQLSERVER_PASSWORD_SENTINEL));
+}
+
+#[test]
+fn sqlserver_unresolved_credential_reference_fails_offline_for_unset_and_empty() {
+    // AC3: the environment variable password_env names must be set and
+    // non-empty at load time; the failure still echoes the definition
+    // context, and there is no value anywhere that could leak.
+    for (password, expected_detail) in [(None, "is not set"), (Some(""), "is empty")] {
+        let (_, _, report) = run_sqlserver_load_failure(
+            &minimal_sqlserver_destination_block(),
+            "dataset: customers\nload_mode: full_refresh\n",
+            password,
+        );
+
+        assert_eq!(
+            report["error_summary"]["code"], "unresolved_credential_reference",
+            "code for the {expected_detail:?} posture"
+        );
+        let message = report["error_summary"]["message"]
+            .as_str()
+            .expect("error message");
+        assert!(
+            message.contains(SQLSERVER_PASSWORD_ENV) && message.contains(expected_detail),
+            "message names the variable and the {expected_detail:?} posture: {message}"
+        );
+        assert_eq!(report["destination_summary"]["connector"], "sqlserver");
+        assert_sqlserver_pre_write_posture(&report);
+    }
+}
+
 fn write_load_definition(
     definition_path: &Path,
     source_path: &Path,
