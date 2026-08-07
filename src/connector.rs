@@ -425,17 +425,9 @@ pub(crate) fn destination_connector(
                 path: definition.path.clone(),
             })),
             "duckdb" => {
-                // An empty dataset is no address at all, so it fails here as
-                // missing rather than at write time; identifier content beyond
-                // presence is deliberately left to DuckDB (no allowlist,
-                // ADR-0030).
-                let dataset = dataset
-                    .filter(|dataset| !dataset.is_empty())
-                    .ok_or_else(|| LoadFailure {
-                        code: "missing_dataset",
-                        message: "load definition dataset is required for a duckdb destination"
-                            .to_string(),
-                    })?;
+                // Identifier content beyond presence is deliberately left to
+                // DuckDB (no allowlist, ADR-0030).
+                let dataset = require_dataset(dataset, "duckdb")?;
                 Ok(Box::new(DuckDbDestination {
                     table: DuckDbTable {
                         path: definition.path.clone(),
@@ -455,6 +447,21 @@ pub(crate) fn destination_connector(
             Ok(Box::new(SqlServerDestination { config }))
         }
     }
+}
+
+/// The shared dataset-presence rule of the table-addressed destinations
+/// (ADR-0030, ADR-0060): an empty dataset is no address at all, so it fails
+/// here as missing rather than at write time.
+fn require_dataset<'definition>(
+    dataset: Option<&'definition str>,
+    connector: &'static str,
+) -> Result<&'definition str, LoadFailure> {
+    dataset
+        .filter(|dataset| !dataset.is_empty())
+        .ok_or_else(|| LoadFailure {
+            code: "missing_dataset",
+            message: format!("load definition dataset is required for a {connector} destination"),
+        })
 }
 
 /// Reads local CSV and JSONL files. The `format` is resolved from the definition
@@ -1933,9 +1940,11 @@ fn duckdb_schema_mismatch(table: &DuckDbTable, operation: &'static str) -> LoadF
 
 /// The resolved `sqlserver` destination address (ADR-0060): every key of the
 /// block validated and defaulted, plus the dataset naming the destination
-/// table. Resolution is offline — the Definition phase never opens a
-/// connection — so connectivity, authentication, and TLS failures stay
-/// write-phase facts for the slices that write.
+/// table (`accept_datetime_rounding` resolves here too, though its semantics
+/// are ADR-0065's and land with the write slices). Resolution is offline —
+/// the Definition phase never opens a connection — so connectivity,
+/// authentication, and TLS failures stay write-phase facts for the slices
+/// that write.
 // The write slices (ADR-0064) consume the resolved address; until the first
 // sqlserver session exists, only `password_env` is read outside tests, and
 // the remaining fields would trip dead_code in non-test builds. Drop the
@@ -2027,13 +2036,7 @@ impl SqlServerConfig {
             }
             Some(schema) => schema.to_string(),
         };
-        let dataset = dataset
-            .filter(|dataset| !dataset.is_empty())
-            .ok_or_else(|| LoadFailure {
-                code: "missing_dataset",
-                message: "load definition dataset is required for a sqlserver destination"
-                    .to_string(),
-            })?;
+        let dataset = require_dataset(dataset, "sqlserver")?;
         if dataset.contains('.') {
             return Err(LoadFailure {
                 code: "invalid_dataset_name",

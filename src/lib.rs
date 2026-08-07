@@ -399,7 +399,9 @@ struct FileDestinationDefinition {
 /// YAML parse failure; `encryption` likewise parses as free text and is
 /// validated there. `port` rides the `execution.chunk_rows` precedent: zero,
 /// negative, out-of-range, and non-integer values fail YAML parsing
-/// (`NonZeroU16`). The block carries no secret by shape (ADR-0061) —
+/// (`NonZeroU16`). `accept_datetime_rounding` is only parsed and echoed
+/// here — its semantics belong to ADR-0065's accept family and land with
+/// the write slices. The block carries no secret by shape (ADR-0061) —
 /// `password_env` names an environment variable — so the
 /// `destination_summary` echo stays safe by construction.
 #[derive(Debug, Deserialize, Serialize)]

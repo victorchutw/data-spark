@@ -9445,15 +9445,32 @@ const SQLSERVER_PASSWORD_ENV: &str = "DATA_SPARK_TEST_MSSQL_PASSWORD";
 /// is asserted as text: no report or stdout may ever contain it.
 const SQLSERVER_PASSWORD_SENTINEL: &str = "S3cr3t-Sentinel-Never-Echo-132!";
 
+/// The minimal valid sqlserver destination block — every required key
+/// present, every optional key absent — which the failure tests use as
+/// written, decorate with the key under test, or pair with a broken
+/// dataset.
+fn minimal_sqlserver_destination_block() -> String {
+    format!(
+        "destination:\n\
+         \x20 connector: sqlserver\n\
+         \x20 host: db.example.internal\n\
+         \x20 database: analytics\n\
+         \x20 user: loader\n\
+         \x20 password_env: {SQLSERVER_PASSWORD_ENV}\n"
+    )
+}
+
 /// Runs a load around the given sqlserver `destination` block with the
 /// credential environment variable set to `password` (removed when `None`)
 /// on the child process, and returns the stdout, the raw report text, and
-/// the parsed report. Every sqlserver load in this slice fails — no load
-/// mode is supported yet — so the helper asserts failure. The source file
-/// is real, proving the failures fire before it is ever read.
+/// the parsed report. `definition_tail` is the definition after the block —
+/// the `dataset` and `load_mode` lines. Every sqlserver load in this slice
+/// fails — no load mode is supported yet — so the helper asserts failure.
+/// The source file is real, proving the failures fire before it is ever
+/// read.
 fn run_sqlserver_load_failure(
     destination_block: &str,
-    trailer: &str,
+    definition_tail: &str,
     password: Option<&str>,
 ) -> (String, String, Value) {
     let work = TempDir::new().expect("tempdir");
@@ -9464,7 +9481,7 @@ fn run_sqlserver_load_failure(
         &definition_path,
         format!(
             "version: 1\nsource:\n  connector: local_file\n  path: {}\n  format: csv\n\
-             {destination_block}{trailer}",
+             {destination_block}{definition_tail}",
             source_path.display()
         ),
     )
@@ -9585,16 +9602,8 @@ fn sqlserver_minimal_block_echoes_absent_keys_as_null_and_declines_append() {
     // AC1: defaulted-absent keys follow the existing destination_summary
     // convention — echoed as null, like source.format — while the resolved
     // defaults themselves are pinned by the unit tests.
-    let destination_block = format!(
-        "destination:\n\
-         \x20 connector: sqlserver\n\
-         \x20 host: db.example.internal\n\
-         \x20 database: analytics\n\
-         \x20 user: loader\n\
-         \x20 password_env: {SQLSERVER_PASSWORD_ENV}\n"
-    );
     let (stdout, report_text, report) = run_sqlserver_load_failure(
-        &destination_block,
+        &minimal_sqlserver_destination_block(),
         "dataset: customers\nload_mode: append\n",
         Some(SQLSERVER_PASSWORD_SENTINEL),
     );
@@ -9673,13 +9682,8 @@ fn sqlserver_missing_or_empty_required_keys_fail_offline_as_invalid_destination_
 #[test]
 fn sqlserver_invalid_encryption_value_fails_offline_as_invalid_destination_config() {
     let destination_block = format!(
-        "destination:\n\
-         \x20 connector: sqlserver\n\
-         \x20 host: db.example.internal\n\
-         \x20 database: analytics\n\
-         \x20 user: loader\n\
-         \x20 password_env: {SQLSERVER_PASSWORD_ENV}\n\
-         \x20 encryption: none\n"
+        "{}  encryption: none\n",
+        minimal_sqlserver_destination_block()
     );
     let (_, _, report) = run_sqlserver_load_failure(
         &destination_block,
@@ -9702,16 +9706,8 @@ fn sqlserver_invalid_encryption_value_fails_offline_as_invalid_destination_confi
 fn sqlserver_dotted_dataset_fails_as_invalid_dataset_name_pointing_at_schema() {
     // AC2: qualification is physical addressing and lives in
     // destination.schema, so the failure sends the author there.
-    let destination_block = format!(
-        "destination:\n\
-         \x20 connector: sqlserver\n\
-         \x20 host: db.example.internal\n\
-         \x20 database: analytics\n\
-         \x20 user: loader\n\
-         \x20 password_env: {SQLSERVER_PASSWORD_ENV}\n"
-    );
     let (_, _, report) = run_sqlserver_load_failure(
-        &destination_block,
+        &minimal_sqlserver_destination_block(),
         "dataset: dbo.customers\nload_mode: full_refresh\n",
         None,
     );
@@ -9733,15 +9729,10 @@ fn sqlserver_path_key_fails_as_an_unknown_key() {
     // AC2: `path` is not a sqlserver key (ADR-0060), so writing one fails
     // under the strict contract exactly like any unknown key (ADR-0037).
     let destination_block = format!(
-        "destination:\n\
-         \x20 connector: sqlserver\n\
-         \x20 host: db.example.internal\n\
-         \x20 database: analytics\n\
-         \x20 user: loader\n\
-         \x20 password_env: {SQLSERVER_PASSWORD_ENV}\n\
-         \x20 path: customers.duckdb\n"
+        "{}  path: customers.duckdb\n",
+        minimal_sqlserver_destination_block()
     );
-    let (_, _, report) = run_sqlserver_load_failure(
+    let (stdout, report_text, report) = run_sqlserver_load_failure(
         &destination_block,
         "dataset: customers\nload_mode: full_refresh\n",
         Some(SQLSERVER_PASSWORD_SENTINEL),
@@ -9760,6 +9751,9 @@ fn sqlserver_path_key_fails_as_an_unknown_key() {
         "error text must identify the rejected key: {message}"
     );
     assert_sqlserver_pre_write_posture(&report);
+    // Even a parse failure's surfaces stay password-free (ADR-0061).
+    assert!(!report_text.contains(SQLSERVER_PASSWORD_SENTINEL));
+    assert!(!stdout.contains(SQLSERVER_PASSWORD_SENTINEL));
 }
 
 #[test]
@@ -9767,17 +9761,9 @@ fn sqlserver_unresolved_credential_reference_fails_offline_for_unset_and_empty()
     // AC3: the environment variable password_env names must be set and
     // non-empty at load time; the failure still echoes the definition
     // context, and there is no value anywhere that could leak.
-    let destination_block = format!(
-        "destination:\n\
-         \x20 connector: sqlserver\n\
-         \x20 host: db.example.internal\n\
-         \x20 database: analytics\n\
-         \x20 user: loader\n\
-         \x20 password_env: {SQLSERVER_PASSWORD_ENV}\n"
-    );
     for (password, expected_detail) in [(None, "is not set"), (Some(""), "is empty")] {
         let (_, _, report) = run_sqlserver_load_failure(
-            &destination_block,
+            &minimal_sqlserver_destination_block(),
             "dataset: customers\nload_mode: full_refresh\n",
             password,
         );

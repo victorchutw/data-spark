@@ -44,8 +44,11 @@ this repository's use of pull requests, and link their commit instead.
   **[contract]** The load definition's `destination` key set is now
   connector-dependent: under `connector: sqlserver` it gains `host`,
   `port`, `database`, `schema`, `user`, `password_env`, `encryption`,
-  `trust_server_certificate`, and `accept_datetime_rounding`, while `path`
-  is not a `sqlserver` key and fails as an unknown key. `password_env`
+  `trust_server_certificate`, and `accept_datetime_rounding` — the last
+  parsed and echoed ahead of its
+  [ADR-0065](docs/adr/0065-validate-existing-sql-server-tables-against-a-loud-or-lossless-accept-family.md)
+  semantics — while `path` is not a `sqlserver` key and fails as an
+  unknown key. `password_env`
   names an environment variable — a credential reference, never a value —
   so no contract key can carry a secret and the `destination_summary`
   echo stays safe by shape. Three failure codes join the vocabulary:
