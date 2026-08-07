@@ -1,0 +1,11 @@
+---
+status: accepted
+---
+
+# Declare Serial Parallelism for Every SQL Server Load Mode
+
+The SQL Server destination declares a Connector Parallelism Limit (ADR-0051) of **1 for all three load modes**. The number matches the trait default, but it is declared rather than defaulted, because the three 1s state different facts. For full refresh and merge the limit is **structural and permanent**: each runs as one explicit transaction on the load's single connection (ADR-0064), and a TDS connection processes one active request at a time, so a second concurrent `write_chunk` has no physical lane; no future decision can raise these two limits without first abandoning the single-transaction write strategies themselves.
+
+Append's 1 is **provisional, with the amendment path recorded**. Append chunks are independent auto-committed bulk loads, so a limit above 1 is conceivable — but it requires a multi-connection writer (a connection pool inside the session, where today's containment design holds one runtime and one client per load), and ADR-0051's declaration obligation makes it contingent on amending append's documented commit semantics first: concurrent completions commit out of stream order, turning ADR-0047's committed-prefix visibility into a committed *set*, and a limit above 1 is dishonest until the documentation says so. That amendment is a separate future decision; nothing in this cycle needs it. With every mode at 1, the shipped behavior keeps its familiar shape: ADR-0051's dispatcher remains the observable sequential loop, configured `execution.parallelism` clamps to 1 (ADR-0052), and the report states the effective value beside the declared limit (ADR-0053).
+
+Alternatives rejected: declaring append above 1 now (no load needs it, and the declaration obligation demands a pooled writer plus amended append semantics — exactly the speculative machinery ADR-0051 reserves for the decision that needs it); leaving the limits silently on the trait default (the per-mode reasoning — two structural, one provisional — is the fact a future reader needs, and an undeclared 1 hides it); a MARS-multiplexed single connection as a parallel lane (Multiple Active Result Sets interleaves requests on one connection rather than executing them concurrently, so bulk loads gain nothing from it).
