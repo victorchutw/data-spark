@@ -13,9 +13,32 @@ jobs:
   rust:
     name: rust
     runs-on: ubuntu-latest
+    env:
+      # Fixed SA test password, deliberately not a secret; chosen here and
+      # reused verbatim by the CONTRIBUTING.md one-liner and the
+      # DATA_SPARK_TEST_MSSQL_* test defaults as later slices land them
+      # (ADR-0066). Upper+lower+digit satisfies SQL Server's complexity
+      # policy with no shell-special characters.
+      MSSQL_SA_PASSWORD: DataSparkTest123
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Start SQL Server container
+        # Detached start right after checkout so the server boots behind
+        # toolchain install, cache restore, fmt, and clippy; the readiness
+        # wait sits immediately before the test step. Measured on the
+        # public runner: 14 s pull + 5 s startup, ~2 GB disk (spike run
+        # 31091458338; the root filesystem has 145 GB), so no disk-free
+        # accommodation is needed. The image floats 2022-latest as a
+        # single version (ADR-0066): no version matrix, no CU pin; if a
+        # cumulative update ever breaks CI, pin that CU and report
+        # upstream.
+        run: |
+          docker run -d --name mssql -p 1433:1433 \
+            -e ACCEPT_EULA=Y \
+            -e MSSQL_SA_PASSWORD="$MSSQL_SA_PASSWORD" \
+            mcr.microsoft.com/mssql/server:2022-latest
 
       - name: Free runner disk space
         # The bundled DuckDB engine plus per-target debug info makes the
@@ -50,8 +73,37 @@ jobs:
       - name: Run clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      - name: Wait for SQL Server readiness
+        # Bounded probe loop so a server that never comes up fails the job
+        # loudly here — with the container log for diagnosis — instead of
+        # hanging until the job timeout. On warm-cache runs the server has
+        # been up for minutes by now and the first probe succeeds, so the
+        # net wall-clock cost approaches zero (ADR-0066).
+        run: |
+          set -euo pipefail
+
+          attempts=60
+          interval=2
+          for attempt in $(seq 1 "$attempts"); do
+            if docker exec mssql /opt/mssql-tools18/bin/sqlcmd -C \
+              -S localhost -U sa -P "$MSSQL_SA_PASSWORD" \
+              -Q "SELECT 1" > /dev/null 2>&1; then
+              echo "SQL Server ready after $attempt probe(s)"
+              exit 0
+            fi
+            sleep "$interval"
+          done
+
+          echo "SQL Server did not become ready after $attempts probes" >&2
+          docker logs --tail 50 mssql >&2 || true
+          exit 1
+
       - name: Run tests
-        run: cargo test --locked
+        # --include-ignored runs the #[ignore = "needs SQL Server"] gated
+        # tests alongside the rest of the suite (ADR-0066). The repo
+        # reserves #[ignore] for needs-a-live-server tests, so the flag's
+        # scope is exactly the server-backed suite.
+        run: cargo test --locked -- --include-ignored
 
       - name: Build release binary
         run: cargo build --release --locked --bin data-spark
