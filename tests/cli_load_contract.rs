@@ -8581,6 +8581,92 @@ fn local_csv_merge_updates_matching_records_and_inserts_new_ones_into_duckdb() {
 }
 
 #[test]
+fn duckdb_merge_replaces_every_duplicate_key_destination_record_but_counts_source_records() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("customers.csv");
+    let database_path = work.path().join("customers.duckdb");
+    let definition_path = work.path().join("load.yml");
+
+    // Full refresh can create a destination with duplicate merge-key values:
+    // merge never treats the destination's key fields as a unique constraint.
+    fs::write(
+        &source_path,
+        concat!(
+            "customer_id,name,tier\n",
+            "1,Ada,gold\n",
+            "1,Grace,silver\n",
+            "2,Katherine,bronze\n",
+        ),
+    )
+    .expect("write duplicate-key bootstrap csv");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "full_refresh",
+        "",
+    );
+    run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-1"),
+        &definition_path,
+        true,
+    );
+
+    // One source record matches both duplicate-key destination records. Both
+    // destination records are replaced whole, while `updated` counts the one
+    // source record and keeps `updated + inserted == row_counts.written`.
+    fs::write(&source_path, "customer_id,name,tier\n1,Current,platinum\n")
+        .expect("write merge csv");
+    write_merge_definition(
+        &definition_path,
+        &source_path,
+        "csv",
+        "duckdb",
+        &database_path,
+        "merge",
+        "merge:\n  keys: [customer_id]\n",
+    );
+    let merge = run_cli_load(
+        work.path(),
+        &work.path().join("artifacts-day-2"),
+        &definition_path,
+        true,
+    );
+
+    assert_eq!(
+        merge.report["destination_write"]["merge"],
+        serde_json::json!({ "updated": 1, "inserted": 0 })
+    );
+    assert_eq!(merge.report["row_counts"]["written"], 1);
+
+    let batch = read_single_duckdb_batch(&database_path, "customers");
+    assert_eq!(batch.num_rows(), 3);
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("customer_id is int64");
+    let names = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("name is string");
+    let tiers = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("tier is string");
+    assert_eq!(ids.values(), &[1, 1, 2]);
+    assert_eq!([names.value(0), names.value(1)], ["Current", "Current"]);
+    assert_eq!([tiers.value(0), tiers.value(1)], ["platinum", "platinum"]);
+    assert_eq!(names.value(2), "Katherine");
+    assert_eq!(tiers.value(2), "bronze");
+}
+
+#[test]
 fn local_jsonl_merge_matches_on_renamed_and_flattened_multi_field_keys() {
     let work = TempDir::new().expect("tempdir");
     let source_path = work.path().join("customers.jsonl");

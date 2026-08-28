@@ -126,7 +126,7 @@ of `0`, one null-key record fails the whole load with
 `reject_threshold_exceeded` before the destination is touched; raise the
 threshold to let the survivors merge while the rejects land in the artifact.
 
-## Duplicate keys fail the load
+## Duplicate source keys fail the load
 
 Two surviving records with the same key tuple would make "update the match"
 ambiguous, so the load fails with `duplicate_merge_keys` rather than letting
@@ -144,6 +144,27 @@ The check runs inside the merge transaction, before the real table is
 touched: the rollback leaves the destination byte-for-byte as it was. If
 your source legitimately carries several versions of a record, deduplicate
 upstream — the load will not choose for you.
+
+## Duplicate destination keys all match
+
+A merge key is a matching rule, not a uniqueness constraint on the
+destination. If the destination already contains several records with the
+same key tuple, one surviving source record matches every one of them.
+Every matching destination record is replaced whole; there is no
+destination-side duplicate-key gate. The currently shipped DuckDB
+destination follows this contract.
+
+The report counts this from the source perspective: `updated` is the number
+of surviving source records that matched at least one destination record, not
+the number of destination records replaced. One source record can therefore
+replace two destination records while reporting `updated: 1`. The source
+partition still holds — `updated + inserted` equals `row_counts.written` —
+even when the number of replaced destination records is greater than
+`updated`.
+
+This does not relax the source-side rule above. Two surviving source records
+with the same key tuple still fail with `duplicate_merge_keys`, so no source
+order chooses which values replace the matching destination records.
 
 ## Merge is DuckDB-only today
 
