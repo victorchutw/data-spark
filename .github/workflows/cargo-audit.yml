@@ -47,18 +47,14 @@ jobs:
         # gate (ADR-0069). Any other nonzero exit — advisory-database
         # fetch failure, tool breakage — fails this step instead: a broken
         # sensor should be a red run, not a misfiled findings issue. The
-        # ignore list carries the three accepted advisories on the stale
-        # rustls stack tiberius pins; their per-posture reachability
-        # analysis lives in ADR-0069.
+        # Project-local acceptance policy lives in .cargo/audit.toml, so
+        # maintainers and this sensor reach the same verdict from the same
+        # command. ADR-0069 records the stale-rustls reachability analysis.
         run: |
           set -euo pipefail
 
           exit_code=0
-          cargo audit \
-            --ignore RUSTSEC-2026-0098 \
-            --ignore RUSTSEC-2026-0099 \
-            --ignore RUSTSEC-2026-0104 \
-            2>&1 | tee audit-report.txt || exit_code=$?
+          cargo audit 2>&1 | tee audit-report.txt || exit_code=$?
 
           if [ "$exit_code" -eq 0 ]; then
             echo "findings=false" >> "$GITHUB_OUTPUT"
