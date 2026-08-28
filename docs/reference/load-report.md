@@ -643,7 +643,7 @@ destination itself states it and the report carries it verbatim.
 | --- | --- | --- |
 | `atomicity` | always | `atomic`, `best_effort`, or `not_applicable`. |
 | `strategy` | `atomicity` is not `not_applicable` | The named write strategy the destination used. |
-| `merge` | a merge load committed | How the surviving records partitioned: `{"updated": M, "inserted": N}`. |
+| `merge` | a merge load committed | How the surviving source records partitioned: `{"updated": M, "inserted": N}`. |
 
 | `atomicity` | Meaning |
 | --- | --- |
@@ -692,9 +692,10 @@ load mode, decides what this field says.
 A merge commits once, terminally, like a full refresh
 ([ADR-0059](../adr/0059-execute-duckdb-merge-as-a-staged-terminal-transaction.md)),
 and a committed merge additionally states how the surviving records
-partitioned — `updated` counts the records whose merge key tuple matched an
-existing destination record (replaced whole), `inserted` the unmatched
-remainder, and `updated + inserted` always equals `row_counts.written`:
+partitioned — `updated` counts the surviving source records whose merge key
+tuple matched at least one existing destination record, `inserted` the
+unmatched remainder, and `updated + inserted` always equals
+`row_counts.written`:
 
 ```json
 {
@@ -706,6 +707,15 @@ remainder, and `updated + inserted` always equals `row_counts.written`:
   }
 }
 ```
+
+These are source-perspective counts, not counts of affected destination
+records. If several destination records share one merge key tuple, one
+surviving source record replaces every matching destination record whole but
+increases `updated` by one. The number of replaced destination records may
+therefore exceed `updated`; the source-record partition and its
+`updated + inserted == row_counts.written` invariant stay unchanged. See
+[Duplicate destination keys all match](../guides/merge-loads.md#duplicate-destination-keys-all-match)
+for the merge behavior.
 
 The `merge` key is absent on every failed merge. Almost always that is
 because the terminal commit never ran, so nothing was committed to count: a
