@@ -1,0 +1,30 @@
+[advisories]
+ignore = [
+    # Accepted by ADR-0069: URI name constraints are reached only by the
+    # narrow certificate-validation posture analyzed there. Delete this
+    # entry when an ADR-0069 source-decision reopen trigger is met.
+    "RUSTSEC-2026-0098",
+    # Accepted by ADR-0069: wildcard name constraints are reached only by
+    # the narrow certificate-validation posture analyzed there. Delete this
+    # entry when an ADR-0069 source-decision reopen trigger is met.
+    "RUSTSEC-2026-0099",
+    # Accepted by ADR-0069: tiberius does not configure certificate
+    # revocation lists, so the vulnerable parser is unreachable. Delete this
+    # entry when an ADR-0069 source-decision reopen trigger is met.
+    "RUSTSEC-2026-0104",
+    # rust_decimal's optional rkyv feature is disabled, so this lockfile-only
+    # dependency is not compiled into Data Spark. Delete this entry once
+    # rust_decimal's optional rkyv requirement moves to >= 0.8.17, when
+    # cargo update can clear the advisory.
+    "RUSTSEC-2026-0235",
+]
+
+# paste and rustls-pemfile are known, reachable, and deliberately tolerated
+# as unmaintained upstream dependencies. Keep the repository's verdict stable
+# when cargo-audit's unpinned defaults change.
+informational_warnings = ["unmaintained"]
+
+[output]
+deny = []
+# cargo-audit 0.22.2 requires this field whenever [output] is present.
+quiet = false

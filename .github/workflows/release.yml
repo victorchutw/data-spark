@@ -64,6 +64,26 @@ jobs:
           shared-key: "rust"
           save-if: "false"
 
+      - name: Verify rkyv remains unreachable
+        run: |
+          set -euo pipefail
+
+          if [ ! -r Cargo.lock ]; then
+            echo "Cargo.lock is unavailable; cannot verify rkyv reachability." >&2
+            exit 1
+          fi
+          if ! grep -Fqx 'name = "rkyv"' Cargo.lock; then
+            echo "rkyv is absent from Cargo.lock; no reachability guard is needed."
+            exit 0
+          fi
+
+          rkyv_tree="$(cargo tree --locked -i rkyv -e all --target all)"
+          if [ -n "$rkyv_tree" ]; then
+            echo "rkyv is reachable; reassess RUSTSEC-2026-0235 in .cargo/audit.toml." >&2
+            printf '%s\n' "$rkyv_tree" >&2
+            exit 1
+          fi
+
       - name: Validate tag and Cargo version
         run: |
           set -euo pipefail
