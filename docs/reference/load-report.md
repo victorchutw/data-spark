@@ -643,7 +643,7 @@ destination itself states it and the report carries it verbatim.
 | --- | --- | --- |
 | `atomicity` | always | `atomic`, `best_effort`, or `not_applicable`. |
 | `strategy` | `atomicity` is not `not_applicable` | The named write strategy the destination used. |
-| `merge` | a merge load committed | How the surviving source records partitioned: `{"updated": M, "inserted": N}`. |
+| `merge` | a merge load committed | How the surviving source records are partitioned: `{"updated": M, "inserted": N}`. |
 
 | `atomicity` | Meaning |
 | --- | --- |
@@ -691,10 +691,10 @@ load mode, decides what this field says.
 
 A merge commits once, terminally, like a full refresh
 ([ADR-0059](../adr/0059-execute-duckdb-merge-as-a-staged-terminal-transaction.md)),
-and a committed merge additionally states how the surviving records
-partitioned — `updated` counts the surviving source records whose merge key
-tuple matched at least one existing destination record, `inserted` the
-unmatched remainder, and `updated + inserted` always equals
+and a committed merge additionally states how the surviving source records
+are partitioned: `updated` counts those whose merge key tuple matched at least
+one existing destination record, `inserted` the unmatched remainder, and
+`updated + inserted` always equals
 `row_counts.written`:
 
 ```json
