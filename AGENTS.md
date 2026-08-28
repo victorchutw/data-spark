@@ -16,6 +16,10 @@ This repo uses the default triage label vocabulary: `needs-triage`, `needs-info`
 
 Work starts from GitHub Issues, moves through issue state labels and PRs, and releases from `v`-prefixed SemVer tags to a single Linux x86_64 binary asset. See `docs/agents/gitops.md`.
 
+### Agent loop
+
+For issue implementation, PR review, CI repair, or Copilot review settling — including work resumed in a new session — read and run the bounded loop in `docs/agents/gitops.md` and its research basis in `docs/research/ai-agent-loop-engineering-2026-07-08.md`. Keep loop state in GitHub and git history; continue until required checks pass and every review thread is resolved, or a documented stop condition fires. Agents must not merge.
+
 ### Domain docs
 
 This is a multi-context repo. Start with root `CONTEXT-MAP.md`, then read the relevant context docs and ADRs. The current context is `CLI/core`. See `docs/agents/domain.md`.
