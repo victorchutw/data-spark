@@ -7,8 +7,8 @@ on:
     - cron: "23 3 * * 1"
   workflow_dispatch:
 
-# Serialize runs so a manual dispatch overlapping the weekly schedule
-# cannot race the issue dedup check and file a duplicate.
+# Serialize runs so a manual dispatch overlapping the weekly schedule cannot
+# race the read-compare-report sequence or file a duplicate tracking issue.
 concurrency:
   group: cargo-audit
   cancel-in-progress: false
@@ -40,68 +40,25 @@ jobs:
         run: cargo install --locked cargo-audit
 
       - name: Audit Cargo.lock
-        id: audit
         # Non-blocking sensor: advisory findings surface as a tracking
-        # issue in the next step and the run stays green, so an external
-        # advisory publication never reddens main or touches the merge
-        # gate (ADR-0069). Any other nonzero exit — advisory-database
-        # fetch failure, tool breakage — fails this step instead: a broken
-        # sensor should be a red run, not a misfiled findings issue. The
-        # Project-local acceptance policy lives in .cargo/audit.toml, so
-        # maintainers and this sensor reach the same verdict from the same
-        # command. ADR-0069 records the stale-rustls reachability analysis.
-        run: |
-          set -euo pipefail
+        # issue or comment in the next step and the run stays green, so an
+        # external advisory publication never reddens main or touches the
+        # merge gate (ADR-0069). Any other nonzero exit — advisory-database
+        # fetch failure, tool breakage, or disagreement between terminal and
+        # JSON results — fails this step instead: a broken sensor should be a
+        # red run, not a misfiled findings issue. The first scan updates the
+        # advisory database and preserves cargo-audit's native report; the
+        # second skips that update and extracts the exact vulnerability ID set.
+        run: >-
+          bash .github/scripts/cargo-audit-scan.sh
+          audit-report.txt audit-report.json vulnerability-ids.txt
 
-          exit_code=0
-          cargo audit 2>&1 | tee audit-report.txt || exit_code=$?
-
-          if [ "$exit_code" -eq 0 ]; then
-            echo "findings=false" >> "$GITHUB_OUTPUT"
-          elif grep -Eq 'error: [0-9]+ vulnerabilit' audit-report.txt; then
-            echo "findings=true" >> "$GITHUB_OUTPUT"
-          else
-            exit "$exit_code"
-          fi
-
-      - name: Open a tracking issue on new findings
-        if: steps.audit.outputs.findings == 'true'
+      - name: Update the findings tracking issue
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          # The exact title is the dedup key: a matching open issue means
-          # the findings are already tracked, and no duplicate is opened.
           ISSUE_TITLE: "cargo-audit sensor: new findings on Cargo.lock"
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          set -euo pipefail
-
-          existing=$(
-            gh issue list --state open --limit 100 --json number,title \
-              | jq -r --arg title "$ISSUE_TITLE" \
-                  '[.[] | select(.title == $title)] | first | .number // empty'
-          )
-
-          if [ -n "$existing" ]; then
-            echo "Findings already tracked in open issue #$existing; not opening a duplicate."
-            exit 0
-          fi
-
-          {
-            echo "The weekly cargo-audit sensor reported findings on \`Cargo.lock\` beyond the accepted ignore list."
-            echo
-            echo "Run: $RUN_URL"
-            echo
-            echo '```text'
-            cat audit-report.txt
-            echo '```'
-            echo
-            echo "Triage per ADR-0069: analyze reachability, then either accept the advisory with a recorded analysis and an ignore-list entry, or move down the fallback ladder (crates.io upgrade, maintainer-fork pinned rev, vendoring)."
-          } > issue-body.md
-
-          # Issues created with the workflow token do not fire
-          # issue-default-label.yml, so the state label is applied here.
-          gh issue create \
-            --title "$ISSUE_TITLE" \
-            --label needs-triage \
-            --body-file issue-body.md
+          AUDIT_REPORT_PATH: audit-report.txt
+          VULNERABILITY_IDS_PATH: vulnerability-ids.txt
+        run: bash .github/scripts/cargo-audit-sensor.sh
