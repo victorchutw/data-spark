@@ -150,8 +150,9 @@ upstream — the load will not choose for you.
 A merge key is a matching rule, not a uniqueness constraint on the
 destination. If the destination already contains several records with the
 same key tuple, one surviving source record matches every one of them.
-DuckDB replaces every matching destination record whole; there is no
-destination-side duplicate-key gate.
+Every matching destination record is replaced whole; there is no
+destination-side duplicate-key gate. The currently shipped DuckDB
+destination follows this contract.
 
 The report counts this from the source perspective: `updated` is the number
 of surviving source records that matched at least one destination record, not
