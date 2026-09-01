@@ -60,6 +60,10 @@ this repository's use of pull requests, and link their commit instead.
 
 ### Fixed
 
+- CSV fields declared or overridden as `float64` now reject text that parses to
+  a non-finite IEEE double as `type_coercion_failed` Rejected Records instead of
+  passing NaN or infinity to a destination
+  ([ADR-0063](docs/adr/0063-parse-declared-float64-text-finitely.md), [#129]).
 - `CONTEXT.md`'s Merge Load definition lagged the decided merge semantics
   ([ADR-0057](docs/adr/0057-land-merge-loads-on-duckdb-only-and-decline-elsewhere.md)):
   it said matched records are updated, where a merge replaces them whole,
@@ -410,4 +414,5 @@ one carried is listed under the stable release that followed — `0.1.0` and
 [#98]: https://github.com/victorchutw/data-spark/pull/98
 [#100]: https://github.com/victorchutw/data-spark/pull/100
 [#104]: https://github.com/victorchutw/data-spark/pull/104
+[#129]: https://github.com/victorchutw/data-spark/issues/129
 [#147]: https://github.com/victorchutw/data-spark/pull/147

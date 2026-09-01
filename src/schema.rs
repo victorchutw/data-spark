@@ -2829,7 +2829,9 @@ fn build_text_array(
                     Some(value) => builder.append_value(
                         value
                             .parse::<f64>()
-                            .map_err(|_| coercion_failure(column_index, value, "float64"))?,
+                            .ok()
+                            .filter(|value| value.is_finite())
+                            .ok_or_else(|| coercion_failure(column_index, value, "float64"))?,
                     ),
                     None => builder.append_null(),
                 }
@@ -3950,6 +3952,36 @@ mod tests {
     }
 
     // ---- Declared-type materialization (ADR-0042, ADR-0043, ADR-0044) ----
+
+    #[test]
+    fn build_text_array_rejects_non_finite_float64_text_and_materializes_finite_values() {
+        for value in ["NaN", "nan", "inf", "-inf", "Infinity", "iNfInItY", "1e400"] {
+            let parsed = value.parse::<f64>().expect("fixture parses as float64");
+            assert!(!parsed.is_finite(), "{value:?} parses as non-finite");
+
+            let error = build_text_array(FieldType::Float64, &[record(2, &[Some(value)])], 0)
+                .expect_err("non-finite float64 text rejected");
+            assert_eq!(error.code, "schema_coercion_failed", "{value:?}");
+        }
+
+        let array = build_text_array(
+            FieldType::Float64,
+            &[
+                record(2, &[Some("1.5")]),
+                record(3, &[Some("-0.0")]),
+                record(4, &[Some("1e300")]),
+            ],
+            0,
+        )
+        .expect("finite float64 text materializes");
+        let values = array
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("float64 array");
+        assert_eq!(values.value(0), 1.5);
+        assert_eq!(values.value(1).to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(values.value(2), 1e300);
+    }
 
     #[test]
     fn from_text_columns_materializes_declared_types_under_overrides() {
