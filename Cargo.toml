@@ -21,13 +21,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_yaml = "0.9"
 # SQL Server TDS client for the sqlserver connector. Pinned by full commit
-# SHA to the maintainer-controlled fork (ADR-0069's fork rung, activated by
-# #156): the published 0.12.3 sources plus one Numeric patch that accepts
-# scale 38 and describes fraction-only values at their real precision, so
-# `decimal(38,38)` loads. Same spike-proven feature set; the stale rustls
-# 0.21 stack is unchanged and stays accepted with the weekly cargo-audit
-# sensor carrying the ignore list. Return to crates.io once an upstream
-# release carries the fix.
+# SHA to the maintainer-controlled fork: the published 0.12.3 sources plus
+# one Numeric patch so `decimal(38,38)` loads (ADR-0069 fork rung, #156).
 tiberius = { git = "https://github.com/victorchutw/tiberius", rev = "65c1a32fbc8e9c16423a76a76cdb1a800b1c21fa", default-features = false, features = ["tds73", "rustls", "chrono"] }
 uuid = { version = "1.10", features = ["v4"] }
 

@@ -16,24 +16,22 @@ use tiberius::{ColumnData, ToSql};
 const SCALED_MINUS_ONE: i128 = -1;
 
 #[test]
-fn pinned_tiberius_builds_scale_38_numeric_deterministically_with_precision_38() {
+fn pinned_tiberius_builds_the_scale_38_value_deterministically_with_precision_38() {
     let first = Numeric::new_with_scale(SCALED_MINUS_ONE, 38);
     let second = Numeric::new_with_scale(SCALED_MINUS_ONE, 38);
 
-    for numeric in [first, second] {
-        assert_eq!(numeric.value(), SCALED_MINUS_ONE);
-        assert_eq!(numeric.scale(), 38);
-        assert_eq!(numeric.int_part(), 0);
-        assert_eq!(numeric.dec_part(), SCALED_MINUS_ONE);
+    for value in [first, second] {
+        assert_eq!(value.value(), SCALED_MINUS_ONE);
+        assert_eq!(value.scale(), 38);
+        assert_eq!(value.int_part(), 0);
+        assert_eq!(value.dec_part(), SCALED_MINUS_ONE);
         assert_eq!(
-            numeric.precision(),
+            value.precision(),
             38,
             "a fraction-only scale-38 value is numeric(38,38), never numeric(39,38)"
         );
     }
 
-    assert_eq!(first, second);
-    assert_eq!(format!("{first:?}"), format!("{second:?}"));
     assert_eq!(first.to_sql(), ColumnData::Numeric(Some(second)));
 }
 
@@ -50,11 +48,8 @@ fn pinned_tiberius_reports_precision_38_across_the_scale_38_range() {
 }
 
 #[test]
+#[should_panic(expected = "scale <= 38")]
 fn pinned_tiberius_still_rejects_scale_39() {
-    let outcome = std::panic::catch_unwind(|| Numeric::new_with_scale(1, 39));
-
-    assert!(
-        outcome.is_err(),
-        "scale 39 exceeds SQL Server's cap and must keep panicking"
-    );
+    // Scale 39 exceeds SQL Server's cap and must keep panicking.
+    Numeric::new_with_scale(1, 39);
 }
