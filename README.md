@@ -167,6 +167,9 @@ timings):
 
 ## Documentation
 
+[CONTRIBUTING.md](CONTRIBUTING.md) is the contributor home for build, format,
+lint, and test instructions, including the complete server-backed test suite.
+
 [examples/](examples/) holds small, self-contained, runnable examples — the four
 source and destination pairs, all three load modes, schema pinning and drift
 policies, structural transforms, declared types, rejected records, and chunked

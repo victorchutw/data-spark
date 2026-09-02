@@ -33,6 +33,10 @@ this repository's use of pull requests, and link their commit instead.
 
 ### Added
 
+- `CONTRIBUTING.md` provides build, format, lint, default-test, and
+  server-backed-test commands, including the local SQL Server container and
+  connection overrides ([ADR-0066](docs/adr/0066-test-server-backed-destinations-against-a-real-server-behind-an-ignore-gate.md),
+  [#154]).
 - The `sqlserver` destination block: the first network destination enters
   the load definition as pure Definition-phase surface — parsing, offline
   validation, and the environment credential reference. No connection is
@@ -416,3 +420,4 @@ one carried is listed under the stable release that followed — `0.1.0` and
 [#104]: https://github.com/victorchutw/data-spark/pull/104
 [#147]: https://github.com/victorchutw/data-spark/pull/147
 [#153]: https://github.com/victorchutw/data-spark/pull/153
+[#154]: https://github.com/victorchutw/data-spark/pull/154
