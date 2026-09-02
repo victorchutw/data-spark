@@ -74,7 +74,40 @@ When moving an external PR through triage, use the same labels with
 10. Merge only after the required `rust` and `copilot-reviewed` checks pass
     and every review conversation is resolved; the `main` branch ruleset
     enforces all three.
-11. Let GitHub close the issue through the `Closes #<issue-number>` reference.
+11. Follow "Merge authorization and post-merge cleanup" below. An agent stops
+    at merge-ready unless the maintainer authorizes that specific merge.
+12. Let GitHub close the issue through the `Closes #<issue-number>` reference.
+13. After GitHub reports the PR merged, return the checkout to a clean, current
+    `main` as described below, regardless of who performed the merge.
+
+## Merge authorization and post-merge cleanup
+
+An agent may merge a PR only after the maintainer explicitly authorizes that
+specific merge. Authorization may be an unambiguous maintainer instruction in
+the active agent session or a maintainer-authored comment or submitted review
+on that PR. Before merging, the agent must ensure the PR thread records the
+authorization; when it arrived in the agent session, add a comment recording
+that the maintainer authorized the agent to merge that PR. Authorization is
+single-use: it does not carry to another PR, permit bypassing a required check,
+or permit merging with an unresolved review conversation. Without that
+authorization, report the PR as merge-ready and stop.
+
+After any PR merge, require a clean worktree, then synchronize the primary
+checkout:
+
+```bash
+test -z "$(git status --porcelain)"
+git switch main
+git pull --ff-only origin main
+test -z "$(git status --porcelain)"
+git status --short --branch
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+```
+
+Cleanup is complete only when the worktree is clean, `main` tracks
+`origin/main` without ahead/behind divergence, and both revisions are equal. If
+the pull cannot fast-forward, stop and ask for explicit approval before moving
+the local `main` branch; never reset or rebase it automatically.
 
 ## Copilot code review
 
@@ -166,8 +199,9 @@ For agent-executable work, prefer this path:
    concept, requires credentials or production data, changes release automation,
    or repeats the same failing check three times.
 
-Agents may open draft PRs and respond to review comments, but must not merge PRs
-or cut releases.
+Agents may open draft PRs and respond to review comments. Merge authority and
+checkout cleanup follow "Merge authorization and post-merge cleanup" above;
+agents must not cut releases.
 
 ## Local checks
 
