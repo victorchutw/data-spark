@@ -83,17 +83,23 @@ When moving an external PR through triage, use the same labels with
 ## Merge authorization and post-merge cleanup
 
 An agent may merge a PR only after the maintainer explicitly authorizes that
-specific merge. Authorization is single-use: it does not carry to another PR,
-permit bypassing a required check, or permit merging with an unresolved review
-conversation. Without that authorization, report the PR as merge-ready and
-stop.
+specific merge. Authorization may be an unambiguous maintainer instruction in
+the active agent session or a maintainer-authored comment or submitted review
+on that PR. Before merging, the agent must ensure the PR thread records the
+authorization; when it arrived in the agent session, add a comment recording
+that the maintainer authorized the agent to merge that PR. Authorization is
+single-use: it does not carry to another PR, permit bypassing a required check,
+or permit merging with an unresolved review conversation. Without that
+authorization, report the PR as merge-ready and stop.
 
 After any PR merge, require a clean worktree, then synchronize the primary
 checkout:
 
 ```bash
+test -z "$(git status --porcelain)"
 git switch main
 git pull --ff-only origin main
+test -z "$(git status --porcelain)"
 git status --short --branch
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
 ```
