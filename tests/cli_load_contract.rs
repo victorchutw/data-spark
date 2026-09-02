@@ -6391,6 +6391,87 @@ schema:
 }
 
 #[test]
+fn csv_float64_override_rejects_non_finite_text_at_the_default_threshold() {
+    let work = TempDir::new().expect("tempdir");
+    let source_path = work.path().join("readings.csv");
+    fs::write(
+        &source_path,
+        "reading\nNaN\nnan\ninf\n-inf\nInfinity\niNfInItY\n1.5\n",
+    )
+    .expect("write source csv");
+
+    let destination_path = work.path().join("readings_dataset");
+    let definition_path = work.path().join("load.yml");
+    fs::write(
+        &definition_path,
+        format!(
+            r#"
+version: 1
+source:
+  connector: local_file
+  path: {}
+  format: csv
+destination:
+  connector: parquet
+  path: {}
+dataset: readings
+load_mode: full_refresh
+schema:
+  overrides:
+  - name: reading
+    type: float64
+"#,
+            source_path.display(),
+            destination_path.display()
+        ),
+    )
+    .expect("write load definition");
+
+    let artifacts_dir = work.path().join("artifacts");
+    Command::cargo_bin("data-spark")
+        .expect("binary")
+        .current_dir(work.path())
+        .arg("load")
+        .arg("--output-dir")
+        .arg(&artifacts_dir)
+        .arg(&definition_path)
+        .assert()
+        .failure();
+
+    let (_, report) = read_single_report(&artifacts_dir, "load writes one artifact directory");
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
+    assert_eq!(report["error_summary"]["code"], "reject_threshold_exceeded");
+    assert_eq!(
+        report["error_summary"]["message"],
+        "rejected 6 of 7 records, exceeding the reject threshold of 0"
+    );
+    assert_eq!(report["row_counts"]["source"], 7);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 6);
+    assert_eq!(report["rejected_records"]["count"], 6);
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+
+    let artifact_path = PathBuf::from(
+        report["rejected_records"]["artifact"]
+            .as_str()
+            .expect("artifact path"),
+    );
+    let rejected_lines = read_rejected_records(&artifact_path);
+    assert_eq!(rejected_lines.len(), 6);
+    for ((rejected, line), value) in rejected_lines
+        .iter()
+        .zip(2..)
+        .zip(["NaN", "nan", "inf", "-inf", "Infinity", "iNfInItY"])
+    {
+        assert_eq!(rejected["line"], line, "artifact line for {value:?}");
+        assert_eq!(rejected["code"], "type_coercion_failed");
+        assert_eq!(rejected["field"], "reading");
+        assert_eq!(rejected["record"], serde_json::json!({"reading": value}));
+    }
+}
+
+#[test]
 fn csv_declared_type_misfits_reject_records_naming_the_cause_within_the_threshold() {
     // The ADR-0043/0044 rejection menu end to end: each misfit becomes one
     // type_coercion_failed rejected record whose artifact line names the
