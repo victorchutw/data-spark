@@ -6439,6 +6439,8 @@ schema:
         .failure();
 
     let (_, report) = read_single_report(&artifacts_dir, "load writes one artifact directory");
+    assert_eq!(report["exit_status"], "failed");
+    assert_eq!(report["process_exit_code"], 1);
     assert_eq!(report["error_summary"]["code"], "reject_threshold_exceeded");
     assert_eq!(
         report["error_summary"]["message"],
@@ -6447,6 +6449,8 @@ schema:
     assert_eq!(report["row_counts"]["source"], 7);
     assert_eq!(report["row_counts"]["written"], 0);
     assert_eq!(report["row_counts"]["rejected"], 6);
+    assert_eq!(report["rejected_records"]["count"], 6);
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
 
     let artifact_path = PathBuf::from(
         report["rejected_records"]["artifact"]
