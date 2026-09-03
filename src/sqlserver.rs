@@ -6,9 +6,12 @@
 //! driver's representability caps: an over-long `NVARCHAR` value reaches
 //! the wire and fails there as a chunk write failure. The one value the
 //! encoder refuses itself is a timestamp outside the `DATETIME2` year
-//! range 0001–9999, because tiberius asserts on a pre-0001 day count
-//! instead of reporting it, and a panic is not the write failure ADR-0062
-//! assigns that sliver.
+//! range 0001–9999. The lower bound is forced — tiberius asserts on a
+//! pre-0001 day count instead of reporting it, and a panic is not the
+//! write failure ADR-0062 assigns that sliver; the upper bound is the
+//! same rule applied symmetrically, so the refused range is exactly the
+//! sliver ADR-0062 enumerates rather than the driver's own limit, and
+//! every out-of-range value fails with one message.
 
 use crate::LoadFailure;
 use arrow_array::{
@@ -21,6 +24,16 @@ use tiberius::numeric::Numeric;
 use tiberius::time::{Date, DateTime2, Time};
 use tiberius::{ColumnData, TokenRow};
 
+/// Every failure this module raises is a write-phase failure: the dataset
+/// schema and the load rules were honored, and the destination side could
+/// not take the shape or the value.
+fn write_failure(message: String) -> LoadFailure {
+    LoadFailure {
+        code: "destination_write_failed",
+        message,
+    }
+}
+
 /// Renders the created shape of a dataset schema (ADR-0062) as one
 /// `CREATE TABLE [schema].[table] (...)` statement.
 pub(crate) fn create_table_ddl(
@@ -29,14 +42,11 @@ pub(crate) fn create_table_ddl(
     table_name: &str,
 ) -> Result<String, LoadFailure> {
     if dataset.fields().is_empty() {
-        return Err(LoadFailure {
-            code: "destination_write_failed",
-            message: format!(
-                "cannot create SQL Server table {}.{}: the dataset schema has no fields",
-                quote_identifier(schema_name),
-                quote_identifier(table_name)
-            ),
-        });
+        return Err(write_failure(format!(
+            "cannot create SQL Server table {}.{}: the dataset schema has no fields",
+            quote_identifier(schema_name),
+            quote_identifier(table_name)
+        )));
     }
     let columns = dataset
         .fields()
@@ -85,7 +95,11 @@ fn quote_identifier(name: &str) -> String {
 /// fields must match one-to-one by exact name. Extra destination columns —
 /// the nullable, `IDENTITY`, or defaulted columns ADR-0065 admits — need
 /// the introspected column type to choose their placeholder, so they join
-/// the plan with the Accept Family slices.
+/// the plan with the Accept Family slices. The Accept Family validates an
+/// existing table's shape before a plan is built, listing every violation
+/// as `incompatible_destination_table`; a mismatch caught here is
+/// therefore an invariant breach between two already-validated shapes,
+/// and it fails loudly rather than being reported as table validation.
 #[derive(Debug)]
 pub(crate) struct BulkRowPlan {
     dataset: Schema,
@@ -108,20 +122,16 @@ impl BulkRowPlan {
     /// dataset field must have a table column; anything else is a write
     /// failure naming the offending column, never a silently partial row.
     pub(crate) fn new(dataset: &Schema, table_columns: &[String]) -> Result<Self, LoadFailure> {
-        let mismatch = |message: String| LoadFailure {
-            code: "destination_write_failed",
-            message,
-        };
         let mut planned = vec![false; dataset.fields().len()];
         let mut columns = Vec::with_capacity(table_columns.len());
         for name in table_columns {
             let field_index = dataset.index_of(name).map_err(|_| {
-                mismatch(format!(
+                write_failure(format!(
                     "SQL Server table column {name} has no dataset field of that name"
                 ))
             })?;
             if std::mem::replace(&mut planned[field_index], true) {
-                return Err(mismatch(format!(
+                return Err(write_failure(format!(
                     "SQL Server table column {name} is listed more than once"
                 )));
             }
@@ -132,7 +142,7 @@ impl BulkRowPlan {
             });
         }
         if let Some(index) = planned.iter().position(|planned| !planned) {
-            return Err(mismatch(format!(
+            return Err(write_failure(format!(
                 "dataset field {} has no SQL Server table column",
                 dataset.field(index).name()
             )));
@@ -150,12 +160,11 @@ impl BulkRowPlan {
     /// any row is produced.
     pub(crate) fn rows<'a>(&self, batch: &'a RecordBatch) -> Result<BulkRows<'a>, LoadFailure> {
         if batch.schema().fields() != self.dataset.fields() {
-            return Err(LoadFailure {
-                code: "destination_write_failed",
-                message: "chunk schema differs from the dataset schema the SQL Server bulk rows \
-                          were planned for"
+            return Err(write_failure(
+                "chunk schema differs from the dataset schema the SQL Server bulk rows were \
+                 planned for"
                     .to_string(),
-            });
+            ));
         }
         let readers = self
             .columns
@@ -232,17 +241,13 @@ impl<'a> ColumnReader<'a> {
             column: &PlannedColumn,
             array: &'a ArrayRef,
         ) -> Result<&'a T, LoadFailure> {
-            array
-                .as_any()
-                .downcast_ref::<T>()
-                .ok_or_else(|| LoadFailure {
-                    code: "destination_write_failed",
-                    message: format!(
-                        "chunk column {} is not the {} array its dataset field materializes as",
-                        column.name,
-                        column.column_type.ddl()
-                    ),
-                })
+            array.as_any().downcast_ref::<T>().ok_or_else(|| {
+                write_failure(format!(
+                    "chunk column {} is not the {} array its dataset field materializes as",
+                    column.name,
+                    column.column_type.ddl()
+                ))
+            })
         }
         Ok(match column.column_type {
             ColumnType::BigInt => ColumnReader::BigInt(typed(column, array)?),
@@ -317,7 +322,10 @@ const LAST_DATETIME2_DAY: i64 = 3_652_058;
 /// writes the value as-is with no rescaling. `None` when the day lies
 /// outside 0001-01-01..=9999-12-31, the `DATETIME2` range: SQL Server
 /// cannot store such a value, and tiberius asserts on a negative day
-/// count rather than reporting it, so the range is checked here.
+/// count rather than reporting it, so the whole range is checked here —
+/// the upper bound by the same rule, although the driver itself would
+/// only assert from day 2^24 (year 45,941) on and let the server reject
+/// the years between.
 fn datetime2_from_micros(micros_since_epoch: i64) -> Option<DateTime2> {
     let day =
         micros_since_epoch.div_euclid(MICROS_PER_DAY) + DAYS_FROM_DATETIME2_ORIGIN_TO_UNIX_EPOCH;
@@ -333,18 +341,32 @@ fn datetime2_from_micros(micros_since_epoch: i64) -> Option<DateTime2> {
 
 /// The write failure for a timestamp outside the `DATETIME2` range: the
 /// second representability sliver of ADR-0062, a write failure rather than
-/// a Rejected Record because the record satisfies the dataset schema.
+/// a Rejected Record because the record satisfies the dataset schema. The
+/// value is spelled in the dataset's own timestamp notation with all six
+/// fractional digits; a value beyond what a calendar can even name falls
+/// back to its raw microsecond count.
 fn datetime2_out_of_range(column: &str, record: usize, micros_since_epoch: i64) -> LoadFailure {
+    use chrono::{Datelike, Timelike};
+
     let rendered = chrono::DateTime::from_timestamp_micros(micros_since_epoch)
-        .map(|instant| format!("{:?}", instant.naive_utc()))
+        .map(|instant| {
+            let value = instant.naive_utc();
+            format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:06}",
+                value.year(),
+                value.month(),
+                value.day(),
+                value.hour(),
+                value.minute(),
+                value.second(),
+                value.nanosecond() / 1_000
+            )
+        })
         .unwrap_or_else(|| format!("{micros_since_epoch} microseconds since 1970-01-01"));
-    LoadFailure {
-        code: "destination_write_failed",
-        message: format!(
-            "record {record} of the chunk holds timestamp {rendered} in dataset field {column}, \
-             outside the SQL Server DATETIME2 range 0001-01-01 to 9999-12-31"
-        ),
-    }
+    write_failure(format!(
+        "record {record} of the chunk holds timestamp {rendered} in dataset field {column}, \
+         outside the SQL Server DATETIME2 range 0001-01-01 to 9999-12-31"
+    ))
 }
 
 /// The exact-fit SQL Server column type of one dataset field type
@@ -371,13 +393,12 @@ impl ColumnType {
     /// contract breach surfaced as a write failure naming the field rather
     /// than a silent approximate mapping.
     fn from_arrow(field: &Field) -> Result<ColumnType, LoadFailure> {
-        let unmapped = || LoadFailure {
-            code: "destination_write_failed",
-            message: format!(
+        let unmapped = || {
+            write_failure(format!(
                 "dataset field {} has no SQL Server column type mapping: {}",
                 field.name(),
                 field.data_type()
-            ),
+            ))
         };
         match field.data_type() {
             DataType::Int64 => Ok(ColumnType::BigInt),
@@ -980,13 +1001,13 @@ mod tests {
         let cases = [
             (
                 micros(0, 12, 31, 23, 0, 0, 0),
-                "record 1 of the chunk holds timestamp 0000-12-31T23:00:00 in dataset field t, \
-                 outside the SQL Server DATETIME2 range 0001-01-01 to 9999-12-31",
+                "record 1 of the chunk holds timestamp 0000-12-31T23:00:00.000000 in dataset \
+                 field t, outside the SQL Server DATETIME2 range 0001-01-01 to 9999-12-31",
             ),
             (
-                micros(10_000, 1, 1, 0, 0, 0, 0),
-                "record 1 of the chunk holds timestamp +10000-01-01T00:00:00 in dataset field t, \
-                 outside the SQL Server DATETIME2 range 0001-01-01 to 9999-12-31",
+                micros(10_000, 1, 1, 0, 0, 0, 1),
+                "record 1 of the chunk holds timestamp 10000-01-01T00:00:00.000001 in dataset \
+                 field t, outside the SQL Server DATETIME2 range 0001-01-01 to 9999-12-31",
             ),
             (
                 i64::MIN,
