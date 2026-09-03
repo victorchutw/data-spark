@@ -222,6 +222,10 @@ _Avoid_: Good row, valid row, kept record
 A temporary data object prepared so a destination can load records through its native batch loading path.
 _Avoid_: Temp file, intermediate file, upload
 
+**Created Shape**:
+The destination table a load creates for a dataset schema: one column per dataset field, in field order, each with the exact-fit destination column type and the field's nullability.
+_Avoid_: Generated DDL, table template, default table
+
 **Accept Family**:
 The set of existing destination column shapes a dataset field may write into without silent value degradation, plus explicitly opted-in exceptions.
 _Avoid_: Compatible types, type whitelist, column tolerance
