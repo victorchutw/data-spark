@@ -181,11 +181,12 @@ impl DestinationWriter for FullRefreshWriter {
                 self.prepare(&mut session, batch).await?;
             }
             let Session { client, plan, .. } = &mut *session;
-            let rows = plan.as_ref().expect("prepared plan").rows(batch)?;
+            let plan = plan.as_ref().expect("prepared plan");
+            let rows = plan.rows(batch)?;
             if batch.num_rows() != 0 {
                 let name = self.table_name();
                 let mut request = client
-                    .bulk_insert(&name)
+                    .bulk_insert_with_columns(&name, &plan.column_names())
                     .await
                     .map_err(|error| failure("bulk begin", error))?;
                 for row in rows {

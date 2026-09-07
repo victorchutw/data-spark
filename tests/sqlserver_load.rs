@@ -250,13 +250,27 @@ fn unrepresentable_text_rolls_back_all_chunks_without_rejecting_records() {
 #[ignore = "needs SQL Server"]
 fn full_refresh_supplies_extra_nullable_default_and_identity_columns() {
     let mut server = Server::new();
-    server.query("CREATE TABLE $table (sequence INT IDENTITY NOT NULL, name NVARCHAR(MAX) NULL, optional INT NULL, defaulted INT NOT NULL DEFAULT 42)");
+    server.query("CREATE TABLE $table (sequence INT IDENTITY NOT NULL, name NVARCHAR(MAX) NULL, optional INT NULL, defaulted INT NOT NULL DEFAULT 42, money_value MONEY NULL, small_money SMALLMONEY NULL, variant SQL_VARIANT NULL)");
     server.load(json!([{ "name": "Ada" }]), "", 0);
     let rows = server.query("SELECT sequence, name, optional, defaulted FROM $table");
     assert_eq!(rows[0].get::<i32, _>(0), Some(1));
     assert_eq!(rows[0].get::<&str, _>(1), Some("Ada"));
     assert_eq!(rows[0].get::<i32, _>(2), None);
     assert_eq!(rows[0].get::<i32, _>(3), Some(42));
+    let rows = server.query("SELECT COUNT(*) FROM $table WHERE money_value IS NULL AND small_money IS NULL AND variant IS NULL");
+    assert_eq!(rows[0].get::<i32, _>(0), Some(1));
+    let report = server.load(
+        json!([{ "name": "replacement" }, { "name": "x".repeat(32768) }]),
+        "execution:\n  chunk_rows: 1\n",
+        1,
+    );
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert_eq!(report["row_counts"]["written"], 0);
+    let rows = server.query("SELECT sequence, name, defaulted FROM $table");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<i32, _>(0), Some(1));
+    assert_eq!(rows[0].get::<&str, _>(1), Some("Ada"));
+    assert_eq!(rows[0].get::<i32, _>(2), Some(42));
 }
 
 #[test]

@@ -22,8 +22,9 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_yaml = "0.9"
 # SQL Server TDS client for the sqlserver connector. Pinned by full commit
 # SHA to the maintainer-controlled fork: the published 0.12.3 sources plus
-# one Numeric patch so `decimal(38,38)` loads (ADR-0069 fork rung, #156).
-tiberius = { git = "https://github.com/victorchutw/tiberius", rev = "65c1a32fbc8e9c16423a76a76cdb1a800b1c21fa", default-features = false, features = ["tds73", "rustls", "chrono"] }
+# Numeric scale-38 and explicit bulk column selection patches
+# (ADR-0069 fork rung, #156/#161).
+tiberius = { git = "https://github.com/victorchutw/tiberius", rev = "cd0c63fd4dd891bc7f09a08ec5844d422a3c736b", default-features = false, features = ["tds73", "rustls", "chrono"] }
 tokio = { version = "1", features = ["rt", "net", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 uuid = { version = "1.10", features = ["v4"] }

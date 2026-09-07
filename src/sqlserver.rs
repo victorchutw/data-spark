@@ -86,18 +86,10 @@ fn quote_identifier(name: &str) -> String {
     format!("[{}]", name.replace(']', "]]"))
 }
 
-/// How one chunk of a dataset becomes tiberius bulk rows for one destination
-/// table: every table column, in table column order, reading exactly one
-/// dataset field. The order is load-bearing — the TDS bulk path carries no
-/// column list, so rows ride in the order the server's metadata states, and
-/// same-typed columns in the wrong order would land transposed without an
-/// error (#115). A plan is built once per write session and encodes every
-/// chunk of the session through [`BulkRowPlan::rows`].
-///
-/// `new` plans the created shape; `for_table` extends that plan with the
-/// typed placeholders needed by extra destination columns. Existing tables
-/// must pass the Accept Family before planning, so mismatches here indicate
-/// an invariant breach and fail as destination write failures.
+/// Encodes mapped columns in destination catalog order. The explicit bulk
+/// column list and each row use this same plan, so extra destination columns
+/// are omitted and SQL Server supplies their defaults, NULLs, or identities.
+/// Existing tables must pass the Accept Family before planning.
 #[derive(Debug)]
 pub(crate) struct BulkRowPlan {
     dataset: Schema,
@@ -109,8 +101,7 @@ pub(crate) struct BulkRowPlan {
 #[derive(Debug)]
 struct PlannedColumn {
     name: String,
-    field_index: Option<usize>,
-    placeholder: Option<ColumnData<'static>>,
+    field_index: usize,
     wire_type: Option<(String, u8)>,
     column_type: ColumnType,
 }
@@ -137,8 +128,7 @@ impl BulkRowPlan {
             }
             columns.push(PlannedColumn {
                 name: name.clone(),
-                field_index: Some(field_index),
-                placeholder: None,
+                field_index,
                 wire_type: None,
                 column_type: ColumnType::from_arrow(dataset.field(field_index))?,
             });
@@ -155,8 +145,7 @@ impl BulkRowPlan {
         })
     }
 
-    /// Adds the extra table columns admitted by the Accept Family, carrying
-    /// typed NULLs for defaults and nullable columns in catalog order.
+    /// Plans only mapped table columns and their accepted wire types.
     pub(crate) fn for_table(
         dataset: &Schema,
         shape: &table::TableShape,
@@ -165,33 +154,23 @@ impl BulkRowPlan {
             .columns
             .iter()
             .filter(|column| dataset.index_of(&column.name).is_ok())
+            .collect::<Vec<_>>();
+        let names = mapped
+            .iter()
             .map(|column| column.name.clone())
             .collect::<Vec<_>>();
-        let mut plan = Self::new(dataset, &mapped)?;
-        let mut mapped = plan.columns.into_iter();
-        plan.columns = shape
-            .columns
-            .iter()
-            // Tiberius excludes IDENTITY columns as non-updateable in its
-            // SELECT TOP 0 metadata. They must also be absent from our rows.
-            .filter(|column| !column.identity)
-            .map(|column| {
-                if dataset.index_of(&column.name).is_ok() {
-                    let mut planned = mapped.next().expect("mapped column");
-                    planned.wire_type = Some((column.type_name.clone(), column.scale));
-                    Ok(planned)
-                } else {
-                    Ok(PlannedColumn {
-                        name: column.name.clone(),
-                        field_index: None,
-                        column_type: ColumnType::BigInt,
-                        placeholder: Some(null_placeholder(column)?),
-                        wire_type: None,
-                    })
-                }
-            })
-            .collect::<Result<_, LoadFailure>>()?;
+        let mut plan = Self::new(dataset, &names)?;
+        for (planned, column) in plan.columns.iter_mut().zip(mapped) {
+            planned.wire_type = Some((column.type_name.clone(), column.scale));
+        }
         Ok(plan)
+    }
+
+    pub(crate) fn column_names(&self) -> Vec<&str> {
+        self.columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect()
     }
 
     /// Encodes one chunk as bulk rows: one [`TokenRow`] per record, in
@@ -210,25 +189,17 @@ impl BulkRowPlan {
         let readers = self
             .columns
             .iter()
-            .map(|column| match column.field_index {
-                Some(index) => {
-                    let reader = ColumnReader::new(column, batch.column(index))?;
-                    Ok(match &column.wire_type {
-                        Some((type_name, scale)) => ColumnReader::Adapted {
-                            reader: Box::new(reader),
-                            name: column.name.clone(),
-                            type_name: type_name.clone(),
-                            scale: *scale,
-                        },
-                        None => reader,
-                    })
-                }
-                None => Ok(ColumnReader::Placeholder(
-                    column
-                        .placeholder
-                        .clone()
-                        .expect("extra column placeholder"),
-                )),
+            .map(|column| {
+                let reader = ColumnReader::new(column, batch.column(column.field_index))?;
+                Ok(match &column.wire_type {
+                    Some((type_name, scale)) => ColumnReader::Adapted {
+                        reader: Box::new(reader),
+                        name: column.name.clone(),
+                        type_name: type_name.clone(),
+                        scale: *scale,
+                    },
+                    None => reader,
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(BulkRows {
@@ -276,6 +247,10 @@ fn adapt_value<'a>(
         (ColumnData::DateTime2(value), "datetime") => ColumnData::DateTime(
             value
                 .map(|value| {
+                    // DATETIME uses 300 ticks/second (25,920,000/day).
+                    // DATETIME2 day offsets are from 0001-01-01: 1753-01-01
+                    // is 639,905, 1900-01-01 is 693,595, and 9999-12-31
+                    // is 3,652,058. DATETIME uses the 1900 epoch.
                     let ticks = (value.time().increments() * 300 + 500_000) / 1_000_000;
                     let day = value.date().days() + (ticks / 25_920_000) as u32;
                     if !(639_905..=3_652_058).contains(&day) {
@@ -306,35 +281,6 @@ fn adapt_value<'a>(
                 .transpose()?,
         ),
         (value, _) => value,
-    })
-}
-
-fn null_placeholder(column: &table::TableColumn) -> Result<ColumnData<'static>, LoadFailure> {
-    Ok(match column.type_name.as_str() {
-        "bigint" => ColumnData::I64(None),
-        "int" => ColumnData::I32(None),
-        "smallint" => ColumnData::I16(None),
-        "tinyint" => ColumnData::U8(None),
-        "bit" => ColumnData::Bit(None),
-        "float" if column.precision == 53 => ColumnData::F64(None),
-        "float" | "real" => ColumnData::F32(None),
-        "nvarchar" | "nchar" | "varchar" | "char" | "ntext" | "text" => ColumnData::String(None),
-        "decimal" | "numeric" => ColumnData::Numeric(None),
-        "datetime2" => ColumnData::DateTime2(None),
-        "datetime" => ColumnData::DateTime(None),
-        "smalldatetime" => ColumnData::SmallDateTime(None),
-        "date" => ColumnData::Date(None),
-        "time" => ColumnData::Time(None),
-        "datetimeoffset" => ColumnData::DateTimeOffset(None),
-        "uniqueidentifier" => ColumnData::Guid(None),
-        "binary" | "varbinary" | "image" => ColumnData::Binary(None),
-        "xml" => ColumnData::Xml(None),
-        name => {
-            return Err(write_failure(format!(
-                "SQL Server extra column {} has no bulk placeholder for {name}",
-                column.name
-            )))
-        }
     })
 }
 
@@ -386,7 +332,6 @@ enum ColumnReader<'a> {
         type_name: String,
         scale: u8,
     },
-    Placeholder(ColumnData<'static>),
     BigInt(&'a Int64Array),
     Float53(&'a Float64Array),
     Bit(&'a BooleanArray),
@@ -442,7 +387,6 @@ impl<'a> ColumnReader<'a> {
                 type_name,
                 scale,
             } => adapt_value(reader.value(record)?, name, type_name, *scale)?,
-            ColumnReader::Placeholder(value) => value.clone(),
             &ColumnReader::BigInt(array) => {
                 ColumnData::I64(array.is_valid(record).then(|| array.value(record)))
             }
@@ -1467,7 +1411,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_table_plan_orders_mapped_and_extra_nullable_columns_and_omits_identity() {
+    fn existing_table_plan_omits_all_extra_columns() {
         let dataset = Schema::new(vec![Field::new("name", DataType::Utf8, false)]);
         let col = |name: &str, type_name: &str, identity| table::TableColumn {
             name: name.into(),
@@ -1483,18 +1427,18 @@ mod tests {
             columns: vec![
                 col("sequence", "int", true),
                 col("optional", "int", false),
+                col("money", "money", false),
+                col("variant", "sql_variant", false),
                 col("name", "nvarchar", false),
             ],
         };
         let plan = BulkRowPlan::for_table(&dataset, &shape).unwrap();
+        assert_eq!(plan.column_names(), ["name"]);
         let batch = RecordBatch::try_new(
             Arc::new(dataset),
             vec![Arc::new(StringArray::from(vec!["Ada"]))],
         )
         .unwrap();
-        assert_eq!(
-            rows_of(&plan, &batch),
-            vec![vec![ColumnData::I32(None), text("Ada")]]
-        );
+        assert_eq!(rows_of(&plan, &batch), vec![vec![text("Ada")]]);
     }
 }
