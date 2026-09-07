@@ -9631,8 +9631,8 @@ fn minimal_sqlserver_destination_block() -> String {
 /// credential environment variable set to `password` (removed when `None`)
 /// on the child process, and returns the stdout, the raw report text, and
 /// the parsed report. `definition_tail` is the definition after the block —
-/// the `dataset` and `load_mode` lines. Every sqlserver load in this slice
-/// fails — no load mode is supported yet — so the helper asserts failure.
+/// the `dataset` and `load_mode` lines. These offline definition checks
+/// fail before a connection is opened, so the helper asserts failure.
 /// The source file is real, proving the failures fire before it is ever
 /// read.
 fn run_sqlserver_load_failure(
@@ -9694,8 +9694,8 @@ fn assert_sqlserver_pre_write_posture(report: &Value) {
 }
 
 #[test]
-fn sqlserver_full_block_echoes_verbatim_and_declines_merge_before_any_work() {
-    // The complete block echoes verbatim even when the mode is declined.
+fn sqlserver_full_block_echoes_verbatim_and_rejects_invalid_merge_before_any_work() {
+    // The complete block echoes verbatim even when the merge configuration is invalid.
     let destination_block = format!(
         "destination:\n\
          \x20 connector: sqlserver\n\
@@ -9711,24 +9711,11 @@ fn sqlserver_full_block_echoes_verbatim_and_declines_merge_before_any_work() {
     );
     let (stdout, report_text, report) = run_sqlserver_load_failure(
         &destination_block,
-        "dataset: customers\nload_mode: merge\nmerge:\n  keys: [id]\n",
+        "dataset: customers\nload_mode: merge\nmerge:\n  keys: [id, id]\n",
         Some(SQLSERVER_PASSWORD_SENTINEL),
     );
 
-    assert_eq!(
-        report["error_summary"]["code"],
-        "unsupported_load_mode_for_destination"
-    );
-    let message = report["error_summary"]["message"]
-        .as_str()
-        .expect("error message");
-    assert_eq!(
-        message,
-        "sqlserver destination does not support load mode: merge \
-         (supported load modes: full_refresh, append)"
-    );
-    assert!(stdout.contains("supported load modes: full_refresh"));
-
+    assert_eq!(report["error_summary"]["code"], "invalid_merge_config");
     // The block is echoed exactly as written, key for key.
     assert_eq!(
         report["destination_summary"],
@@ -9762,24 +9749,17 @@ fn sqlserver_full_block_echoes_verbatim_and_declines_merge_before_any_work() {
 }
 
 #[test]
-fn sqlserver_minimal_block_echoes_absent_keys_as_null_and_declines_merge() {
+fn sqlserver_minimal_block_echoes_absent_keys_as_null_and_rejects_invalid_merge() {
     // AC1: defaulted-absent keys follow the existing destination_summary
     // convention — echoed as null, like source.format — while the resolved
     // defaults themselves are pinned by the unit tests.
     let (stdout, report_text, report) = run_sqlserver_load_failure(
         &minimal_sqlserver_destination_block(),
-        "dataset: customers\nload_mode: merge\nmerge:\n  keys: [id]\n",
+        "dataset: customers\nload_mode: merge\nmerge:\n  keys: [id, id]\n",
         Some(SQLSERVER_PASSWORD_SENTINEL),
     );
 
-    assert_eq!(
-        report["error_summary"]["code"],
-        "unsupported_load_mode_for_destination"
-    );
-    assert!(report["error_summary"]["message"]
-        .as_str()
-        .expect("error message")
-        .contains("does not support load mode: merge"));
+    assert_eq!(report["error_summary"]["code"], "invalid_merge_config");
     assert_eq!(
         report["destination_summary"],
         serde_json::json!({
