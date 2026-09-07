@@ -16,8 +16,8 @@
 //! write facts ([`DestinationWrite`]) so the orchestrator never branches on
 //! connector identity. The load mode is parsed once into [`LoadMode`] at the
 //! session boundary. `local_file`, `parquet`, and `duckdb` are the first
-//! connectors, and `sqlserver` enters as Definition-phase surface — offline
-//! block validation with every load mode still declined (ADR-0060);
+//! connectors; `sqlserver` validates its block offline (ADR-0060) and
+//! supports object-preserving transactional full refresh (ADR-0064);
 //! everything else here is private.
 
 use crate::rejection::{RejectedRecord, RejectionSink};
@@ -1945,22 +1945,18 @@ fn duckdb_schema_mismatch(table: &DuckDbTable, operation: &'static str) -> LoadF
 /// the Definition phase never opens a connection — so connectivity,
 /// authentication, and TLS failures stay write-phase facts for the slices
 /// that write.
-// The write slices (ADR-0064) consume the resolved address; until the first
-// sqlserver session exists, only `password_env` is read outside tests, and
-// the remaining fields would trip dead_code in non-test builds. Drop the
-// attribute with the first sqlserver write session.
-#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone)]
 pub(crate) struct SqlServerConfig {
-    host: String,
-    port: u16,
-    database: String,
-    schema: String,
-    user: String,
-    password_env: String,
-    encryption: SqlServerEncryption,
-    trust_server_certificate: bool,
-    accept_datetime_rounding: bool,
-    dataset: String,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) database: String,
+    pub(crate) schema: String,
+    pub(crate) user: String,
+    pub(crate) password_env: String,
+    pub(crate) encryption: SqlServerEncryption,
+    pub(crate) trust_server_certificate: bool,
+    pub(crate) accept_datetime_rounding: bool,
+    pub(crate) dataset: String,
 }
 
 /// The two encryption postures of ADR-0060: `required` — the secure default —
@@ -2089,19 +2085,10 @@ fn resolve_credential_reference(password_env: &str) -> Result<(), LoadFailure> {
     }
 }
 
-/// The SQL Server destination (ADR-0060): in this slice, pure
-/// Definition-phase surface — the block is validated offline and echoed, and
-/// no load mode is supported yet. The write strategies land mode by mode
-/// (ADR-0064), widening [`Destination::supported_load_modes`] as they do, so
-/// until then every load declines through [`Destination::validate_mode`]
-/// before any connection could exist.
+/// SQL Server full refresh preserves the destination table object (ADR-0064).
 struct SqlServerDestination {
-    // Held for the write slices (ADR-0064); no shipped path reads it yet.
-    #[allow(dead_code)]
     config: SqlServerConfig,
 }
-
-const NO_LOAD_MODES: &[LoadMode] = &[];
 
 impl Destination for SqlServerDestination {
     fn connector_name(&self) -> &'static str {
@@ -2109,15 +2096,18 @@ impl Destination for SqlServerDestination {
     }
 
     fn supported_load_modes(&self) -> &'static [LoadMode] {
-        NO_LOAD_MODES
+        &[LoadMode::FullRefresh]
+    }
+
+    fn parallelism_limit(&self, _mode: LoadMode) -> NonZeroU64 {
+        NonZeroU64::MIN
     }
 
     fn begin(&self, mode: LoadMode) -> Result<Box<dyn DestinationWriter>, DestinationWriteFailure> {
-        // Every mode is declined until the first write slice widens the
-        // list: the orchestrator's validate_mode call fails the load before
-        // begin, and a directly-driven session reports the same declination.
         self.validate_mode(mode)?;
-        unreachable!("sqlserver validate_mode declines every load mode");
+        Ok(Box::new(
+            crate::sqlserver::session::FullRefreshWriter::begin(self.config.clone())?,
+        ))
     }
 }
 
@@ -3012,13 +3002,17 @@ mod tests {
     }
 
     #[test]
-    fn sql_server_destination_declines_every_load_mode_with_a_readable_message() {
+    fn sql_server_destination_supports_only_full_refresh_and_declares_serial_parallelism() {
         let config = SqlServerConfig::from_definition(&sqlserver_definition(), Some("customers"))
             .expect("valid sqlserver block resolves");
         let destination = SqlServerDestination { config };
 
-        assert!(destination.supported_load_modes().is_empty());
-        for mode in [LoadMode::FullRefresh, LoadMode::Append, LoadMode::Merge] {
+        assert!(destination.supported_load_modes() == [LoadMode::FullRefresh]);
+        assert!(destination.validate_mode(LoadMode::FullRefresh).is_ok());
+        for mode in ALL_LOAD_MODES {
+            assert_eq!(destination.parallelism_limit(*mode).get(), 1);
+        }
+        for mode in [LoadMode::Append, LoadMode::Merge] {
             let error = destination
                 .validate_mode(mode)
                 .expect_err("every mode declined");
@@ -3027,7 +3021,7 @@ mod tests {
                 error.message,
                 format!(
                     "sqlserver destination does not support load mode: {} \
-                     (no load modes are supported for this destination yet)",
+                     (supported load modes: full_refresh)",
                     mode.as_str()
                 )
             );

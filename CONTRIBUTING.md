@@ -21,9 +21,8 @@ cargo clippy --locked --all-targets -- -D warnings
 
 The default `cargo test --locked` command does not require SQL Server. Tests
 that open a live TDS connection carry `#[ignore = "needs SQL Server"]` and
-appear in Cargo's `ignored` count; while no such tests exist, that count is
-zero. The `#[ignore]` attribute is reserved for tests that need a live server,
-so all other tests remain in the default suite.
+appear in Cargo's `ignored` count. The `#[ignore]` attribute is reserved for
+tests that need a live server, so all other tests remain in the default suite.
 
 Run the complete suite, including server-backed tests, with:
 

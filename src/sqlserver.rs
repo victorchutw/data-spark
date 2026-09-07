@@ -1,8 +1,8 @@
 //! The SQL Server type mapping (ADR-0062): the created shape a dataset
 //! schema takes as a `CREATE TABLE` statement ([`create_table_ddl`]), and
 //! the encoding of one chunk's records into the tiberius bulk rows every
-//! live load mode consumes ([`BulkRowPlan`], ADR-0064). Pure and offline —
-//! nothing here opens a connection, and nothing here preflights the
+//! live load mode consumes ([`BulkRowPlan`], ADR-0064). The mapping stays
+//! offline; [`session`] owns the connection. Nothing here preflights the
 //! driver's representability caps: an over-long `NVARCHAR` value reaches
 //! the wire and fails there as a chunk write failure. The one value the
 //! encoder refuses itself is a timestamp outside the `DATETIME2` year
@@ -13,6 +13,7 @@
 //! sliver ADR-0062 enumerates rather than the driver's own limit, and
 //! every out-of-range value fails with one message.
 
+pub(crate) mod session;
 pub(crate) mod table;
 
 use crate::LoadFailure;
@@ -93,15 +94,10 @@ fn quote_identifier(name: &str) -> String {
 /// error (#115). A plan is built once per write session and encodes every
 /// chunk of the session through [`BulkRowPlan::rows`].
 ///
-/// This slice plans full-schema rows: the table columns and the dataset
-/// fields must match one-to-one by exact name. Extra destination columns —
-/// the nullable, `IDENTITY`, or defaulted columns ADR-0065 admits — need
-/// the introspected column type to choose their placeholder, so they join
-/// the plan with the Accept Family slices. The Accept Family validates an
-/// existing table's shape before a plan is built, listing every violation
-/// as `incompatible_destination_table`; a mismatch caught here is
-/// therefore an invariant breach between two already-validated shapes,
-/// and it fails loudly rather than being reported as table validation.
+/// `new` plans the created shape; `for_table` extends that plan with the
+/// typed placeholders needed by extra destination columns. Existing tables
+/// must pass the Accept Family before planning, so mismatches here indicate
+/// an invariant breach and fail as destination write failures.
 #[derive(Debug)]
 pub(crate) struct BulkRowPlan {
     dataset: Schema,
@@ -113,7 +109,9 @@ pub(crate) struct BulkRowPlan {
 #[derive(Debug)]
 struct PlannedColumn {
     name: String,
-    field_index: usize,
+    field_index: Option<usize>,
+    placeholder: Option<ColumnData<'static>>,
+    wire_type: Option<(String, u8)>,
     column_type: ColumnType,
 }
 
@@ -139,7 +137,9 @@ impl BulkRowPlan {
             }
             columns.push(PlannedColumn {
                 name: name.clone(),
-                field_index,
+                field_index: Some(field_index),
+                placeholder: None,
+                wire_type: None,
                 column_type: ColumnType::from_arrow(dataset.field(field_index))?,
             });
         }
@@ -153,6 +153,45 @@ impl BulkRowPlan {
             dataset: dataset.clone(),
             columns,
         })
+    }
+
+    /// Adds the extra table columns admitted by the Accept Family, carrying
+    /// typed NULLs for defaults and nullable columns in catalog order.
+    pub(crate) fn for_table(
+        dataset: &Schema,
+        shape: &table::TableShape,
+    ) -> Result<Self, LoadFailure> {
+        let mapped = shape
+            .columns
+            .iter()
+            .filter(|column| dataset.index_of(&column.name).is_ok())
+            .map(|column| column.name.clone())
+            .collect::<Vec<_>>();
+        let mut plan = Self::new(dataset, &mapped)?;
+        let mut mapped = plan.columns.into_iter();
+        plan.columns = shape
+            .columns
+            .iter()
+            // Tiberius excludes IDENTITY columns as non-updateable in its
+            // SELECT TOP 0 metadata. They must also be absent from our rows.
+            .filter(|column| !column.identity)
+            .map(|column| {
+                if dataset.index_of(&column.name).is_ok() {
+                    let mut planned = mapped.next().expect("mapped column");
+                    planned.wire_type = Some((column.type_name.clone(), column.scale));
+                    Ok(planned)
+                } else {
+                    Ok(PlannedColumn {
+                        name: column.name.clone(),
+                        field_index: None,
+                        column_type: ColumnType::BigInt,
+                        placeholder: Some(null_placeholder(column)?),
+                        wire_type: None,
+                    })
+                }
+            })
+            .collect::<Result<_, LoadFailure>>()?;
+        Ok(plan)
     }
 
     /// Encodes one chunk as bulk rows: one [`TokenRow`] per record, in
@@ -171,7 +210,26 @@ impl BulkRowPlan {
         let readers = self
             .columns
             .iter()
-            .map(|column| ColumnReader::new(column, batch.column(column.field_index)))
+            .map(|column| match column.field_index {
+                Some(index) => {
+                    let reader = ColumnReader::new(column, batch.column(index))?;
+                    Ok(match &column.wire_type {
+                        Some((type_name, scale)) => ColumnReader::Adapted {
+                            reader: Box::new(reader),
+                            name: column.name.clone(),
+                            type_name: type_name.clone(),
+                            scale: *scale,
+                        },
+                        None => reader,
+                    })
+                }
+                None => Ok(ColumnReader::Placeholder(
+                    column
+                        .placeholder
+                        .clone()
+                        .expect("extra column placeholder"),
+                )),
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(BulkRows {
             readers,
@@ -179,6 +237,105 @@ impl BulkRowPlan {
             len: batch.num_rows(),
         })
     }
+}
+
+/// The bulk metadata describes the destination type, so values must have
+/// its wire width even when the dataset type is wider. Range failures stay
+/// write failures. Timestamp rounding is reachable only after validation
+/// admitted the explicit rounding opt-in.
+fn adapt_value<'a>(
+    value: ColumnData<'a>,
+    name: &str,
+    type_name: &str,
+    scale: u8,
+) -> Result<ColumnData<'a>, LoadFailure> {
+    let out_of_range = || {
+        write_failure(format!(
+            "dataset field {name} is outside the SQL Server {type_name} range"
+        ))
+    };
+    Ok(match (value, type_name) {
+        (ColumnData::I64(value), "int") => ColumnData::I32(
+            value
+                .map(i32::try_from)
+                .transpose()
+                .map_err(|_| out_of_range())?,
+        ),
+        (ColumnData::I64(value), "smallint") => ColumnData::I16(
+            value
+                .map(i16::try_from)
+                .transpose()
+                .map_err(|_| out_of_range())?,
+        ),
+        (ColumnData::I64(value), "tinyint") => ColumnData::U8(
+            value
+                .map(u8::try_from)
+                .transpose()
+                .map_err(|_| out_of_range())?,
+        ),
+        (ColumnData::DateTime2(value), "datetime") => ColumnData::DateTime(
+            value
+                .map(|value| {
+                    let ticks = (value.time().increments() * 300 + 500_000) / 1_000_000;
+                    let day = value.date().days() + (ticks / 25_920_000) as u32;
+                    if !(639_905..=3_652_058).contains(&day) {
+                        return Err(out_of_range());
+                    }
+                    Ok(tiberius::time::DateTime::new(
+                        day as i32 - 693_595,
+                        (ticks % 25_920_000) as u32,
+                    ))
+                })
+                .transpose()?,
+        ),
+        (ColumnData::DateTime2(value), "datetime2") if scale < 6 => ColumnData::DateTime2(
+            value
+                .map(|value| {
+                    let divisor = 10u64.pow(u32::from(6 - scale));
+                    let ticks = (value.time().increments() + divisor / 2) / divisor;
+                    let per_day = 86_400 * 10u64.pow(u32::from(scale));
+                    let day = value.date().days() + (ticks / per_day) as u32;
+                    if day > 3_652_058 {
+                        return Err(out_of_range());
+                    }
+                    Ok(DateTime2::new(
+                        Date::new(day),
+                        Time::new(ticks % per_day, scale),
+                    ))
+                })
+                .transpose()?,
+        ),
+        (value, _) => value,
+    })
+}
+
+fn null_placeholder(column: &table::TableColumn) -> Result<ColumnData<'static>, LoadFailure> {
+    Ok(match column.type_name.as_str() {
+        "bigint" => ColumnData::I64(None),
+        "int" => ColumnData::I32(None),
+        "smallint" => ColumnData::I16(None),
+        "tinyint" => ColumnData::U8(None),
+        "bit" => ColumnData::Bit(None),
+        "float" if column.precision == 53 => ColumnData::F64(None),
+        "float" | "real" => ColumnData::F32(None),
+        "nvarchar" | "nchar" | "varchar" | "char" | "ntext" | "text" => ColumnData::String(None),
+        "decimal" | "numeric" => ColumnData::Numeric(None),
+        "datetime2" => ColumnData::DateTime2(None),
+        "datetime" => ColumnData::DateTime(None),
+        "smalldatetime" => ColumnData::SmallDateTime(None),
+        "date" => ColumnData::Date(None),
+        "time" => ColumnData::Time(None),
+        "datetimeoffset" => ColumnData::DateTimeOffset(None),
+        "uniqueidentifier" => ColumnData::Guid(None),
+        "binary" | "varbinary" | "image" => ColumnData::Binary(None),
+        "xml" => ColumnData::Xml(None),
+        name => {
+            return Err(write_failure(format!(
+                "SQL Server extra column {} has no bulk placeholder for {name}",
+                column.name
+            )))
+        }
+    })
 }
 
 /// The bulk rows of one chunk (see [`BulkRowPlan::rows`]). A record whose
@@ -223,6 +380,13 @@ impl<'a> Iterator for BulkRows<'a> {
 /// values are read from, resolved once per chunk so per-record encoding
 /// never downcasts.
 enum ColumnReader<'a> {
+    Adapted {
+        reader: Box<ColumnReader<'a>>,
+        name: String,
+        type_name: String,
+        scale: u8,
+    },
+    Placeholder(ColumnData<'static>),
     BigInt(&'a Int64Array),
     Float53(&'a Float64Array),
     Bit(&'a BooleanArray),
@@ -272,6 +436,13 @@ impl<'a> ColumnReader<'a> {
     /// exact value otherwise.
     fn value(&self, record: usize) -> Result<ColumnData<'a>, LoadFailure> {
         Ok(match self {
+            ColumnReader::Adapted {
+                reader,
+                name,
+                type_name,
+                scale,
+            } => adapt_value(reader.value(record)?, name, type_name, *scale)?,
+            ColumnReader::Placeholder(value) => value.clone(),
             &ColumnReader::BigInt(array) => {
                 ColumnData::I64(array.is_valid(record).then(|| array.value(record)))
             }
@@ -609,6 +780,10 @@ mod tests {
                 ColumnData::String(text.map(|text| text.into_owned().into()))
             }
             ColumnData::I64(v) => ColumnData::I64(v),
+            ColumnData::I32(v) => ColumnData::I32(v),
+            ColumnData::I16(v) => ColumnData::I16(v),
+            ColumnData::U8(v) => ColumnData::U8(v),
+            ColumnData::DateTime(v) => ColumnData::DateTime(v),
             ColumnData::F64(v) => ColumnData::F64(v),
             ColumnData::Bit(v) => ColumnData::Bit(v),
             ColumnData::Numeric(v) => ColumnData::Numeric(v),
@@ -1150,6 +1325,176 @@ mod tests {
         assert_eq!(
             last_day.signed_duration_since(origin).num_days(),
             LAST_DATETIME2_DAY
+        );
+    }
+
+    fn existing_column_plan(
+        data_type: DataType,
+        type_name: &str,
+        scale: u8,
+    ) -> (Schema, BulkRowPlan) {
+        let dataset = Schema::new(vec![Field::new("value", data_type, true)]);
+        let shape = table::TableShape {
+            columns: vec![table::TableColumn {
+                name: "value".into(),
+                type_name: type_name.into(),
+                precision: 0,
+                scale,
+                max_length: 8,
+                nullable: true,
+                identity: false,
+                has_default: false,
+            }],
+        };
+        let plan = BulkRowPlan::for_table(&dataset, &shape).expect("existing column plan");
+        (dataset, plan)
+    }
+
+    #[test]
+    fn existing_integer_columns_encode_their_width_and_fail_loudly_on_overflow() {
+        for (type_name, min, max, expected) in [
+            (
+                "int",
+                i64::from(i32::MIN),
+                i64::from(i32::MAX),
+                vec![
+                    ColumnData::I32(Some(i32::MIN)),
+                    ColumnData::I32(Some(i32::MAX)),
+                    ColumnData::I32(None),
+                ],
+            ),
+            (
+                "smallint",
+                i64::from(i16::MIN),
+                i64::from(i16::MAX),
+                vec![
+                    ColumnData::I16(Some(i16::MIN)),
+                    ColumnData::I16(Some(i16::MAX)),
+                    ColumnData::I16(None),
+                ],
+            ),
+            (
+                "tinyint",
+                0,
+                255,
+                vec![
+                    ColumnData::U8(Some(0)),
+                    ColumnData::U8(Some(255)),
+                    ColumnData::U8(None),
+                ],
+            ),
+        ] {
+            let (dataset, plan) = existing_column_plan(DataType::Int64, type_name, 0);
+            let batch = RecordBatch::try_new(
+                Arc::new(dataset.clone()),
+                vec![Arc::new(Int64Array::from(vec![Some(min), Some(max), None]))],
+            )
+            .unwrap();
+            assert_eq!(
+                rows_of(&plan, &batch),
+                expected
+                    .into_iter()
+                    .map(|value| vec![value])
+                    .collect::<Vec<_>>()
+            );
+            for value in [min - 1, max + 1] {
+                let batch = RecordBatch::try_new(
+                    Arc::new(dataset.clone()),
+                    vec![Arc::new(Int64Array::from(vec![value]))],
+                )
+                .unwrap();
+                let failure = plan.rows(&batch).unwrap().next().unwrap().unwrap_err();
+                assert_eq!(failure.code, "destination_write_failed");
+                assert!(failure.message.contains(type_name));
+            }
+        }
+    }
+
+    #[test]
+    fn existing_datetime_columns_round_days_preserve_nulls_and_reject_range_overflow() {
+        for (type_name, scale, expected) in [
+            (
+                "datetime",
+                3,
+                ColumnData::DateTime(Some(tiberius::time::DateTime::new(45_350, 0))),
+            ),
+            (
+                "datetime2",
+                3,
+                ColumnData::DateTime2(Some(DateTime2::new(Date::new(738_945), Time::new(0, 3)))),
+            ),
+            (
+                "datetime2",
+                0,
+                ColumnData::DateTime2(Some(DateTime2::new(Date::new(738_945), Time::new(0, 0)))),
+            ),
+        ] {
+            let (dataset, plan) = existing_column_plan(
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                type_name,
+                scale,
+            );
+            let batch = RecordBatch::try_new(
+                Arc::new(dataset.clone()),
+                vec![Arc::new(TimestampMicrosecondArray::from(vec![
+                    Some(micros(2024, 2, 29, 23, 59, 59, 999_999)),
+                    None,
+                ]))],
+            )
+            .unwrap();
+            let rows = rows_of(&plan, &batch);
+            assert_eq!(rows[0], vec![expected]);
+            assert_eq!(
+                rows[1],
+                vec![if type_name == "datetime" {
+                    ColumnData::DateTime(None)
+                } else {
+                    ColumnData::DateTime2(None)
+                }]
+            );
+            let batch = RecordBatch::try_new(
+                Arc::new(dataset),
+                vec![Arc::new(TimestampMicrosecondArray::from(vec![micros(
+                    9999, 12, 31, 23, 59, 59, 999_999,
+                )]))],
+            )
+            .unwrap();
+            assert_eq!(
+                plan.rows(&batch).unwrap().next().unwrap().unwrap_err().code,
+                "destination_write_failed"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_table_plan_orders_mapped_and_extra_nullable_columns_and_omits_identity() {
+        let dataset = Schema::new(vec![Field::new("name", DataType::Utf8, false)]);
+        let col = |name: &str, type_name: &str, identity| table::TableColumn {
+            name: name.into(),
+            type_name: type_name.into(),
+            precision: 0,
+            scale: 0,
+            max_length: -1,
+            nullable: true,
+            identity,
+            has_default: false,
+        };
+        let shape = table::TableShape {
+            columns: vec![
+                col("sequence", "int", true),
+                col("optional", "int", false),
+                col("name", "nvarchar", false),
+            ],
+        };
+        let plan = BulkRowPlan::for_table(&dataset, &shape).unwrap();
+        let batch = RecordBatch::try_new(
+            Arc::new(dataset),
+            vec![Arc::new(StringArray::from(vec!["Ada"]))],
+        )
+        .unwrap();
+        assert_eq!(
+            rows_of(&plan, &batch),
+            vec![vec![ColumnData::I32(None), text("Ada")]]
         );
     }
 }

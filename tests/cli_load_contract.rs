@@ -9694,11 +9694,8 @@ fn assert_sqlserver_pre_write_posture(report: &Value) {
 }
 
 #[test]
-fn sqlserver_full_block_echoes_verbatim_and_declines_the_load_before_any_work() {
-    // AC1 + AC4: a complete valid block parses and is echoed verbatim, and
-    // the load then fails pre-write through mode validation — the sqlserver
-    // destination supports no load mode yet — with a readable spelling of
-    // the empty mode list.
+fn sqlserver_full_block_echoes_verbatim_and_declines_append_before_any_work() {
+    // The complete block echoes verbatim even when the mode is declined.
     let destination_block = format!(
         "destination:\n\
          \x20 connector: sqlserver\n\
@@ -9714,7 +9711,7 @@ fn sqlserver_full_block_echoes_verbatim_and_declines_the_load_before_any_work() 
     );
     let (stdout, report_text, report) = run_sqlserver_load_failure(
         &destination_block,
-        "dataset: customers\nload_mode: full_refresh\n",
+        "dataset: customers\nload_mode: append\n",
         Some(SQLSERVER_PASSWORD_SENTINEL),
     );
 
@@ -9727,10 +9724,10 @@ fn sqlserver_full_block_echoes_verbatim_and_declines_the_load_before_any_work() 
         .expect("error message");
     assert_eq!(
         message,
-        "sqlserver destination does not support load mode: full_refresh \
-         (no load modes are supported for this destination yet)"
+        "sqlserver destination does not support load mode: append \
+         (supported load modes: full_refresh)"
     );
-    assert!(stdout.contains("no load modes are supported for this destination yet"));
+    assert!(stdout.contains("supported load modes: full_refresh"));
 
     // The block is echoed exactly as written, key for key.
     assert_eq!(
@@ -9749,7 +9746,7 @@ fn sqlserver_full_block_echoes_verbatim_and_declines_the_load_before_any_work() 
         })
     );
     assert_eq!(report["dataset"], "customers");
-    assert_eq!(report["load_mode"], "full_refresh");
+    assert_eq!(report["load_mode"], "append");
     assert_sqlserver_pre_write_posture(&report);
 
     // ADR-0061: the password exists only in the environment; no surface of

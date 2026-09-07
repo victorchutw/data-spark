@@ -729,6 +729,8 @@ dependencies = [
  "serde_yaml",
  "tempfile",
  "tiberius",
+ "tokio",
+ "tokio-util",
  "uuid",
 ]
 

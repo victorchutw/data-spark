@@ -24,6 +24,8 @@ serde_yaml = "0.9"
 # SHA to the maintainer-controlled fork: the published 0.12.3 sources plus
 # one Numeric patch so `decimal(38,38)` loads (ADR-0069 fork rung, #156).
 tiberius = { git = "https://github.com/victorchutw/tiberius", rev = "65c1a32fbc8e9c16423a76a76cdb1a800b1c21fa", default-features = false, features = ["tds73", "rustls", "chrono"] }
+tokio = { version = "1", features = ["rt", "net", "time"] }
+tokio-util = { version = "0.7", features = ["compat"] }
 uuid = { version = "1.10", features = ["v4"] }
 
 [dev-dependencies]
