@@ -657,6 +657,7 @@ The strategies the shipped destinations report:
 | --- | --- | --- | --- |
 | `duckdb` | `full_refresh` | `atomic` | `transactional_replace` |
 | `sqlserver` | `full_refresh` | `atomic` | `transactional_delete_insert` |
+| `sqlserver` | `append` | `best_effort` | `bulk_insert` |
 | `duckdb` | `append` | `best_effort` | `insert` |
 | `duckdb` | `merge` | `atomic` | `transactional_merge` |
 | `parquet` | `full_refresh` | `best_effort` | `staging_then_replace` |

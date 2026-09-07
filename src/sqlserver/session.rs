@@ -1,9 +1,9 @@
-//! A synchronous full-refresh session with a private current-thread runtime.
+//! A synchronous full-refresh or append session with a private current-thread runtime.
 
 use super::{create_table_ddl, quote_identifier, table, write_failure, BulkRowPlan};
 use crate::connector::{
     AbandonedWrite, DestinationWrite, DestinationWriteFacts, DestinationWriteFailure,
-    DestinationWriter, LoadMode, SqlServerConfig, SqlServerEncryption,
+    DestinationWriter, LoadMode, SqlServerConfig, SqlServerEncryption, Transience,
 };
 use crate::LoadFailure;
 use arrow_array::RecordBatch;
@@ -13,7 +13,8 @@ use tokio::{net::TcpStream, runtime::Runtime};
 use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 type SqlClient = Client<Compat<TcpStream>>;
-const STRATEGY: &str = "transactional_delete_insert";
+const FULL_REFRESH_STRATEGY: &str = "transactional_delete_insert";
+const APPEND_STRATEGY: &str = "bulk_insert";
 
 fn client_config(address: &SqlServerConfig, password: String) -> Config {
     let mut config = Config::new();
@@ -46,8 +47,26 @@ async fn execute(client: &mut SqlClient, sql: &str) -> Result<(), LoadFailure> {
     Ok(())
 }
 
-pub(crate) struct FullRefreshWriter {
+async fn inspect(
+    client: &mut SqlClient,
+    address: &SqlServerConfig,
+) -> Result<table::TableShape, LoadFailure> {
+    let rows = client
+        .simple_query(table::introspection_query(
+            &address.schema,
+            &address.dataset,
+        ))
+        .await
+        .map_err(|error| failure("introspection", error))?
+        .into_first_result()
+        .await
+        .map_err(|error| failure("introspection", error))?;
+    table::TableShape::from_catalog_rows(rows)
+}
+
+pub(crate) struct Writer {
     address: SqlServerConfig,
+    mode: LoadMode,
     runtime: Runtime,
     session: Mutex<Session>,
 }
@@ -55,11 +74,17 @@ pub(crate) struct FullRefreshWriter {
 struct Session {
     client: SqlClient,
     plan: Option<BulkRowPlan>,
+    shape: Option<table::TableShape>,
     transaction: bool,
+    committed_chunks: u64,
+    written_records: u64,
 }
 
-impl FullRefreshWriter {
-    pub(crate) fn begin(address: SqlServerConfig) -> Result<Self, DestinationWriteFailure> {
+impl Writer {
+    pub(crate) fn begin(
+        address: SqlServerConfig,
+        mode: LoadMode,
+    ) -> Result<Self, DestinationWriteFailure> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -71,7 +96,7 @@ impl FullRefreshWriter {
                 write_failure("SQL Server credential reference is no longer available".into())
             })?;
         let config = client_config(&address, password);
-        let client = runtime.block_on(async {
+        let mut client = runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(15), async {
                 let tcp = TcpStream::connect((address.host.as_str(), address.port))
                     .await
@@ -85,13 +110,33 @@ impl FullRefreshWriter {
             .await
             .map_err(|_| write_failure("SQL Server connect timed out after 15 seconds".into()))?
         })?;
+        // Append must reject an absent table before opening the writer.
+        // The dataset schema becomes available with the first chunk.
+        let shape = if mode == LoadMode::Append {
+            let shape = runtime.block_on(inspect(&mut client, &address))?;
+            if shape.columns.is_empty() {
+                return Err(write_failure(format!(
+                    "SQL Server table {}.{} must exist before append",
+                    quote_identifier(&address.schema),
+                    quote_identifier(&address.dataset)
+                ))
+                .into());
+            }
+            Some(shape)
+        } else {
+            None
+        };
         Ok(Self {
             address,
+            mode,
             runtime,
             session: Mutex::new(Session {
                 client,
                 plan: None,
+                shape,
                 transaction: false,
+                committed_chunks: 0,
+                written_records: 0,
             }),
         })
     }
@@ -105,18 +150,10 @@ impl FullRefreshWriter {
     }
 
     async fn prepare(&self, session: &mut Session, batch: &RecordBatch) -> Result<(), LoadFailure> {
-        let rows = session
-            .client
-            .simple_query(table::introspection_query(
-                &self.address.schema,
-                &self.address.dataset,
-            ))
-            .await
-            .map_err(|error| failure("introspection", error))?
-            .into_first_result()
-            .await
-            .map_err(|error| failure("introspection", error))?;
-        let shape = table::TableShape::from_catalog_rows(rows)?;
+        let shape = match session.shape.take() {
+            Some(shape) => shape,
+            None => inspect(&mut session.client, &self.address).await?,
+        };
         let dataset = batch.schema();
         let plan = if shape.columns.is_empty() {
             BulkRowPlan::new(
@@ -130,29 +167,31 @@ impl FullRefreshWriter {
         } else {
             shape.validate(
                 &dataset,
-                LoadMode::FullRefresh,
+                self.mode,
                 &[],
                 self.address.accept_datetime_rounding,
             )?;
             BulkRowPlan::for_table(&dataset, &shape)?
         };
         // The port exposes the resolved schema only with the first chunk.
-        // Validate before BEGIN/DELETE; create within the same transaction
+        // Validate before any write. Full refresh creates within its transaction
         // so even a failed first load leaves no destination object behind.
-        execute(&mut session.client, "BEGIN TRAN").await?;
-        session.transaction = true;
-        if shape.columns.is_empty() {
+        if self.mode == LoadMode::FullRefresh {
+            execute(&mut session.client, "BEGIN TRAN").await?;
+            session.transaction = true;
+            if shape.columns.is_empty() {
+                execute(
+                    &mut session.client,
+                    &create_table_ddl(&dataset, &self.address.schema, &self.address.dataset)?,
+                )
+                .await?;
+            }
             execute(
                 &mut session.client,
-                &create_table_ddl(&dataset, &self.address.schema, &self.address.dataset)?,
+                &format!("DELETE FROM {}", self.table_name()),
             )
             .await?;
         }
-        execute(
-            &mut session.client,
-            &format!("DELETE FROM {}", self.table_name()),
-        )
-        .await?;
         session.plan = Some(plan);
         Ok(())
     }
@@ -173,13 +212,16 @@ impl FullRefreshWriter {
     }
 }
 
-impl DestinationWriter for FullRefreshWriter {
+impl DestinationWriter for Writer {
     fn write_chunk(&self, batch: &RecordBatch) -> Result<(), DestinationWriteFailure> {
         let mut session = self.session.lock().expect("SQL Server session lock");
-        let result = self.runtime.block_on(async {
-            if session.plan.is_none() {
-                self.prepare(&mut session, batch).await?;
+        if session.plan.is_none() {
+            if let Err(error) = self.runtime.block_on(self.prepare(&mut session, batch)) {
+                self.rollback(&mut session);
+                return Err(error.into());
             }
+        }
+        let result = self.runtime.block_on(async {
             let Session { client, plan, .. } = &mut *session;
             let plan = plan.as_ref().expect("prepared plan");
             let rows = plan.rows(batch)?;
@@ -202,13 +244,32 @@ impl DestinationWriter for FullRefreshWriter {
             }
             Ok::<_, LoadFailure>(())
         });
-        result.map_err(|error| {
-            self.rollback(&mut session);
-            error.into()
-        })
+        if self.mode == LoadMode::Append {
+            result.map_err(|failure| DestinationWriteFailure {
+                failure,
+                facts: DestinationWriteFacts::best_effort(APPEND_STRATEGY),
+                written_records: session.written_records,
+                committed_chunks: session.committed_chunks,
+                transience: Transience::Terminal,
+            })?;
+            session.committed_chunks += 1;
+            session.written_records += batch.num_rows() as u64;
+            Ok(())
+        } else {
+            result.map_err(|error| {
+                self.rollback(&mut session);
+                error.into()
+            })
+        }
     }
 
     fn commit(self: Box<Self>) -> Result<DestinationWrite, DestinationWriteFailure> {
+        if self.mode == LoadMode::Append {
+            return Ok(DestinationWrite {
+                bytes_written: None,
+                facts: DestinationWriteFacts::best_effort(APPEND_STRATEGY),
+            });
+        }
         let mut session = self.session.lock().expect("SQL Server session lock");
         let result = self
             .runtime
@@ -220,21 +281,26 @@ impl DestinationWriter for FullRefreshWriter {
         session.transaction = false;
         Ok(DestinationWrite {
             bytes_written: None,
-            facts: DestinationWriteFacts::atomic(STRATEGY),
+            facts: DestinationWriteFacts::atomic(FULL_REFRESH_STRATEGY),
         })
     }
 
     fn abandon(self: Box<Self>) -> AbandonedWrite {
-        self.rollback(&mut self.session.lock().expect("SQL Server session lock"));
+        let mut session = self.session.lock().expect("SQL Server session lock");
+        self.rollback(&mut session);
         AbandonedWrite {
-            committed_chunks: 0,
-            written_records: 0,
-            facts: DestinationWriteFacts::not_applicable(),
+            committed_chunks: session.committed_chunks,
+            written_records: session.written_records,
+            facts: if session.committed_chunks > 0 {
+                DestinationWriteFacts::best_effort(APPEND_STRATEGY)
+            } else {
+                DestinationWriteFacts::not_applicable()
+            },
         }
     }
 }
 
-impl Drop for FullRefreshWriter {
+impl Drop for Writer {
     fn drop(&mut self) {
         self.rollback(&mut self.session.lock().expect("SQL Server session lock"));
     }
