@@ -118,7 +118,7 @@ impl DestinationWriteFacts {
         }
     }
 
-    fn with_merge_counts(self, updated: u64, inserted: u64) -> Self {
+    pub(crate) fn with_merge_counts(self, updated: u64, inserted: u64) -> Self {
         DestinationWriteFacts {
             merge: Some(MergeWriteCounts { updated, inserted }),
             ..self
@@ -256,7 +256,7 @@ impl LoadMode {
         }
     }
 
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             LoadMode::FullRefresh => "full_refresh",
             LoadMode::Append => "append",
@@ -444,7 +444,10 @@ pub(crate) fn destination_connector(
         DestinationDefinition::SqlServer(definition) => {
             let config = SqlServerConfig::from_definition(definition, dataset)?;
             resolve_credential_reference(&config.password_env)?;
-            Ok(Box::new(SqlServerDestination { config }))
+            Ok(Box::new(SqlServerDestination {
+                config,
+                merge_keys: merge_keys.to_vec(),
+            }))
         }
     }
 }
@@ -2088,6 +2091,7 @@ fn resolve_credential_reference(password_env: &str) -> Result<(), LoadFailure> {
 /// SQL Server loads preserve the destination table object (ADR-0064).
 struct SqlServerDestination {
     config: SqlServerConfig,
+    merge_keys: Vec<String>,
 }
 
 impl Destination for SqlServerDestination {
@@ -2096,7 +2100,7 @@ impl Destination for SqlServerDestination {
     }
 
     fn supported_load_modes(&self) -> &'static [LoadMode] {
-        &[LoadMode::FullRefresh, LoadMode::Append]
+        ALL_LOAD_MODES
     }
 
     fn parallelism_limit(&self, _mode: LoadMode) -> NonZeroU64 {
@@ -2108,6 +2112,7 @@ impl Destination for SqlServerDestination {
         Ok(Box::new(crate::sqlserver::session::Writer::begin(
             self.config.clone(),
             mode,
+            self.merge_keys.clone(),
         )?))
     }
 }
@@ -3003,30 +3008,18 @@ mod tests {
     }
 
     #[test]
-    fn sql_server_destination_supports_full_refresh_and_append_and_declares_serial_parallelism() {
+    fn sql_server_destination_supports_all_modes_and_declares_serial_parallelism() {
         let config = SqlServerConfig::from_definition(&sqlserver_definition(), Some("customers"))
             .expect("valid sqlserver block resolves");
-        let destination = SqlServerDestination { config };
-
-        assert!(destination.supported_load_modes() == [LoadMode::FullRefresh, LoadMode::Append]);
-        assert!(destination.validate_mode(LoadMode::FullRefresh).is_ok());
+        let destination = SqlServerDestination {
+            config,
+            merge_keys: vec!["id".into()],
+        };
+        assert!(destination.supported_load_modes() == ALL_LOAD_MODES);
         for mode in ALL_LOAD_MODES {
+            assert!(destination.validate_mode(*mode).is_ok());
             assert_eq!(destination.parallelism_limit(*mode).get(), 1);
         }
-        assert!(destination.validate_mode(LoadMode::Append).is_ok());
-        let mode = LoadMode::Merge;
-        let error = destination
-            .validate_mode(mode)
-            .expect_err("every mode declined");
-        assert_eq!(error.code, "unsupported_load_mode_for_destination");
-        assert_eq!(
-            error.message,
-            format!(
-                "sqlserver destination does not support load mode: {} \
-                     (supported load modes: full_refresh, append)",
-                mode.as_str()
-            )
-        );
     }
 
     #[test]

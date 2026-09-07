@@ -1,4 +1,4 @@
-//! A synchronous full-refresh or append session with a private current-thread runtime.
+//! A synchronous SQL Server load session with a private current-thread runtime.
 
 use super::{create_table_ddl, quote_identifier, table, write_failure, BulkRowPlan};
 use crate::connector::{
@@ -14,6 +14,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 type SqlClient = Client<Compat<TcpStream>>;
 const FULL_REFRESH_STRATEGY: &str = "transactional_delete_insert";
+const MERGE_STRATEGY: &str = "transactional_merge";
 const APPEND_STRATEGY: &str = "bulk_insert";
 
 fn client_config(address: &SqlServerConfig, password: String) -> Config {
@@ -67,6 +68,8 @@ async fn inspect(
 pub(crate) struct Writer {
     address: SqlServerConfig,
     mode: LoadMode,
+    merge_keys: Vec<String>,
+    stage: String,
     runtime: Runtime,
     session: Mutex<Session>,
 }
@@ -76,6 +79,7 @@ struct Session {
     plan: Option<BulkRowPlan>,
     shape: Option<table::TableShape>,
     transaction: bool,
+    identity_insert: bool,
     committed_chunks: u64,
     written_records: u64,
 }
@@ -84,6 +88,7 @@ impl Writer {
     pub(crate) fn begin(
         address: SqlServerConfig,
         mode: LoadMode,
+        merge_keys: Vec<String>,
     ) -> Result<Self, DestinationWriteFailure> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -110,15 +115,16 @@ impl Writer {
             .await
             .map_err(|_| write_failure("SQL Server connect timed out after 15 seconds".into()))?
         })?;
-        // Append must reject an absent table before opening the writer.
+        // After connecting, append and merge reject an absent table before any write.
         // The dataset schema becomes available with the first chunk.
-        let shape = if mode == LoadMode::Append {
+        let shape = if mode != LoadMode::FullRefresh {
             let shape = runtime.block_on(inspect(&mut client, &address))?;
             if shape.columns.is_empty() {
                 return Err(write_failure(format!(
-                    "SQL Server table {}.{} must exist before append",
+                    "SQL Server table {}.{} must exist before {}",
                     quote_identifier(&address.schema),
-                    quote_identifier(&address.dataset)
+                    quote_identifier(&address.dataset),
+                    mode.as_str()
                 ))
                 .into());
             }
@@ -129,12 +135,15 @@ impl Writer {
         Ok(Self {
             address,
             mode,
+            merge_keys,
+            stage: format!("data_spark_merge_stage_{}", uuid::Uuid::new_v4().simple()),
             runtime,
             session: Mutex::new(Session {
                 client,
                 plan: None,
                 shape,
                 transaction: false,
+                identity_insert: false,
                 committed_chunks: 0,
                 written_records: 0,
             }),
@@ -155,7 +164,15 @@ impl Writer {
             None => inspect(&mut session.client, &self.address).await?,
         };
         let dataset = batch.schema();
-        let plan = if shape.columns.is_empty() {
+        if !shape.columns.is_empty() {
+            shape.validate(
+                &dataset,
+                self.mode,
+                &self.merge_keys,
+                self.address.accept_datetime_rounding,
+            )?;
+        }
+        let plan = if shape.columns.is_empty() || self.mode == LoadMode::Merge {
             BulkRowPlan::new(
                 &dataset,
                 &dataset
@@ -165,14 +182,21 @@ impl Writer {
                     .collect::<Vec<_>>(),
             )?
         } else {
-            shape.validate(
-                &dataset,
-                self.mode,
-                &[],
-                self.address.accept_datetime_rounding,
-            )?;
             BulkRowPlan::for_table(&dataset, &shape)?
         };
+        if self.mode == LoadMode::Merge {
+            execute(&mut session.client, "BEGIN TRAN").await?;
+            session.transaction = true;
+            execute(
+                &mut session.client,
+                &create_table_ddl(&dataset, &self.address.schema, &self.stage)?,
+            )
+            .await?;
+            session.identity_insert = shape
+                .columns
+                .iter()
+                .any(|column| column.identity && self.merge_keys.contains(&column.name));
+        }
         // The port exposes the resolved schema only with the first chunk.
         // Validate before any write. Full refresh creates within its transaction
         // so even a failed first load leaves no destination object behind.
@@ -196,6 +220,109 @@ impl Writer {
         Ok(())
     }
 
+    fn stage_name(&self) -> String {
+        format!(
+            "{}.{}",
+            quote_identifier(&self.address.schema),
+            quote_identifier(&self.stage)
+        )
+    }
+
+    fn merge_failure(&self, failure: LoadFailure) -> DestinationWriteFailure {
+        DestinationWriteFailure {
+            failure,
+            facts: DestinationWriteFacts::atomic(MERGE_STRATEGY),
+            written_records: 0,
+            committed_chunks: 0,
+            transience: Transience::Terminal,
+        }
+    }
+
+    async fn merge(&self, session: &mut Session) -> Result<DestinationWriteFacts, LoadFailure> {
+        let stage = self.stage_name();
+        let target = self.table_name();
+        let keys = self
+            .merge_keys
+            .iter()
+            .map(|key| quote_identifier(key))
+            .collect::<Vec<_>>();
+        let duplicates = session
+            .client
+            .simple_query(format!(
+                "SELECT TOP (1) 1 FROM {stage} GROUP BY {} HAVING COUNT_BIG(*) > 1",
+                keys.join(", ")
+            ))
+            .await
+            .map_err(|error| failure("duplicate-key gate", error))?
+            .into_first_result()
+            .await
+            .map_err(|error| failure("duplicate-key gate", error))?;
+        if !duplicates.is_empty() {
+            return Err(LoadFailure {
+                code: "duplicate_merge_keys",
+                message: "surviving records contain duplicate merge key tuples".into(),
+            });
+        }
+        let predicate = keys
+            .iter()
+            .map(|key| format!("target.{key} = source.{key}"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        // HOLDLOCK retains the counted key ranges until MERGE commits; EXISTS
+        // counts each staged record once even if several target records match.
+        let counts = session.client.simple_query(format!(
+            "SELECT COUNT_BIG(*), COUNT_BIG(CASE WHEN matched = 1 THEN 1 END) FROM \
+             (SELECT CASE WHEN EXISTS (SELECT 1 FROM {target} AS target WITH (UPDLOCK, HOLDLOCK) WHERE {predicate}) \
+             THEN 1 ELSE 0 END AS matched FROM {stage} AS source) AS counted"
+        )).await.map_err(|error| failure("merge counts", error))?
+            .into_first_result().await.map_err(|error| failure("merge counts", error))?;
+        let staged = counts[0].get::<i64, _>(0).expect("COUNT_BIG is non-null") as u64;
+        let updated = counts[0].get::<i64, _>(1).expect("COUNT_BIG is non-null") as u64;
+        let columns = session.plan.as_ref().expect("prepared plan").column_names();
+        let updates = columns
+            .iter()
+            .filter(|name| !self.merge_keys.iter().any(|key| key == **name))
+            .map(|name| {
+                let name = quote_identifier(name);
+                format!("{name} = source.{name}")
+            })
+            .collect::<Vec<_>>();
+        let update = if updates.is_empty() {
+            String::new()
+        } else {
+            format!("WHEN MATCHED THEN UPDATE SET {}", updates.join(", "))
+        };
+        let names = columns
+            .iter()
+            .map(|name| quote_identifier(name))
+            .collect::<Vec<_>>();
+        let values = names
+            .iter()
+            .map(|name| format!("source.{name}"))
+            .collect::<Vec<_>>();
+        if session.identity_insert {
+            execute(
+                &mut session.client,
+                &format!("SET IDENTITY_INSERT {target} ON"),
+            )
+            .await?;
+        }
+        execute(&mut session.client, &format!(
+            "MERGE INTO {target} WITH (HOLDLOCK) AS target USING {stage} AS source ON {predicate} \
+             {update} WHEN NOT MATCHED THEN INSERT ({}) VALUES ({});", names.join(", "), values.join(", ")
+        )).await?;
+        if session.identity_insert {
+            execute(
+                &mut session.client,
+                &format!("SET IDENTITY_INSERT {target} OFF"),
+            )
+            .await?;
+        }
+        execute(&mut session.client, &format!("DROP TABLE {stage}")).await?;
+        Ok(DestinationWriteFacts::atomic(MERGE_STRATEGY)
+            .with_merge_counts(updated, staged - updated))
+    }
+
     fn rollback(&self, session: &mut Session) {
         if session.transaction {
             // A failed bulk send may leave the protocol unusable. Attempt
@@ -217,8 +344,13 @@ impl DestinationWriter for Writer {
         let mut session = self.session.lock().expect("SQL Server session lock");
         if session.plan.is_none() {
             if let Err(error) = self.runtime.block_on(self.prepare(&mut session, batch)) {
+                let staged_merge = self.mode == LoadMode::Merge && session.transaction;
                 self.rollback(&mut session);
-                return Err(error.into());
+                return Err(if staged_merge {
+                    self.merge_failure(error)
+                } else {
+                    error.into()
+                });
             }
         }
         let result = self.runtime.block_on(async {
@@ -226,7 +358,11 @@ impl DestinationWriter for Writer {
             let plan = plan.as_ref().expect("prepared plan");
             let rows = plan.rows(batch)?;
             if batch.num_rows() != 0 {
-                let name = self.table_name();
+                let name = if self.mode == LoadMode::Merge {
+                    self.stage_name()
+                } else {
+                    self.table_name()
+                };
                 let mut request = client
                     .bulk_insert_with_columns(&name, &plan.column_names())
                     .await
@@ -258,7 +394,11 @@ impl DestinationWriter for Writer {
         } else {
             result.map_err(|error| {
                 self.rollback(&mut session);
-                error.into()
+                if self.mode == LoadMode::Merge {
+                    self.merge_failure(error)
+                } else {
+                    error.into()
+                }
             })
         }
     }
@@ -271,18 +411,32 @@ impl DestinationWriter for Writer {
             });
         }
         let mut session = self.session.lock().expect("SQL Server session lock");
-        let result = self
-            .runtime
-            .block_on(execute(&mut session.client, "COMMIT TRAN"));
-        if let Err(error) = result {
-            self.rollback(&mut session);
-            return Err(error.into());
+        let result = self.runtime.block_on(async {
+            let facts = if self.mode == LoadMode::Merge {
+                self.merge(&mut session).await?
+            } else {
+                DestinationWriteFacts::atomic(FULL_REFRESH_STRATEGY)
+            };
+            execute(&mut session.client, "COMMIT TRAN").await?;
+            Ok::<_, LoadFailure>(facts)
+        });
+        match result {
+            Ok(facts) => {
+                session.transaction = false;
+                Ok(DestinationWrite {
+                    bytes_written: None,
+                    facts,
+                })
+            }
+            Err(error) => {
+                self.rollback(&mut session);
+                Err(if self.mode == LoadMode::Merge {
+                    self.merge_failure(error)
+                } else {
+                    error.into()
+                })
+            }
         }
-        session.transaction = false;
-        Ok(DestinationWrite {
-            bytes_written: None,
-            facts: DestinationWriteFacts::atomic(FULL_REFRESH_STRATEGY),
-        })
     }
 
     fn abandon(self: Box<Self>) -> AbandonedWrite {

@@ -33,6 +33,12 @@ this repository's use of pull requests, and link their commit instead.
 
 ### Added
 
+- The `sqlserver` destination supports merge into existing tables using one
+  atomic staged transaction (`transactional_merge`), widening ADR-0057's scope.
+  Merge preserves explicit identity keys and extra destination columns, fails
+  duplicate source keys without changing records, and reports source-based
+  updated and inserted counts
+  ([#163](https://github.com/victorchutw/data-spark/pull/163)).
 - The `sqlserver` destination supports append into existing tables, committing
   each chunk independently and preserving the committed prefix when a later
   chunk fails. Loads report `best_effort` / `bulk_insert`; missing tables fail

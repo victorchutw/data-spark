@@ -481,3 +481,255 @@ fn append_rejects_mapped_identity_and_nullable_default_fields_before_writing() {
         assert_eq!(rows[0].get::<i64, _>(0), Some(1));
     }
 }
+
+#[test]
+#[ignore = "needs SQL Server"]
+fn merge_inserts_then_replaces_matched_records_whole() {
+    let mut server = Server::new();
+    server.mode = "merge";
+    server
+        .query("CREATE TABLE $table (id BIGINT NULL, name NVARCHAR(MAX) NULL, score BIGINT NULL)");
+    let options = "merge:\n  keys: [id]\nexecution:\n  chunk_rows: 1\n";
+    let report = server.load(
+        json!([{"id":1,"name":"Ada","score":10},{"id":2,"name":"Grace","score":20}]),
+        options,
+        0,
+    );
+    assert_eq!(
+        report["destination_write"],
+        json!({"atomicity":"atomic","strategy":"transactional_merge","merge":{"updated":0,"inserted":2}})
+    );
+    assert_eq!(report["row_counts"]["written"], 2);
+    let report = server.load(
+        json!([{"id":1,"name":"updated","score":null},{"id":3,"name":"new","score":30}]),
+        options,
+        0,
+    );
+    assert_eq!(
+        report["destination_write"]["merge"],
+        json!({"updated":1,"inserted":1})
+    );
+    assert_eq!(report["row_counts"]["written"], 2);
+    let rows = server.query("SELECT id, name, score FROM $table ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].get::<&str, _>(1), Some("updated"));
+    assert_eq!(rows[0].get::<i64, _>(2), None);
+    assert_eq!(rows[1].get::<&str, _>(1), Some("Grace"));
+    assert_eq!(rows[1].get::<i64, _>(2), Some(20));
+    assert_eq!(rows[2].get::<i64, _>(0), Some(3));
+    assert_eq!(rows[2].get::<&str, _>(1), Some("new"));
+    assert_eq!(rows[2].get::<i64, _>(2), Some(30));
+}
+
+#[test]
+#[ignore = "needs SQL Server"]
+fn merge_identity_keys_keep_source_values_and_leave_extra_columns_to_the_server() {
+    let mut server = Server::new();
+    server.mode = "merge";
+    server.query("CREATE TABLE $table (id INT IDENTITY NOT NULL, name NVARCHAR(MAX) NULL DEFAULT N'default name', extra INT NOT NULL DEFAULT 42); INSERT INTO $table(name,extra) VALUES(N'old',99)");
+    let report = server.load(
+        json!([{"id":1,"name":null},{"id":77,"name":null}]),
+        "merge:\n  keys: [id]\nschema:\n  overrides:\n  - name: id\n    nullable: false\n  - name: name\n    type: utf8\n",
+        0,
+    );
+    assert_eq!(
+        report["destination_write"]["merge"],
+        json!({"updated":1,"inserted":1})
+    );
+    assert_eq!(report["row_counts"]["written"], 2);
+    let rows = server.query("SELECT id, name, extra FROM $table ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<i32, _>(0), Some(1));
+    assert_eq!(rows[1].get::<i32, _>(0), Some(77));
+    assert_eq!(rows[0].get::<&str, _>(1), None);
+    assert_eq!(rows[1].get::<&str, _>(1), None);
+    assert_eq!(rows[0].get::<i32, _>(2), Some(99));
+    assert_eq!(rows[1].get::<i32, _>(2), Some(42));
+}
+
+#[test]
+#[ignore = "needs SQL Server"]
+fn merge_duplicate_composite_keys_across_chunks_roll_back_without_changing_records() {
+    let mut server = Server::new();
+    server.mode = "merge";
+    server.query("CREATE TABLE $table (id BIGINT NULL, region NVARCHAR(MAX) NULL, name NVARCHAR(MAX) NULL); INSERT INTO $table VALUES(1,N'east',N'original'),(2,N'west',NULL)");
+    let probe =
+        "SELECT id, region, name FROM $table ORDER BY id FOR JSON PATH, INCLUDE_NULL_VALUES";
+    let before = server.query(probe)[0].get::<&str, _>(0).unwrap().to_owned();
+    let report = server.load(json!([{"id":1,"region":"east","name":"first"},{"id":1,"region":"west","name":"other"},{"id":1,"region":"east","name":"duplicate"}]), "merge:\n  keys: [id, region]\nexecution:\n  chunk_rows: 1\n", 1);
+    assert_eq!(report["error_summary"]["code"], "duplicate_merge_keys");
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(
+        report["destination_write"],
+        json!({"atomicity":"atomic","strategy":"transactional_merge"})
+    );
+    assert_eq!(
+        server.query("SELECT COUNT(*) FROM $table")[0].get::<i32, _>(0),
+        Some(2)
+    );
+    assert_eq!(
+        server.query(probe)[0].get::<&str, _>(0),
+        Some(before.as_str())
+    );
+}
+
+#[test]
+#[ignore = "needs SQL Server"]
+fn merge_all_columns_as_keys_counts_matches_and_inserts_unmatched_tuples() {
+    let mut server = Server::new();
+    server.mode = "merge";
+    server.query("CREATE TABLE $table (id BIGINT NULL, region NVARCHAR(MAX) NULL); INSERT INTO $table VALUES(1,N'east')");
+    let report = server.load(
+        json!([{"id":1,"region":"east"},{"id":1,"region":"west"}]),
+        "merge:\n  keys: [id, region]\n",
+        0,
+    );
+    assert_eq!(
+        report["destination_write"]["merge"],
+        json!({"updated":1,"inserted":1})
+    );
+    assert_eq!(report["row_counts"]["written"], 2);
+    let rows = server.query("SELECT id, region FROM $table ORDER BY region");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get::<i64, _>(0), Some(1));
+    assert_eq!(rows[1].get::<i64, _>(0), Some(1));
+    assert_eq!(rows[0].get::<&str, _>(1), Some("east"));
+    assert_eq!(rows[1].get::<&str, _>(1), Some("west"));
+}
+
+#[test]
+#[ignore = "needs SQL Server"]
+fn merge_missing_table_fails_before_writing_and_never_bootstraps() {
+    let mut server = Server::new();
+    server.mode = "merge";
+    let report = server.load(json!([{"id":1}]), "merge:\n  keys: [id]\n", 1);
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("before merge"));
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["execution"]["record_format"], "not_started");
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+    assert_eq!(
+        server.query("SELECT OBJECT_ID('$table')")[0].get::<i32, _>(0),
+        None
+    );
+}
+
+#[test]
+#[ignore = "needs SQL Server"]
+fn merge_zero_survivors_commits_without_changing_the_destination() {
+    let mut server = Server::new();
+    server.mode = "merge";
+    server.query("CREATE TABLE $table (id BIGINT NULL); INSERT INTO $table VALUES(99)");
+    let report = server.load(json!([{"id":"bad"}]), "merge:\n  keys: [id]\nschema:\n  overrides:\n  - name: id\n    type: int64\nreject_threshold: 1\n", 0);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 1);
+    assert_eq!(
+        report["destination_write"],
+        json!({"atomicity":"atomic","strategy":"transactional_merge","merge":{"updated":0,"inserted":0}})
+    );
+    let rows = server.query("SELECT id FROM $table");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<i64, _>(0), Some(99));
+}
+
+#[test]
+#[ignore = "needs SQL Server"]
+fn merge_rejects_non_key_mapped_identity_before_writing() {
+    let mut server = Server::new();
+    server.mode = "merge";
+    server.query("CREATE TABLE $table (sequence BIGINT IDENTITY NOT NULL, id BIGINT NULL); INSERT INTO $table(id) VALUES(99)");
+    let report = server.load(
+        json!([{"id":99,"sequence":77}]),
+        "merge:\n  keys: [id]\nschema:\n  overrides:\n  - name: sequence\n    nullable: false\n",
+        1,
+    );
+    assert_eq!(
+        report["error_summary"]["code"],
+        "incompatible_destination_table"
+    );
+    assert_eq!(report["row_counts"]["written"], 0);
+    let rows = server.query("SELECT sequence, id FROM $table");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<i64, _>(0), Some(1));
+    assert_eq!(rows[0].get::<i64, _>(1), Some(99));
+}
+
+#[test]
+#[ignore = "needs SQL Server"]
+fn merge_target_duplicates_are_all_updated_but_counts_follow_source_records() {
+    let mut server = Server::new();
+    server.mode = "merge";
+    server.query("CREATE TABLE $table (id BIGINT NULL, name NVARCHAR(MAX) NULL); INSERT INTO $table VALUES(1,N'first'),(1,N'second')");
+    let report = server.load(
+        json!([{"id":1,"name":"replacement"},{"id":2,"name":"new"}]),
+        "merge:\n  keys: [id]\n",
+        0,
+    );
+    assert_eq!(
+        report["destination_write"]["merge"],
+        json!({"updated":1,"inserted":1})
+    );
+    assert_eq!(report["row_counts"]["written"], 2);
+    let rows = server.query("SELECT id, name FROM $table ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    for row in &rows[..2] {
+        assert_eq!(row.get::<i64, _>(0), Some(1));
+        assert_eq!(row.get::<&str, _>(1), Some("replacement"));
+    }
+    assert_eq!(rows[2].get::<i64, _>(0), Some(2));
+    assert_eq!(rows[2].get::<&str, _>(1), Some("new"));
+}
+
+#[test]
+#[ignore = "needs SQL Server"]
+fn merge_server_conversion_failure_rolls_back_identity_insert_and_staged_records() {
+    let mut server = Server::new();
+    server.mode = "merge";
+    server.query("CREATE TABLE $table (id INT IDENTITY NOT NULL, amount TINYINT NULL); INSERT INTO $table(amount) VALUES(9)");
+    let report = server.load(
+        json!([{"id":1,"amount":10},{"id":77,"amount":256}]),
+        "merge:\n  keys: [id]\nschema:\n  overrides:\n  - name: id\n    nullable: false\nexecution:\n  chunk_rows: 1\n",
+        1,
+    );
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    let rows = server.query("SELECT id, amount FROM $table");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<i32, _>(0), Some(1));
+    assert_eq!(rows[0].get::<u8, _>(1), Some(9));
+    let report = server.load(
+        json!([{"id":77,"amount":12}]),
+        "merge:\n  keys: [id]\nschema:\n  overrides:\n  - name: id\n    nullable: false\n",
+        0,
+    );
+    assert_eq!(
+        report["destination_write"]["merge"],
+        json!({"updated":0,"inserted":1})
+    );
+    assert_eq!(
+        server.query("SELECT amount FROM $table WHERE id=77")[0].get::<u8, _>(0),
+        Some(12)
+    );
+}
+
+#[test]
+#[ignore = "needs SQL Server"]
+fn merge_datetime_rounding_happens_in_server_dml_after_created_shape_staging() {
+    let mut server = Server::new();
+    server.mode = "merge";
+    server.rounding = true;
+    server.query("CREATE TABLE $table (id BIGINT NULL, instant DATETIME2(3) NULL)");
+    server.load(
+        json!([{"id":1,"instant":"2024-02-29T23:59:59.999999Z"}]),
+        "merge:\n  keys: [id]\nschema:\n  overrides:\n  - name: instant\n    type: timestamptz\n",
+        0,
+    );
+    assert_eq!(
+        server.query("SELECT CONVERT(varchar(40),instant,126) FROM $table")[0].get::<&str, _>(0),
+        Some("2024-03-01T00:00:00")
+    );
+}
