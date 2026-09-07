@@ -115,7 +115,7 @@ impl Writer {
             .await
             .map_err(|_| write_failure("SQL Server connect timed out after 15 seconds".into()))?
         })?;
-        // Append and merge reject an absent table before opening the writer.
+        // After connecting, append and merge reject an absent table before any write.
         // The dataset schema becomes available with the first chunk.
         let shape = if mode != LoadMode::FullRefresh {
             let shape = runtime.block_on(inspect(&mut client, &address))?;

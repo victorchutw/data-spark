@@ -575,7 +575,7 @@ fn merge_duplicate_composite_keys_across_chunks_roll_back_without_changing_recor
 
 #[test]
 #[ignore = "needs SQL Server"]
-fn merge_all_columns_as_keys_only_inserts_unmatched_tuples() {
+fn merge_all_columns_as_keys_counts_matches_and_inserts_unmatched_tuples() {
     let mut server = Server::new();
     server.mode = "merge";
     server.query("CREATE TABLE $table (id BIGINT NULL, region NVARCHAR(MAX) NULL); INSERT INTO $table VALUES(1,N'east')");
