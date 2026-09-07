@@ -12,6 +12,7 @@ struct Server {
     client: Client<Compat<TcpStream>>,
     table: String,
     rounding: bool,
+    mode: &'static str,
 }
 
 fn setting(name: &str, default: &str) -> String {
@@ -42,6 +43,7 @@ impl Server {
             client,
             table: format!("data_spark_{}", uuid::Uuid::new_v4().simple()),
             rounding: false,
+            mode: "full_refresh",
         }
     }
 
@@ -70,7 +72,7 @@ impl Server {
             "port":setting("PORT", "1433").parse::<u16>().unwrap(), "database":"tempdb", "schema":"dbo",
             "user":setting("USER", "sa"), "password_env":"DATA_SPARK_LIVE_TEST_PASSWORD", "trust_server_certificate":true, "accept_datetime_rounding":self.rounding});
         fs::write(work.path().join("load.yml"), format!(
-            "version: 1\nsource:\n  connector: local_file\n  path: source.jsonl\n  format: jsonl\ndestination: {destination}\ndataset: {}\nload_mode: full_refresh\n{options}", self.table)).unwrap();
+            "version: 1\nsource:\n  connector: local_file\n  path: source.jsonl\n  format: jsonl\ndestination: {destination}\ndataset: {}\nload_mode: {}\n{options}", self.table, self.mode)).unwrap();
         Command::cargo_bin("data-spark")
             .unwrap()
             .current_dir(work.path())
@@ -346,4 +348,136 @@ fn datetime_rounding_opt_in_writes_legacy_and_lower_precision_columns() {
     );
     assert_eq!(rows[0].get::<&str, _>(0), Some("2024-02-29T12:34:56.123"));
     assert_eq!(rows[0].get::<&str, _>(1), Some("2024-03-01T00:00:00"));
+}
+
+#[test]
+#[ignore = "needs SQL Server"]
+fn append_loads_accumulate_without_replacing_existing_records() {
+    let mut server = Server::new();
+    server.mode = "append";
+    server.query("CREATE TABLE $table (id BIGINT NULL); INSERT INTO $table VALUES(99)");
+    for records in [json!([{ "id": 1 }, { "id": 2 }]), json!([{ "id": 3 }])] {
+        let expected = records.as_array().unwrap().len();
+        let report = server.load(records, "execution:\n  chunk_rows: 1\n", 0);
+        assert_eq!(report["row_counts"]["written"], expected);
+        assert_eq!(report["execution"]["batch_count"], expected);
+        assert_eq!(
+            report["destination_write"],
+            json!({"atomicity":"best_effort","strategy":"bulk_insert"})
+        );
+    }
+    let rows = server.query("SELECT id FROM $table ORDER BY id");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.get::<i64, _>(0).unwrap())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 99]
+    );
+}
+
+#[test]
+#[ignore = "needs SQL Server"]
+fn append_missing_table_fails_before_the_session_without_bootstrapping() {
+    let mut server = Server::new();
+    server.mode = "append";
+    let report = server.load(json!([{ "id": 1 }]), "", 1);
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert!(report["error_summary"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("before append"));
+    assert_eq!(report["execution"]["record_format"], "not_started");
+    assert_eq!(report["execution"]["batch_count"], 0);
+    assert_eq!(report["row_counts"]["written"], 0);
+    assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+    assert_eq!(
+        server.query("SELECT OBJECT_ID('$table')")[0].get::<i32, _>(0),
+        None
+    );
+}
+
+#[test]
+#[ignore = "needs SQL Server"]
+fn append_failed_chunk_preserves_exactly_the_committed_prefix() {
+    let mut server = Server::new();
+    server.mode = "append";
+    server.query(
+        "CREATE TABLE $table (name NVARCHAR(MAX) NULL); INSERT INTO $table VALUES(N'original')",
+    );
+    let report = server.load(
+        json!([{"name":"first"}, {"name":"second"}, {"name":"failed chunk prefix"}, {"name":"x".repeat(32768)}]),
+        "execution:\n  chunk_rows: 2\n", 1);
+    assert_eq!(report["error_summary"]["code"], "destination_write_failed");
+    assert_eq!(report["row_counts"]["written"], 2);
+    assert_eq!(report["row_counts"]["rejected"], 0);
+    assert_eq!(report["execution"]["batch_count"], 1);
+    assert_eq!(report["execution"]["record_format"], "arrow_record_batch");
+    assert_eq!(
+        report["destination_write"],
+        json!({"atomicity":"best_effort","strategy":"bulk_insert"})
+    );
+    let rows = server.query("SELECT name FROM $table ORDER BY name");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.get::<&str, _>(0).unwrap())
+            .collect::<Vec<_>>(),
+        vec!["first", "original", "second"]
+    );
+}
+
+#[test]
+#[ignore = "needs SQL Server"]
+fn append_supplies_extra_nullable_default_and_identity_columns() {
+    let mut server = Server::new();
+    server.mode = "append";
+    server.query("CREATE TABLE $table (sequence INT IDENTITY NOT NULL, optional INT NULL, name NVARCHAR(MAX) NULL, defaulted INT NOT NULL DEFAULT 42)");
+    for name in ["Ada", "Grace"] {
+        server.load(json!([{ "name": name }]), "", 0);
+    }
+    let rows =
+        server.query("SELECT sequence, optional, name, defaulted FROM $table ORDER BY sequence");
+    assert_eq!(rows.len(), 2);
+    for (row, (sequence, name)) in rows.iter().zip([(1, "Ada"), (2, "Grace")]) {
+        assert_eq!(row.get::<i32, _>(0), Some(sequence));
+        assert_eq!(row.get::<i32, _>(1), None);
+        assert_eq!(row.get::<&str, _>(2), Some(name));
+        assert_eq!(row.get::<i32, _>(3), Some(42));
+    }
+}
+
+#[test]
+#[ignore = "needs SQL Server"]
+fn append_rejects_mapped_identity_and_nullable_default_fields_before_writing() {
+    for ddl in [
+        "CREATE TABLE $table (id BIGINT IDENTITY NOT NULL); INSERT INTO $table DEFAULT VALUES",
+        "CREATE TABLE $table (id BIGINT NULL DEFAULT 42); INSERT INTO $table VALUES(1)",
+    ] {
+        let mut server = Server::new();
+        server.mode = "append";
+        server.query(ddl);
+        let options = if ddl.contains("IDENTITY") {
+            "schema:\n  overrides:\n  - name: id\n    nullable: false\n"
+        } else {
+            "schema:\n  overrides:\n  - name: id\n    nullable: true\n"
+        };
+        let report = server.load(json!([{ "id": 7 }]), options, 1);
+        assert_eq!(
+            report["error_summary"]["code"],
+            "incompatible_destination_table"
+        );
+        assert!(report["error_summary"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(if ddl.contains("IDENTITY") {
+                "IDENTITY"
+            } else {
+                "DEFAULT"
+            }));
+        assert_eq!(report["destination_write"]["atomicity"], "not_applicable");
+        assert_eq!(report["row_counts"]["written"], 0);
+        assert_eq!(report["execution"]["batch_count"], 0);
+        let rows = server.query("SELECT id FROM $table");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get::<i64, _>(0), Some(1));
+    }
 }

@@ -33,6 +33,12 @@ this repository's use of pull requests, and link their commit instead.
 
 ### Added
 
+- The `sqlserver` destination supports append into existing tables, committing
+  each chunk independently and preserving the committed prefix when a later
+  chunk fails. Loads report `best_effort` / `bulk_insert`; missing tables fail
+  before the write session, and mapped identity or nullable default-carrying
+  fields fail the Accept Family before writing
+  ([#162](https://github.com/victorchutw/data-spark/pull/162)).
 - The `sqlserver` destination supports full refresh: it creates absent tables
   in the exact-fit created shape and replaces records in existing tables
   within one transaction, preserving indexes and the table object. Existing

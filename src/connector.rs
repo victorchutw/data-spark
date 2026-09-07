@@ -2085,7 +2085,7 @@ fn resolve_credential_reference(password_env: &str) -> Result<(), LoadFailure> {
     }
 }
 
-/// SQL Server full refresh preserves the destination table object (ADR-0064).
+/// SQL Server loads preserve the destination table object (ADR-0064).
 struct SqlServerDestination {
     config: SqlServerConfig,
 }
@@ -2096,7 +2096,7 @@ impl Destination for SqlServerDestination {
     }
 
     fn supported_load_modes(&self) -> &'static [LoadMode] {
-        &[LoadMode::FullRefresh]
+        &[LoadMode::FullRefresh, LoadMode::Append]
     }
 
     fn parallelism_limit(&self, _mode: LoadMode) -> NonZeroU64 {
@@ -2105,9 +2105,10 @@ impl Destination for SqlServerDestination {
 
     fn begin(&self, mode: LoadMode) -> Result<Box<dyn DestinationWriter>, DestinationWriteFailure> {
         self.validate_mode(mode)?;
-        Ok(Box::new(
-            crate::sqlserver::session::FullRefreshWriter::begin(self.config.clone())?,
-        ))
+        Ok(Box::new(crate::sqlserver::session::Writer::begin(
+            self.config.clone(),
+            mode,
+        )?))
     }
 }
 
@@ -3002,30 +3003,30 @@ mod tests {
     }
 
     #[test]
-    fn sql_server_destination_supports_only_full_refresh_and_declares_serial_parallelism() {
+    fn sql_server_destination_supports_full_refresh_and_append_and_declares_serial_parallelism() {
         let config = SqlServerConfig::from_definition(&sqlserver_definition(), Some("customers"))
             .expect("valid sqlserver block resolves");
         let destination = SqlServerDestination { config };
 
-        assert!(destination.supported_load_modes() == [LoadMode::FullRefresh]);
+        assert!(destination.supported_load_modes() == [LoadMode::FullRefresh, LoadMode::Append]);
         assert!(destination.validate_mode(LoadMode::FullRefresh).is_ok());
         for mode in ALL_LOAD_MODES {
             assert_eq!(destination.parallelism_limit(*mode).get(), 1);
         }
-        for mode in [LoadMode::Append, LoadMode::Merge] {
-            let error = destination
-                .validate_mode(mode)
-                .expect_err("every mode declined");
-            assert_eq!(error.code, "unsupported_load_mode_for_destination");
-            assert_eq!(
-                error.message,
-                format!(
-                    "sqlserver destination does not support load mode: {} \
-                     (supported load modes: full_refresh)",
-                    mode.as_str()
-                )
-            );
-        }
+        assert!(destination.validate_mode(LoadMode::Append).is_ok());
+        let mode = LoadMode::Merge;
+        let error = destination
+            .validate_mode(mode)
+            .expect_err("every mode declined");
+        assert_eq!(error.code, "unsupported_load_mode_for_destination");
+        assert_eq!(
+            error.message,
+            format!(
+                "sqlserver destination does not support load mode: {} \
+                     (supported load modes: full_refresh, append)",
+                mode.as_str()
+            )
+        );
     }
 
     #[test]

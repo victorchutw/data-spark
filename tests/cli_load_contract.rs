@@ -9694,7 +9694,7 @@ fn assert_sqlserver_pre_write_posture(report: &Value) {
 }
 
 #[test]
-fn sqlserver_full_block_echoes_verbatim_and_declines_append_before_any_work() {
+fn sqlserver_full_block_echoes_verbatim_and_declines_merge_before_any_work() {
     // The complete block echoes verbatim even when the mode is declined.
     let destination_block = format!(
         "destination:\n\
@@ -9711,7 +9711,7 @@ fn sqlserver_full_block_echoes_verbatim_and_declines_append_before_any_work() {
     );
     let (stdout, report_text, report) = run_sqlserver_load_failure(
         &destination_block,
-        "dataset: customers\nload_mode: append\n",
+        "dataset: customers\nload_mode: merge\nmerge:\n  keys: [id]\n",
         Some(SQLSERVER_PASSWORD_SENTINEL),
     );
 
@@ -9724,8 +9724,8 @@ fn sqlserver_full_block_echoes_verbatim_and_declines_append_before_any_work() {
         .expect("error message");
     assert_eq!(
         message,
-        "sqlserver destination does not support load mode: append \
-         (supported load modes: full_refresh)"
+        "sqlserver destination does not support load mode: merge \
+         (supported load modes: full_refresh, append)"
     );
     assert!(stdout.contains("supported load modes: full_refresh"));
 
@@ -9746,7 +9746,7 @@ fn sqlserver_full_block_echoes_verbatim_and_declines_append_before_any_work() {
         })
     );
     assert_eq!(report["dataset"], "customers");
-    assert_eq!(report["load_mode"], "append");
+    assert_eq!(report["load_mode"], "merge");
     assert_sqlserver_pre_write_posture(&report);
 
     // ADR-0061: the password exists only in the environment; no surface of
@@ -9762,13 +9762,13 @@ fn sqlserver_full_block_echoes_verbatim_and_declines_append_before_any_work() {
 }
 
 #[test]
-fn sqlserver_minimal_block_echoes_absent_keys_as_null_and_declines_append() {
+fn sqlserver_minimal_block_echoes_absent_keys_as_null_and_declines_merge() {
     // AC1: defaulted-absent keys follow the existing destination_summary
     // convention — echoed as null, like source.format — while the resolved
     // defaults themselves are pinned by the unit tests.
     let (stdout, report_text, report) = run_sqlserver_load_failure(
         &minimal_sqlserver_destination_block(),
-        "dataset: customers\nload_mode: append\n",
+        "dataset: customers\nload_mode: merge\nmerge:\n  keys: [id]\n",
         Some(SQLSERVER_PASSWORD_SENTINEL),
     );
 
@@ -9779,7 +9779,7 @@ fn sqlserver_minimal_block_echoes_absent_keys_as_null_and_declines_append() {
     assert!(report["error_summary"]["message"]
         .as_str()
         .expect("error message")
-        .contains("does not support load mode: append"));
+        .contains("does not support load mode: merge"));
     assert_eq!(
         report["destination_summary"],
         serde_json::json!({
