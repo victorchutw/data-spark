@@ -33,6 +33,13 @@ this repository's use of pull requests, and link their commit instead.
 
 ### Added
 
+- The `sqlserver` destination supports full refresh: it creates absent tables
+  in the exact-fit created shape and replaces records in existing tables
+  within one transaction, preserving indexes and the table object. Existing
+  tables outside the Accept Family fail with `incompatible_destination_table`
+  before any records change. Successful loads report `atomic` /
+  `transactional_delete_insert` with connector parallelism limited to 1
+  ([#160](https://github.com/victorchutw/data-spark/pull/160)).
 - `CONTRIBUTING.md` provides build, format, lint, default-test, and
   server-backed-test commands, including the local SQL Server container and
   connection overrides ([ADR-0066](docs/adr/0066-test-server-backed-destinations-against-a-real-server-behind-an-ignore-gate.md),

@@ -15,11 +15,6 @@ mod dispatch;
 mod rejection;
 mod retry;
 mod schema;
-// The SQL Server mapping module has no live consumer until the first
-// sqlserver write session (#136); until then its items are reached only by
-// tests and would trip dead_code in non-test builds. Drop the attribute
-// with that consumer.
-#[cfg_attr(not(test), allow(dead_code))]
 mod sqlserver;
 
 use connector::{
