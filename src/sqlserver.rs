@@ -13,6 +13,8 @@
 //! sliver ADR-0062 enumerates rather than the driver's own limit, and
 //! every out-of-range value fails with one message.
 
+pub(crate) mod table;
+
 use crate::LoadFailure;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Decimal128Array, Float64Array, Int64Array, RecordBatch,
